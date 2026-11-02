@@ -38,6 +38,7 @@ import lights  # noqa: E402
 import sdr_settings  # noqa: E402
 import source_dialog  # noqa: E402
 import spectrum  # noqa: E402
+import sound  # noqa: E402
 import orbitfit  # noqa: E402  (orbits from our own observations)
 import receiver  # noqa: E402  (the SDR receiver and decoder, run from here)
 import location_dialog  # noqa: E402
@@ -1258,6 +1259,9 @@ class Tracker(QtWidgets.QMainWindow):
         # map above, live spectrum + waterfall below (drag the divider; the Spectrum button hides it)
         self.spectrum = spectrum.SpectrumPanel()
         self.receiver.spectrum_port = self.spectrum.view.port
+        self.sound = sound.SoundPlayer(self)
+        self.receiver.audio_port = self.sound.port
+        self.spectrum.attach_sound(self.sound)
         self.map_split = QtWidgets.QSplitter(Qt.Vertical)
         self.map_split.addWidget(self.map)
         self.map_split.addWidget(self.spectrum)

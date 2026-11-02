@@ -20,7 +20,7 @@ DEFAULTS = {
     'ppm': 0.0,
     'bias_t': False,
     'offset_tune': False,       # E4000 tuners: avoids the centre spike (SDR++: "Offset Tuning")
-    'iq_correction': True,      # the E4000 tuner needs these (SDR++: "IQ Correction")
+    'iq_correction': False,     # gr-osmosdr's automatic IQ balance mirrors every burst (~6 dB below it) - off
     'dc_correction': True,
     'threshold_db': 16.0,       # burst detection, dB over the noise
     'extra_args': '',           # anything else for the device string, e.g. "offset_tune=1"

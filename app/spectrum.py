@@ -33,6 +33,7 @@ def colormap():
 
 class SpectrumView(QtWidgets.QWidget):
     framesChanged = QtCore.pyqtSignal()
+    listenPicked = QtCore.pyqtSignal(float)     # a click chose the frequency to listen to (Hz)
 
     def __init__(self):
         super().__init__()
@@ -56,6 +57,7 @@ class SpectrumView(QtWidgets.QWidget):
         self.view = None            # (f0, f1) Hz shown; None = everything
         self.drag = None
         self.mouse = None
+        self.listen_hz = None       # tuned sound: the channel being listened to (Hz), drawn as a marker
         self.dirty = False
         t = QtCore.QTimer(self)
         t.timeout.connect(self._repaint)
@@ -178,6 +180,7 @@ class SpectrumView(QtWidgets.QWidget):
 
     def mousePressEvent(self, e):
         self.drag = (e.pos().x(), self._span())
+        self.press_x = e.pos().x()
 
     def mouseMoveEvent(self, e):
         self.mouse = e.pos()
@@ -189,6 +192,10 @@ class SpectrumView(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, e):
         self.drag = None
+        if self.n and self.listen_hz is not None and abs(e.pos().x() - getattr(self, 'press_x', -99)) < 4:
+            self.listen_hz = self.f_of(e.pos().x(), self.width())      # a click (not a drag): listen here
+            self.listenPicked.emit(self.listen_hz)
+            self.dirty = True
 
     def mouseDoubleClickEvent(self, e):
         self.view = None
@@ -267,6 +274,13 @@ class SpectrumView(QtWidgets.QWidget):
         cx = self.x_of(self.center, w)
         p.setPen(QtGui.QPen(QtGui.QColor(255, 107, 107, 120), 1, Qt.DashLine))
         p.drawLine(QPointF(cx, 0), QPointF(cx, top_h))
+        if self.listen_hz is not None:        # the tuned channel being listened to
+            lx = self.x_of(self.listen_hz, w)
+            half = max(2.0, self.x_of(self.listen_hz + 18e3, w) - lx)
+            p.fillRect(QtCore.QRectF(lx - half, 0, 2 * half, top_h), QtGui.QColor(255, 210, 60, 45))
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 60), 1.5))
+            p.drawLine(QPointF(lx, 0), QPointF(lx, h))
+            p.drawText(QPointF(min(lx + 6, w - 150), top_h - 6), '\U0001F50A %.4f MHz' % (self.listen_hz / 1e6))
 
         # waterfall
         rows = min(ROWS, h - wf_top)
@@ -334,13 +348,24 @@ class SpectrumPanel(QtWidgets.QWidget):
             sb.valueChanged.connect(self._manual)
         self.peak = QtWidgets.QCheckBox('Peak hold')
         self.peak.toggled.connect(self._peak)
+        self.sound = QtWidgets.QComboBox()
+        self.sound.addItems(['\U0001F507 Sound off', '\U0001F50A Whole band', '\U0001F50A Tuned (click to tune)'])
+        self.sound.setToolTip('Hear the radio like SDR++: static, with a click or "zzt" for each burst.\n'
+                              'Whole band: every burst the receiver hears. Tuned: one channel - click the spectrum '
+                              'to choose it.\nNothing is decoded into speech.')
+        self.volume = QtWidgets.QSlider(Qt.Horizontal)
+        self.volume.setRange(0, 100)
+        self.volume.setValue(60)
+        self.volume.setFixedWidth(90)
+        self.volume.setToolTip('Volume')
+        self.player = None
         self.pause = QtWidgets.QPushButton('Pause')
         self.pause.setCheckable(True)
         self.pause.toggled.connect(lambda on: setattr(self.view, 'paused', on))
         bar.addWidget(title)
         bar.addSpacing(10)
         bar.addWidget(self.info, 1)
-        for wdg in (self.auto, self.lo, self.hi, self.peak, self.pause):
+        for wdg in (self.sound, self.volume, self.auto, self.lo, self.hi, self.peak, self.pause):
             bar.addWidget(wdg)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 4, 0, 0)
@@ -349,6 +374,22 @@ class SpectrumPanel(QtWidgets.QWidget):
         t = QtCore.QTimer(self)
         t.timeout.connect(self._update_info)
         t.start(500)
+
+    def attach_sound(self, player):
+        """connect the sound controls to a sound.SoundPlayer"""
+        self.player = player
+        self.sound.currentIndexChanged.connect(self._sound_mode)
+        self.volume.valueChanged.connect(lambda v: player.set_volume(v / 100))
+        self.view.listenPicked.connect(lambda hz: player.set_mode('tuned', hz))
+
+    def _sound_mode(self, i):
+        mode = ('off', 'wide', 'tuned')[i]
+        if mode == 'tuned':
+            self.view.listen_hz = self.view.listen_hz or self.player.listen_hz
+        else:
+            self.view.listen_hz = None
+        self.view.dirty = True
+        self.player.set_mode(mode, self.view.listen_hz)
 
     def _auto(self, on):
         self.view.auto = on
@@ -368,6 +409,9 @@ class SpectrumPanel(QtWidgets.QWidget):
 
     def _update_info(self):
         v = self.view
+        if self.player is not None and v.n and self.player.center != v.center:
+            self.player.center = v.center
+            self.player.set_mode(self.player.mode)
         if v.auto:      # show the range auto picked, ready for switching to manual
             for sb, val in ((self.lo, v.db_lo), (self.hi, v.db_hi)):
                 sb.blockSignals(True)

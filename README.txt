@@ -60,7 +60,8 @@ The "Source" button next to Start receiver works like SDR++'s source menu:
   10-20 MS/s and cover the whole Iridium band (1616-1626.5 MHz).
 - Frequency: Automatic keeps the ring-alert channels (1626.0-1626.5 MHz) in view.
 - Gain (or Auto), PPM correction, Bias-T (powers an active antenna or LNA through the coax),
-  offset tuning and IQ / DC correction (for E4000 tuners like the SMArTee XTR).
+  offset tuning and DC correction. IQ correction is off by default: gr-osmosdr's automatic IQ
+  balance creates a mirror image of every burst, which can't be decoded.
 - Burst threshold: how far over the noise a burst must be. 14 dB is the minimum - lower floods
   the decoder with false bursts and can run the PC out of memory.
 Changes apply the next time you start the receiver.
@@ -85,6 +86,9 @@ and messaging channels are shaded green, the phone channels blue.
 - Auto range keeps the noise dark and bursts bright; untick it to set Min / Max yourself.
 - Peak hold draws the strongest level seen at each frequency - handy when aiming an antenna.
 - The Spectrum button at the top hides or shows it; drag the divider to resize it.
+- Sound (in the spectrum toolbar): hear the radio like SDR++ - static, with a click or "zzt"
+  for each burst. "Whole band" plays every burst the receiver hears; "Tuned" plays one channel -
+  click the spectrum to choose it (the yellow marker). Nothing is decoded into speech.
 
 
 THE CONSOLE (more detail)

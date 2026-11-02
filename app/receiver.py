@@ -68,6 +68,7 @@ class Receiver(QtCore.QObject):
         super().__init__()
         self.replay = replay          # for testing: feed an old .bits file instead of the SDR
         self.spectrum_port = 0        # set by the tracker: where to send the live spectrum
+        self.audio_port = 0           # ... and the sound
         self.sdr = sdr_settings.load()
         self.extractor = self.parser = self.decoder = None
         self.stamp = None
@@ -133,6 +134,8 @@ class Receiver(QtCore.QObject):
             args = [SOURCE, conf, '%g' % s['threshold_db'], '--ppm', '%g' % s['ppm']]
             if self.spectrum_port:
                 args += ['--spectrum-port', str(self.spectrum_port)]
+            if self.audio_port:
+                args += ['--audio-port', str(self.audio_port)]
             args += ['--auto-gain'] * s['auto_gain'] + ['--no-iq'] * (not s['iq_correction']) + \
                 ['--no-dc'] * (not s['dc_correction'])
             self.extractor.start(PY, args)

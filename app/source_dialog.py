@@ -101,7 +101,7 @@ class SourceDialog(QtWidgets.QDialog):
         self.bias.setChecked(self.s['bias_t'])
         self.offset = QtWidgets.QCheckBox('Offset tuning (E4000 tuners)')
         self.offset.setChecked(self.s['offset_tune'])
-        self.iq = QtWidgets.QCheckBox('IQ correction')
+        self.iq = QtWidgets.QCheckBox('IQ correction (automatic - can create mirror images of bursts; best left off)')
         self.iq.setChecked(self.s['iq_correction'])
         self.dc = QtWidgets.QCheckBox('DC offset correction')
         self.dc.setChecked(self.s['dc_correction'])

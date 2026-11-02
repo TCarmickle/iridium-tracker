@@ -16,7 +16,8 @@ once they have sent you a position fix, and fade as the time since you last hear
 - **Timeline** to scrub, play and replay past captures
 - **Per-satellite details**: every ring-alert position it sent you, how good its orbit is, next pass
 - **Spectrum and waterfall** like SDR++: the live spectrum of exactly what the decoder hears, with
-  zoom, hover readout, auto range and peak hold
+  zoom, hover readout, auto range and peak hold - and **sound**: hear the raw radio (static and burst
+  clicks) for the whole band or one channel you click, like SDR++
 - **Activity lights**: flash green for every decoded message and red for every damaged burst, and
   by each satellite in the list when that satellite is heard
 - **Choose your SDR** like SDR++'s source menu: any gr-osmosdr device (RTL-SDR, RTL-TCP, HackRF,
