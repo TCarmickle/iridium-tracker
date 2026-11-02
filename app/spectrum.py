@@ -358,6 +358,10 @@ class SpectrumPanel(QtWidgets.QWidget):
         self.volume.setValue(60)
         self.volume.setFixedWidth(90)
         self.volume.setToolTip('Volume')
+        self.audio_btn = QtWidgets.QToolButton()
+        self.audio_btn.setText('Audio \u25be')
+        self.audio_btn.setToolTip('Low-pass and high-pass filters, and squelch, for the sound')
+        self.audio_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.player = None
         self.pause = QtWidgets.QPushButton('Pause')
         self.pause.setCheckable(True)
@@ -365,7 +369,7 @@ class SpectrumPanel(QtWidgets.QWidget):
         bar.addWidget(title)
         bar.addSpacing(10)
         bar.addWidget(self.info, 1)
-        for wdg in (self.sound, self.volume, self.auto, self.lo, self.hi, self.peak, self.pause):
+        for wdg in (self.sound, self.volume, self.audio_btn, self.auto, self.lo, self.hi, self.peak, self.pause):
             bar.addWidget(wdg)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 4, 0, 0)
@@ -378,9 +382,53 @@ class SpectrumPanel(QtWidgets.QWidget):
     def attach_sound(self, player):
         """connect the sound controls to a sound.SoundPlayer"""
         self.player = player
+        self.volume.setValue(int(round(player.volume * 100)))
         self.sound.currentIndexChanged.connect(self._sound_mode)
         self.volume.valueChanged.connect(lambda v: player.set_volume(v / 100))
         self.view.listenPicked.connect(lambda hz: player.set_mode('tuned', hz))
+        self.audio_btn.setMenu(self._audio_menu(player))
+
+    def _audio_menu(self, player):
+        """the Audio menu: low-pass, high-pass and squelch (applied in the tracker, remembered)"""
+        import sound
+        menu = QtWidgets.QMenu(self)
+        box = QtWidgets.QWidget()
+        form = QtWidgets.QFormLayout(box)
+        form.setContentsMargins(12, 10, 12, 10)
+        a = player.settings
+        lp = QtWidgets.QComboBox()
+        for hz in sound.LOW_PASS:
+            lp.addItem('Off' if not hz else '%g kHz' % (hz / 1000), hz)
+        lp.setCurrentIndex(max(0, lp.findData(a['low_pass'])))
+        lp.setToolTip('Cuts the sound above this frequency: softer, less hiss')
+        lp.currentIndexChanged.connect(lambda i: player.set_filters(low_pass=lp.itemData(i)))
+        hp = QtWidgets.QComboBox()
+        for hz in sound.HIGH_PASS:
+            hp.addItem('Off' if not hz else ('%d Hz' % hz if hz < 1000 else '%g kHz' % (hz / 1000)), hz)
+        hp.setCurrentIndex(max(0, hp.findData(a['high_pass'])))
+        hp.setToolTip('Cuts the sound below this frequency: less rumble, crisper clicks')
+        hp.currentIndexChanged.connect(lambda i: player.set_filters(high_pass=hp.itemData(i)))
+        row = QtWidgets.QHBoxLayout()
+        sq = QtWidgets.QSlider(Qt.Horizontal)
+        sq.setRange(0, 30)
+        sq.setValue(int(a['squelch_db']))
+        sq.setFixedWidth(140)
+        sq_lbl = QtWidgets.QLabel()
+        sq_lbl.setMinimumWidth(48)
+        show = lambda v: sq_lbl.setText('Off' if not v else '%d dB' % v)
+        show(sq.value())
+        sq.setToolTip('Mutes the static; opens only for signals this much louder than the noise (0 = off)')
+        sq.valueChanged.connect(show)
+        sq.valueChanged.connect(lambda v: player.set_filters(squelch_db=float(v)))
+        row.addWidget(sq)
+        row.addWidget(sq_lbl)
+        form.addRow('Low-pass:', lp)
+        form.addRow('High-pass:', hp)
+        form.addRow('Squelch:', row)
+        act = QtWidgets.QWidgetAction(menu)
+        act.setDefaultWidget(box)
+        menu.addAction(act)
+        return menu
 
     def _sound_mode(self, i):
         mode = ('off', 'wide', 'tuned')[i]

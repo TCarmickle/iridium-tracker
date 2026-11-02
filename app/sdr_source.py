@@ -139,9 +139,13 @@ class UdpAudio(gr.sync_block):
             self.hello = now
             self._send(b'IRAH ' + self.mode.encode())
         if self.mode != 'off' and len(x):
-            r = float(np.sqrt(np.mean(x.astype(np.float64) ** 2)))
-            self.rms = 0.97 * self.rms + 0.03 * max(r, 1e-9)      # slow level: static stays steady, bursts pop
-            y = np.clip(x / (4 * self.rms), -1, 1).astype(np.float32)
+            # the static's level, from the noise itself (the median ignores bursts), changing over ~3 s so the
+            # background stays steady instead of dipping after every burst
+            noise = float(np.median(np.abs(x))) / 0.674 + 1e-9
+            a = 1 - np.exp(-len(x) / (48000 * 3.0))
+            self.rms = (1 - a) * self.rms + a * noise
+            # static at about -22 dB; bursts above it, rounded off gently instead of clipped
+            y = np.tanh(x / (12 * self.rms)).astype(np.float32)
             self.pending = np.concatenate([self.pending, y])
             while len(self.pending) >= 960:
                 self._send(b'IRAU' + (self.pending[:960] * 30000).astype('<i2').tobytes())
@@ -204,7 +208,7 @@ def _init(self, *a, **k):
         self.connect(tuned[-1], (mix, 0))
         self.connect(src, *wide)
         self.connect(wide[-1], (mix, 1))
-        self.connect(mix, resample, sink)
+        self.connect(mix, resample, sink)     # (filters and squelch are applied in the tracker)
         self._audio_blocks = (tuned, wide, mix, resample, sink)
         print('Sound: available (whole band or one tuned channel)', file=sys.stderr)
 

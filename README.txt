@@ -89,6 +89,9 @@ and messaging channels are shaded green, the phone channels blue.
 - Sound (in the spectrum toolbar): hear the radio like SDR++ - static, with a click or "zzt"
   for each burst. "Whole band" plays every burst the receiver hears; "Tuned" plays one channel -
   click the spectrum to choose it (the yellow marker). Nothing is decoded into speech.
+  "Audio" next to the volume: an optional low-pass (softer, less hiss) and high-pass (less
+  rumble) filter, and a squelch that mutes the static and opens only for bursts louder than the
+  noise by the amount you set. Your choices are remembered.
 
 
 THE CONSOLE (more detail)
