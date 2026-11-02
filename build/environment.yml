@@ -1,0 +1,15 @@
+# The Python runtime bundled in python\ (see BUILDING.md). Versions are pinned to the ones tested.
+name: iridium-tracker-runtime
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12.9
+  - gnuradio-core=3.10.12.0      # GNU Radio
+  - gnuradio-iridium=1!1.0.0     # gr-iridium: iridium-extractor (burst detector)
+  - gnuradio-osmosdr=0.2.6       # SDR access (RTL-SDR and others)
+  - pyqt=5.15.9                  # the app window
+  - numpy=2.2.3
+  - scipy=1.15.2                 # orbit fitting
+  - requests                     # map tiles, satellite names, terrain height
+  - crcmod=1.7                   # used by iridium-toolkit's parser
+  - libblas=*=*openblas          # OpenBLAS instead of Intel MKL: ~600 MB smaller

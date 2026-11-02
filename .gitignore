@@ -1,0 +1,20 @@
+# the bundled Python runtime (rebuilt with build/build_runtime.py, ~550 MB)
+/python/
+
+# your own data - never committed: antenna location, captures, catalog, map cache
+app/settings.json
+app/output*
+app/catalog-data*.json
+app/catalog.txt
+app/iridium-names.tle
+app/tiles/
+app/tracker-error.log
+
+# generated
+LICENSES/third-party/
+dist/
+__pycache__/
+*.pyc
+
+# build scratch
+build/_*

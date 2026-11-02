@@ -1,0 +1,48 @@
+# Building Iridium Tracker
+
+The repository holds the source. The ~550 MB Python runtime (`python\`) and the zip are built,
+not committed. You need conda or mamba ([radioconda](https://github.com/ryanvolz/radioconda) or
+[Miniforge](https://github.com/conda-forge/miniforge)).
+
+## 1. The runtime
+```bat
+python build\build_runtime.py
+```
+Creates `python\` from `build\environment.yml` (pinned versions, OpenBLAS instead of MKL), then
+removes what is only needed for building software (debug symbols, headers, static libraries).
+Use `--conda path\to\mamba.exe` if it can't find conda, `--force` to rebuild.
+
+> Note: the app limits OpenBLAS to one thread (`OPENBLAS_NUM_THREADS=1`). Otherwise OpenBLAS
+> reserves a buffer per CPU core (~2.5 GB on 20 cores) and the receiver's memory watchdog stops
+> the decoder.
+
+## 2. License texts
+```bat
+python build\collect_licenses.py
+```
+Copies each bundled package's license texts from conda's package cache into
+`LICENSES\third-party` and lists them in `LICENSES\THIRD-PARTY-PACKAGES.txt`.
+
+## 3. The zip
+```bat
+python build\make_package.py
+```
+Writes `dist\IridiumTracker.zip` (~200 MB). It never includes `app\settings.json` (your
+location), captures, the catalog or the map cache.
+
+## Running from source
+`Iridium Tracker.bat` runs `app\start.py` with the runtime in `python\`. To develop with another
+conda environment that has the packages in `environment.yml`: `python app\start.py`.
+
+## Layout
+| Path | What |
+|---|---|
+| `app\start.py` | entry point |
+| `app\iridium_tracker.py` | the window: map, timeline, satellite list |
+| `app\receiver.py` | runs iridium-extractor + iridium-parser while receiving |
+| `app\catalog.py` | adds finished captures to the catalog (`catalog-data.json`, `catalog.txt`) |
+| `app\orbitfit.py` | fits orbits to your own position fixes and Doppler |
+| `app\location_dialog.py` | typed location, terrain height lookup |
+| `app\iridium-toolkit\` | [iridium-toolkit](https://github.com/muccc/iridium-toolkit) (BSD-2), vendored at commit `7938ae0` |
+| `tools\` | developer tools (orbit accuracy check, capture summary) |
+| `build\` | runtime, license and package scripts |
