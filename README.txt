@@ -72,9 +72,11 @@ GLOBE (Globe button)
 The same picture as the map, on a 3D globe: the satellites at their orbital height, the
 orbital-plane rings, the selected satellite's past (orange) and future (yellow) path, your
 position fixes (red) and you. The night side is shaded from the Sun's real position. Anything
-behind the Earth is drawn faintly. Drag to spin, mouse wheel to zoom, double-click to come back
-to your location, click a satellite to select it. It follows the timeline, so Play and
-scrubbing move the satellites on the globe too.
+behind the Earth is drawn faintly. Drag to move around the Earth, mouse wheel to zoom,
+right-drag up/down to tilt and left/right to turn, double-click to come back to your location,
+click a satellite to select it. "Top view" looks straight down; "Side view" looks across the
+Earth towards the horizon, with the orbits arching over it. It follows the timeline, so Play
+and scrubbing move the satellites on the globe too.
 
 
 SKY PLOT (Sky button)

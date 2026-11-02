@@ -1,13 +1,17 @@
 """3D globe: the satellites, their orbital planes and your position fixes around a spinning Earth.
 
-Drawn with NumPy (no 3D engine needed): an orthographic view of the Earth textured with the same
-dark map as the main window, the night side shaded from the Sun's real position, and everything
+Drawn with NumPy (no 3D engine needed): a perspective camera looking at the Earth, textured with the
+same dark map as the main window, the night side shaded from the Sun's real position, and everything
 from the tracker's scene - satellites at orbital height, plane rings, the selected satellite's
 track and the measured fixes - in true 3D (things behind the Earth are hidden or faint).
-Drag to spin, mouse wheel to zoom, double-click to return to your location.
+Only the window's own pixels are rendered, so zooming in costs no more than zooming out.
+
+The camera looks at a point on the Earth's surface (the centre of the view) from some distance away,
+tilted from straight down (top view) towards the horizon (side view).
+  drag: move around the Earth          right-drag: tilt up/down, turn left/right
+  wheel: zoom                          double-click: back to your location
 """
 import math
-import os
 import threading
 import time
 
@@ -15,11 +19,17 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QPointF, Qt
 
-import paths
-
 R_EARTH = 6371.0
 TEX_W, TEX_H = 2048, 1024       # equirectangular Earth texture
 TILE_Z = 3                      # map tiles used for it (8 x 8 tiles = 2048 px)
+FOV_DEG = 40.0                  # camera field of view across the window's shorter side
+DIST_MIN, DIST_MAX = 0.12, 12.0  # camera distance from the point it looks at, Earth radii
+TILT_MAX = 85.0
+ORBIT_R = (R_EARTH + 781.0) / R_EARTH
+# dist/tilt/heading of the camera, and how high the point it looks at is (Earth radii from the centre)
+TOP_VIEW = dict(dist=3.6, tilt=0.0, heading=0.0, target_r=1.0)
+SIDE_VIEW = dict(dist=1.8, tilt=72.0, heading=0.0, target_r=ORBIT_R)    # across the Earth, satellites mid-screen
+SETTLE_MS = 180                 # after the last zoom/drag step, re-render at full resolution
 
 
 def to_xyz(lat, lon, alt_km=0.0):
@@ -57,14 +67,19 @@ class GlobeView(QtWidgets.QWidget):
         self.setMinimumSize(500, 500)
         self.setMouseTracking(True)
         self.home = home                    # (lat, lon)
-        self.lat0, self.lon0 = home[0], home[1]
-        self.zoom = 0.82                    # Earth radius as a fraction of half the window
+        self.lat0, self.lon0 = home[0], home[1]     # the point the camera looks at
+        self.dist, self.tilt, self.heading = TOP_VIEW['dist'], TOP_VIEW['tilt'], TOP_VIEW['heading']
+        self.target_r = TOP_VIEW['target_r']
         self.scene = None
         self.tex = None
         self.earth = None                   # cached rendering of the Earth (QImage) and what it was for
         self.earth_key = None
         self.drag = None
+        self.fast_until = 0.0
         self.hits = []
+        self.settle = QtCore.QTimer(self)
+        self.settle.setSingleShot(True)
+        self.settle.timeout.connect(self.update)
         threading.Thread(target=self._load_texture, args=(load_tile,), daemon=True).start()
 
     def _load_texture(self, load_tile):
@@ -76,82 +91,143 @@ class GlobeView(QtWidgets.QWidget):
         self.scene = scene
         self.update()
 
-    # ---- the view
-    def _axes(self):
-        la, lo = math.radians(self.lat0), math.radians(self.lon0)
-        c = np.array([math.cos(la) * math.cos(lo), math.cos(la) * math.sin(lo), math.sin(la)])   # towards you
-        e = np.array([-math.sin(lo), math.cos(lo), 0.0])                                        # right
-        n = np.cross(c, e)                                                                      # up
-        return e, n, c
+    def set_view(self, dist, tilt, heading, target_r=1.0):
+        self.dist, self.tilt, self.heading, self.target_r = dist, tilt, heading, target_r
+        self._moved()
 
-    def _scale(self):
-        return min(self.width(), self.height()) / 2 * self.zoom
+    def _moved(self):
+        """the camera moved: draw quickly now, sharply once it stops"""
+        self.fast_until = time.time() + SETTLE_MS / 1000
+        self.settle.start(SETTLE_MS + 20)
+        self.update()
+
+    # ---- the camera
+    def _camera(self):
+        """(position, right, up, forward, focal length in pixels)"""
+        la, lo = math.radians(self.lat0), math.radians(self.lon0)
+        U = np.array([math.cos(la) * math.cos(lo), math.cos(la) * math.sin(lo), math.sin(la)])   # up, at the target
+        E = np.array([-math.sin(lo), math.cos(lo), 0.0])                                        # east
+        N = np.cross(U, E)                                                                      # north
+        h, t = math.radians(self.heading), math.radians(self.tilt)
+        F = N * math.cos(h) + E * math.sin(h)           # the way we're facing, along the ground
+        right = E * math.cos(h) - N * math.sin(h)
+        back = U * math.cos(t) - F * math.sin(t)        # from the target towards the camera
+        pos = U * self.target_r + self.dist * back
+        fwd = -back
+        up = np.cross(right, fwd)
+        f = min(self.width(), self.height()) / 2 / math.tan(math.radians(FOV_DEG / 2))
+        return pos, right, up, fwd, f
+
+    def _centre_y(self):
+        """where the point we look at sits on screen: the middle when looking down, higher up as the camera
+        tilts, so a side view isn't half empty sky above the horizon"""
+        return self.height() * (0.5 - 0.2 * math.sin(math.radians(self.tilt)))
 
     def project(self, xyz):
-        """(screen x, screen y, in front) for Earth-fixed points (Earth radii)"""
-        e, n, c = self._axes()
-        x, y, z = xyz @ e, xyz @ n, xyz @ c
-        s = self._scale()
-        front = (z > 0) | (x * x + y * y > 1)        # not hidden behind the Earth
-        return self.width() / 2 + s * x, self.height() / 2 - s * y, front
+        """(screen x, screen y, visible, in view) for Earth-fixed points (Earth radii).
+        in view = in front of the camera; visible = in view and not hidden behind the Earth"""
+        xyz = np.atleast_2d(np.asarray(xyz, float))
+        pos, right, up, fwd, f = self._camera()
+        v = xyz - pos
+        zc = v @ fwd
+        inview = zc > 1e-3
+        zs = np.where(inview, zc, 1.0)
+        sx = self.width() / 2 + f * (v @ right) / zs
+        sy = self._centre_y() - f * (v @ up) / zs
+        r = np.linalg.norm(xyz, axis=1)
+        # on the ground: visible when that side faces the camera
+        ground = (xyz / r[:, None]) @ pos > 1.0
+        # above it: hidden if the line of sight passes through the Earth first
+        a = np.einsum('ij,ij->i', v, v)
+        b = 2 * (v @ pos)
+        c = pos @ pos - 1.0
+        disc = b * b - 4 * a * c
+        t1 = (-b - np.sqrt(np.clip(disc, 0, None))) / (2 * a)
+        above = ~((disc > 0) & (t1 > 0) & (t1 < 1))
+        visible = inview & np.where(r < 1.01, ground, above)
+        return sx, sy, visible, inview
 
     def _render_earth(self, fast):
-        """the Earth as an image for the current view (half resolution while dragging)"""
-        s = self._scale()
+        """the Earth (and its glow) as an image the size of the window - half resolution while moving"""
+        w, h = self.width(), self.height()
         k = 2 if fast else 1
-        size = int(2 * s / k) + 2
+        W, H = max(1, w // k), max(1, h // k)
         sun = self.scene['sun'] if self.scene else (0.0, 0.0)
-        key = (round(self.lat0, 3), round(self.lon0, 3), round(s, 1), k, round(sun[0], 1), round(sun[1], 1),
-               self.tex is not None, bool(self.scene and self.scene.get('night')))
+        night = bool(self.scene and self.scene.get('night'))
+        key = (round(self.lat0, 3), round(self.lon0, 3), round(self.dist, 4), round(self.tilt, 2), self.target_r,
+               round(self.heading, 2), W, H, round(sun[0], 1), round(sun[1], 1), self.tex is not None, night)
         if key == self.earth_key:
             return self.earth
-        g = (np.arange(size) + 0.5) / size * 2 - 1
-        xs, ys = np.meshgrid(g, -g)
-        rr = xs * xs + ys * ys
-        m = rr < 1
-        z = np.sqrt(np.clip(1 - rr, 0, 1))
-        e, n, c = self._axes()
-        x, y, zz = xs[m], ys[m], z[m]
-        p = np.outer(x, e) + np.outer(y, n) + np.outer(zz, c)
-        lat = np.degrees(np.arcsin(np.clip(p[:, 2], -1, 1)))
-        lon = np.degrees(np.arctan2(p[:, 1], p[:, 0]))
-        if self.tex is not None:
-            u = np.clip(((lon + 180) / 360 * TEX_W).astype(int), 0, TEX_W - 1)
-            v = np.clip(((90 - lat) / 180 * TEX_H).astype(int), 0, TEX_H - 1)
-            rgb = self.tex[v, u].astype(np.float32)
-        else:                               # map still loading: a plain ocean colour with a light grid
-            rgb = np.tile(np.array([24, 44, 62], np.float32), (len(lat), 1))
-            grid = (np.abs((lat + 90) % 30 - 15) > 14.2) | (np.abs((lon + 180) % 30 - 15) > 14.2)
-            rgb[grid] = (50, 70, 90)
-        rgb = rgb * 1.35                    # the map is dark-themed; lift it a little on the globe
-        shade = 0.72 + 0.28 * zz            # a little darker towards the edge: looks round
-        if self.scene and self.scene.get('night'):
-            sl, so = np.radians(sun[0]), np.radians(sun[1])
-            sun_v = np.array([math.cos(sl) * math.cos(so), math.cos(sl) * math.sin(so), math.sin(sl)])
-            day = np.clip((p @ sun_v) * 8 + 0.5, 0, 1)        # soft terminator
-            shade = shade * (0.55 + 0.45 * day)
-        rgb = np.clip(rgb * shade[:, None], 0, 255).astype(np.uint8)
-        img = np.zeros((size, size, 4), np.uint8)
-        img[..., 3] = 0
-        img[m, 0], img[m, 1], img[m, 2], img[m, 3] = rgb[:, 2], rgb[:, 1], rgb[:, 0], 255     # BGRA
-        self.earth = (QtGui.QImage(img.tobytes(), size, size, size * 4, QtGui.QImage.Format_ARGB32).copy(), s)
+        pos, right, up, fwd, f = self._camera()
+        f = f / k
+        px = (np.arange(W, dtype=np.float32) + 0.5 - W / 2) / f
+        py = (self._centre_y() / k - np.arange(H, dtype=np.float32) - 0.5) / f
+        d = (fwd.astype(np.float32)[None, None, :] + px[None, :, None] * right.astype(np.float32)
+             + py[:, None, None] * up.astype(np.float32))
+        d /= np.linalg.norm(d, axis=2, keepdims=True)
+        b = d @ pos.astype(np.float32)                  # ray: pos + t d
+        c = float(pos @ pos) - 1.0
+        disc = b * b - c
+        hit = (disc > 0) & (-b - np.sqrt(np.clip(disc, 0, None)) > 0)
+        img = np.zeros((H, W, 4), np.uint8)
+        # atmosphere: a faint blue glow just outside the edge of the Earth
+        miss = ~hit & (b < 0)
+        dmin = np.sqrt(np.clip(c + 1.0 - b * b, 0, None))
+        glow = miss & (dmin < 1.06)
+        a = np.clip((1.06 - dmin[glow]) / 0.06, 0, 1) * 80
+        img[glow] = np.stack([np.full_like(a, 255), np.full_like(a, 154), np.full_like(a, 76), a], -1).astype(np.uint8)
+        if hit.any():
+            dh = d[hit]
+            bh = b[hit]
+            t = -bh - np.sqrt(disc[hit])
+            p = pos[None, :] + t[:, None] * dh
+            lat = np.degrees(np.arcsin(np.clip(p[:, 2], -1, 1)))
+            lon = np.degrees(np.arctan2(p[:, 1], p[:, 0]))
+            if self.tex is not None:
+                u = np.clip(((lon + 180) / 360 * TEX_W).astype(int), 0, TEX_W - 1)
+                v = np.clip(((90 - lat) / 180 * TEX_H).astype(int), 0, TEX_H - 1)
+                rgb = self.tex[v, u].astype(np.float32)
+            else:                           # map still loading: a plain ocean colour with a light grid
+                rgb = np.tile(np.array([24, 44, 62], np.float32), (len(lat), 1))
+                grid = (np.abs((lat + 90) % 30 - 15) > 14.2) | (np.abs((lon + 180) % 30 - 15) > 14.2)
+                rgb[grid] = (50, 70, 90)
+            rgb = rgb * 1.35                # the map is dark-themed; lift it a little on the globe
+            facing = np.clip(-np.einsum('ij,ij->i', p, dh), 0, 1)
+            shade = 0.72 + 0.28 * facing    # a little darker towards the edge: looks round
+            if night:
+                sl, so = np.radians(sun[0]), np.radians(sun[1])
+                sun_v = np.array([math.cos(sl) * math.cos(so), math.cos(sl) * math.sin(so), math.sin(sl)], np.float32)
+                day = np.clip((p @ sun_v) * 8 + 0.5, 0, 1)        # soft terminator
+                shade = shade * (0.55 + 0.45 * day)
+            rgb = np.clip(rgb * shade[:, None], 0, 255).astype(np.uint8)
+            img[hit] = np.stack([rgb[:, 2], rgb[:, 1], rgb[:, 0], np.full(len(rgb), 255, np.uint8)], -1)   # BGRA
+        self.earth = QtGui.QImage(img.tobytes(), W, H, W * 4, QtGui.QImage.Format_ARGB32).copy()
         self.earth_key = key
         return self.earth
 
     # ---- mouse
     def mousePressEvent(self, e):
-        self.drag = (e.pos(), self.lat0, self.lon0, False)
+        self.drag = (e.pos(), e.button(), self.lat0, self.lon0, self.tilt, self.heading, False)
 
     def mouseMoveEvent(self, e):
-        if self.drag and e.buttons() & Qt.LeftButton:
-            p0, la, lo, _ = self.drag
+        if self.drag and e.buttons() & (Qt.LeftButton | Qt.RightButton):
+            p0, button, la, lo, tilt, heading, _ = self.drag
             d = e.pos() - p0
             if abs(d.x()) + abs(d.y()) > 2:
-                self.drag = (p0, la, lo, True)
-                deg = math.degrees(1 / self._scale())
-                self.lon0 = (lo - d.x() * deg / max(0.2, math.cos(math.radians(la))) + 180) % 360 - 180
-                self.lat0 = max(-89.0, min(89.0, la + d.y() * deg))
-                self.update()
+                self.drag = (p0, button, la, lo, tilt, heading, True)
+                if button == Qt.RightButton:        # tilt and turn
+                    self.tilt = max(0.0, min(TILT_MAX, tilt - d.y() * 0.3))
+                    self.heading = (heading - d.x() * 0.3 + 180) % 360 - 180
+                else:                               # grab the Earth and move it
+                    _, _, _, _, f = self._camera()
+                    deg = math.degrees(min(self.dist, 3.0) / f)
+                    fwd_deg, right_deg = d.y() * deg, -d.x() * deg
+                    h = math.radians(heading)
+                    north = fwd_deg * math.cos(h) - right_deg * math.sin(h)
+                    east = fwd_deg * math.sin(h) + right_deg * math.cos(h)
+                    self.lat0 = max(-89.0, min(89.0, la + north))
+                    self.lon0 = (lo + east / max(0.2, math.cos(math.radians(la))) + 180) % 360 - 180
+                self._moved()
             return
         hit = self._hit(e.pos())
         if hit:
@@ -160,22 +236,20 @@ class GlobeView(QtWidgets.QWidget):
             QtWidgets.QToolTip.hideText()
 
     def mouseReleaseEvent(self, e):
-        if self.drag and not self.drag[3]:
+        if self.drag and not self.drag[6] and self.drag[1] == Qt.LeftButton:
             hit = self._hit(e.pos())
             if hit and hit[0]:
                 self.satelliteClicked.emit(hit[0])
-        dragged = self.drag and self.drag[3]
         self.drag = None
-        if dragged:
-            self.update()               # sharp again
 
     def mouseDoubleClickEvent(self, e):
         self.lat0, self.lon0 = self.home
-        self.update()
+        self._moved()
 
     def wheelEvent(self, e):
-        self.zoom = min(6.0, max(0.3, self.zoom * (1.15 if e.angleDelta().y() > 0 else 1 / 1.15)))
-        self.update()
+        step = 1 / 1.15 if e.angleDelta().y() > 0 else 1.15
+        self.dist = min(DIST_MAX, max(DIST_MIN, self.dist * step))
+        self._moved()
 
     def _hit(self, pos):
         best = None
@@ -190,7 +264,7 @@ class GlobeView(QtWidgets.QWidget):
         """a 3D polyline: solid where it's in front of the Earth, faint where behind"""
         if len(xyz) < 2:
             return
-        sx, sy, front = self.project(np.asarray(xyz))
+        sx, sy, front, inview = self.project(np.asarray(xyz))
         for vis, alpha, wd in ((False, faint_alpha, 1.0), (True, colour.alpha(), width)):
             c = QtGui.QColor(colour)
             c.setAlpha(alpha)
@@ -199,7 +273,7 @@ class GlobeView(QtWidgets.QWidget):
             path = QtGui.QPainterPath()
             last = -2
             for i in range(1, len(sx)):
-                if front[i] == vis and front[i - 1] == vis:     # a piece wholly in front (or wholly behind)
+                if (front[i] == vis and front[i - 1] == vis and inview[i] and inview[i - 1]):
                     if last != i - 1:
                         path.moveTo(sx[i - 1], sy[i - 1])
                     path.lineTo(sx[i], sy[i])
@@ -211,18 +285,10 @@ class GlobeView(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.Antialiasing)
         w, h = self.width(), self.height()
         p.fillRect(self.rect(), QtGui.QColor('#07090d'))
-        cx, cy = w / 2, h / 2
-        s = self._scale()
-        # a faint atmosphere glow
-        glow = QtGui.QRadialGradient(cx, cy, s * 1.08)
-        glow.setColorAt(0.9, QtGui.QColor(76, 154, 255, 70))
-        glow.setColorAt(1.0, QtGui.QColor(76, 154, 255, 0))
-        p.setPen(Qt.NoPen)
-        p.setBrush(glow)
-        p.drawEllipse(QPointF(cx, cy), s * 1.08, s * 1.08)
-        img, _s = self._render_earth(fast=bool(self.drag and self.drag[3]))
+        moving = bool(self.drag and self.drag[6]) or time.time() < self.fast_until
+        img = self._render_earth(fast=moving)
         p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
-        p.drawImage(QtCore.QRectF(cx - s, cy - s, 2 * s, 2 * s), img)
+        p.drawImage(QtCore.QRectF(0, 0, w, h), img)
         self.hits = []
         sc = self.scene
         if sc:
@@ -239,7 +305,7 @@ class GlobeView(QtWidgets.QWidget):
                         self._line(p, to_xyz(seg[:, 0], seg[:, 1], 781.0), QtGui.QColor(col), 2.5 if tr['selected'] else 1.8)
             # measured positions (the satellite's own report), at their real height
             for fx in sc.get('fixes', []):
-                x, y, front = self.project(to_xyz(fx['lat'], fx['lon'], fx['alt_km'])[None, :])
+                x, y, front, _ = self.project(to_xyz(fx['lat'], fx['lon'], fx['alt_km']))
                 if front[0]:
                     c = QtGui.QColor(it.C_FIX)
                     c.setAlpha(int(255 * fx['alpha']))
@@ -247,7 +313,7 @@ class GlobeView(QtWidgets.QWidget):
                     p.setBrush(c)
                     p.drawEllipse(QPointF(x[0], y[0]), 3.5, 3.5)
             # you
-            hx, hy, hf = self.project(to_xyz(self.home[0], self.home[1], 2.0)[None, :])
+            hx, hy, hf, _ = self.project(to_xyz(self.home[0], self.home[1], 2.0))
             if hf[0]:
                 p.setPen(QtGui.QPen(Qt.white, 1.5))
                 p.setBrush(it.C_HOME)
@@ -259,7 +325,9 @@ class GlobeView(QtWidgets.QWidget):
             font.setPointSize(8)
             p.setFont(font)
             for st in sorted(sc.get('sats', []), key=lambda st: st['selected']):
-                x, y, front = self.project(to_xyz(st['lat'], st['lon'], st['alt'])[None, :])
+                x, y, front, inview = self.project(to_xyz(st['lat'], st['lon'], st['alt']))
+                if not inview[0]:
+                    continue
                 col = QtGui.QColor(230, 50, 60) if st['selected'] else (QtGui.QColor(40, 190, 90) if st['el'] > 0
                                                                        else QtGui.QColor(150, 156, 168))
                 p.setOpacity(1.0 if front[0] else 0.12)       # behind the Earth: just a hint
@@ -273,7 +341,7 @@ class GlobeView(QtWidgets.QWidget):
                         '%.0f&deg; above your horizon' % st['el'] if st['el'] > 0 else 'below your horizon')))
             p.setOpacity(1.0)
         p.setPen(QtGui.QColor('#8b93a1'))
-        p.drawText(QPointF(10, h - 10), 'Drag to spin  ·  wheel to zoom  ·  double-click: back to you')
+        p.drawText(QPointF(10, h - 10), 'Drag: move  ·  right-drag: tilt / turn  ·  wheel: zoom  ·  double-click: back to you')
         p.drawText(QPointF(w - 200, h - 10), '© OpenStreetMap contributors')
 
 
@@ -297,7 +365,20 @@ class GlobeWindow(QtWidgets.QDialog):
         super().__init__(parent)
         self.setWindowTitle('Globe - satellites and orbits from your own observations')
         self.view = GlobeView(home, load_tile)
+        bar = QtWidgets.QHBoxLayout()
+        bar.setContentsMargins(8, 6, 8, 0)
+        for label, tip, preset in (('Top view', 'Look straight down on the Earth', TOP_VIEW),
+                                   ('Side view', 'Look across the Earth towards the horizon, with the satellites '
+                                                 'passing above it', SIDE_VIEW)):
+            b = QtWidgets.QPushButton(label)
+            b.setToolTip(tip)
+            b.clicked.connect(lambda _, v=preset: self.view.set_view(v['dist'], v['tilt'], self.view.heading, v['target_r']))
+            bar.addWidget(b)
+        bar.addWidget(QtWidgets.QLabel('<span style="color:#8b93a1">Right-drag up/down to tilt, '
+                                       'left/right to turn</span>'))
+        bar.addStretch(1)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self.view)
-        self.resize(820, 820)
+        lay.addLayout(bar)
+        lay.addWidget(self.view, 1)
+        self.resize(820, 860)
