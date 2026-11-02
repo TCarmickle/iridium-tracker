@@ -21,13 +21,14 @@ from PyQt5 import QtCore
 
 import catalog
 import paths
+import sdr_settings
 import storage
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RC = os.path.dirname(sys.executable)          # the radioconda (or packaged) Python running us
 PY = os.path.join(RC, 'python.exe')
-EXTRACTOR = os.path.join(RC, 'Library', 'bin', 'iridium-extractor.py')
-THRESHOLD = 16      # dB over noise; never go below ~14 (10 dB crashed the PC)
+EXTRACTOR = os.path.join(RC, 'Library', 'bin', 'iridium-extractor.py')   # gr-iridium's decoder
+SOURCE = os.path.join(HERE, 'sdr_source.py')    # runs it with our device options and the spectrum tap
 LIMIT_GB = 2
 STATUS_EVERY = 10   # the decoder prints its totals every second; the log keeps one line in this many
 NO_WINDOW = 0x08000000   # CREATE_NO_WINDOW
@@ -64,6 +65,8 @@ class Receiver(QtCore.QObject):
     def __init__(self, replay=None):
         super().__init__()
         self.replay = replay          # for testing: feed an old .bits file instead of the SDR
+        self.spectrum_port = 0        # set by the tracker: where to send the live spectrum
+        self.sdr = sdr_settings.load()
         self.extractor = self.parser = self.decoder = None
         self.stamp = None
         self.state = 'idle'           # idle / running / stopping / decoding
@@ -123,7 +126,14 @@ class Receiver(QtCore.QObject):
         if self.replay:
             self.extractor.start(PY, ['-c', REPLAY_CODE, self.replay])
         else:
-            self.extractor.start(PY, [EXTRACTOR, '-d', str(THRESHOLD), os.path.join(HERE, 'rtl-sdr.conf')])
+            s = self.sdr = sdr_settings.load()
+            conf = sdr_settings.write_conf(s, os.path.join(paths.DATA, 'sdr.conf'))
+            args = [SOURCE, conf, '%g' % s['threshold_db'], '--ppm', '%g' % s['ppm']]
+            if self.spectrum_port:
+                args += ['--spectrum-port', str(self.spectrum_port)]
+            args += ['--auto-gain'] * s['auto_gain'] + ['--no-iq'] * (not s['iq_correction']) + \
+                ['--no-dc'] * (not s['dc_correction'])
+            self.extractor.start(PY, args)
         if not self.extractor.waitForStarted(5000):
             self.status.emit('Could not start iridium-extractor: %s' % self.extractor.errorString())
             self.parser.kill()
@@ -134,7 +144,7 @@ class Receiver(QtCore.QObject):
         self.state = 'running'
         self.timer.start(250)
         self.running.emit(True)
-        self.status.emit('Starting the SDR...')
+        self.status.emit('Starting %s...' % ('the replay' if self.replay else self.sdr['label']))
 
     # ---- while running
     def _tick(self):
@@ -239,8 +249,9 @@ class Receiver(QtCore.QObject):
             self._extractor_err()
             self.stop_reason = self.last_status or 'the decoder stopped by itself'
             if 'Failed to open' in self.stop_reason or 'usb_claim' in self.stop_reason:
-                self.stop_reason = ('the SDR could not be opened - is it plugged in, and are SDR++, SatDump '
-                                    'and 1-receive.bat closed?')
+                self.stop_reason = ('the SDR (%s) could not be opened - is it plugged in, and are SDR++, SatDump '
+                                    % self.sdr['device'] +
+                                    'and other receivers (like the Iridium Console) closed?')
         if self.state != 'stopping':
             return
         self.timer.stop()

@@ -50,6 +50,34 @@ least 30-60 minutes outdoors. In the list on the right, click a satellite to see
 position it sent you and how good its orbit is.
 
 
+CHOOSING YOUR SDR (Source button)
+---------------------------------
+The "Source" button next to Start receiver works like SDR++'s source menu:
+- Device: the SDRs found on this PC (Refresh to look again), an RTL-SDR shared over the network
+  (RTL-TCP: rtl_tcp=host:port), or any gr-osmosdr device string (hackrf=0, airspy=0, rtl=1,
+  soapy=0,driver=...).
+- Sample rate: RTL-SDRs 2.0-2.5 MS/s. Wider SDRs (HackRF, Airspy, bladeRF) can take up to
+  10-20 MS/s and cover the whole Iridium band (1616-1626.5 MHz).
+- Frequency: Automatic keeps the ring-alert channels (1626.0-1626.5 MHz) in view.
+- Gain (or Auto), PPM correction, Bias-T (powers an active antenna or LNA through the coax),
+  offset tuning and IQ / DC correction (for E4000 tuners like the SMArTee XTR).
+- Burst threshold: how far over the noise a burst must be. 14 dB is the minimum - lower floods
+  the decoder with false bursts and can run the PC out of memory.
+Changes apply the next time you start the receiver.
+
+
+SPECTRUM AND WATERFALL
+----------------------
+Under the map, while receiving: the live spectrum (top) and waterfall (bottom) of exactly what
+the decoder hears - each Iridium burst shows up as a short dash in the waterfall. The ring-alert
+and messaging channels are shaded green, the phone channels blue.
+- Mouse wheel zooms in on a frequency, drag moves along, double-click shows everything.
+- Hover to read the frequency and level (and how long ago, in the waterfall).
+- Auto range keeps the noise dark and bursts bright; untick it to set Min / Max yourself.
+- Peak hold draws the strongest level seen at each frequency - handy when aiming an antenna.
+- The Spectrum button at the top hides or shows it; drag the divider to resize it.
+
+
 THE CONSOLE (more detail)
 -------------------------
 Double-click "Iridium Console.bat" for a burst-by-burst view, like a radio log:

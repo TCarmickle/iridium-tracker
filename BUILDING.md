@@ -40,6 +40,10 @@ conda environment that has the packages in `environment.yml`: `python app\start.
 | `app\start.py` | entry point |
 | `app\iridium_tracker.py` | the window: map, timeline, satellite list |
 | `app\console.py` | Iridium Console: detailed burst-by-burst view, or receiving without the window |
+| `app\sdr_source.py` | runs gr-iridium's extractor with the device options and the spectrum tap (UDP) |
+| `app\sdr_settings.py` | SDR source settings, device discovery, extractor config |
+| `app\source_dialog.py` | the Source panel |
+| `app\spectrum.py` | spectrum + waterfall view |
 | `app\receiver.py` | runs iridium-extractor + iridium-parser while receiving |
 | `app\catalog.py` | adds finished captures to the catalog (`catalog-data.json`, `catalog.txt`) |
 | `app\orbitfit.py` | fits orbits to your own position fixes and Doppler |

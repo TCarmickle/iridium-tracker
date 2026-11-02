@@ -15,6 +15,10 @@ once they have sent you a position fix, and fade as the time since you last hear
   fixes and Doppler curves, with an uncertainty that grows with time since the last observation
 - **Timeline** to scrub, play and replay past captures
 - **Per-satellite details**: every ring-alert position it sent you, how good its orbit is, next pass
+- **Spectrum and waterfall** like SDR++: the live spectrum of exactly what the decoder hears, with
+  zoom, hover readout, auto range and peak hold
+- **Choose your SDR** like SDR++'s source menu: any gr-osmosdr device (RTL-SDR, RTL-TCP, HackRF,
+  Airspy, bladeRF, SoapySDR...), sample rate, frequency, gain, PPM, bias-T, IQ/DC correction
 - **Iridium Console** (`Iridium Console.bat`): a burst-by-burst log of every decoded frame, ring-alert
   positions and decoder status, alongside the tracker or receiving on its own
 - **Click the map to set your location**; the terrain height is looked up automatically

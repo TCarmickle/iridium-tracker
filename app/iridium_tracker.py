@@ -34,6 +34,9 @@ import paths     # noqa: E402  (where the data lives)
 import catalog   # noqa: E402  (capture reading, satellite names)
 import storage   # noqa: E402  (keeping the data small)
 import data_dialog  # noqa: E402
+import sdr_settings  # noqa: E402
+import source_dialog  # noqa: E402
+import spectrum  # noqa: E402
 import orbitfit  # noqa: E402  (orbits from our own observations)
 import receiver  # noqa: E402  (the SDR receiver and decoder, run from here)
 import location_dialog  # noqa: E402
@@ -1117,9 +1120,15 @@ class Tracker(QtWidgets.QMainWindow):
         self.rx_btn = QtWidgets.QPushButton()
         self.rx_btn.setMinimumWidth(170)
         self.rx_btn.clicked.connect(self.toggle_receiver)
-        self.rx_btn.setToolTip('Runs the SDR receiver and decoder (what 1-receive.bat does). Close SDR++ and '
-                               'SatDump first - only one program can use the SDR. When you stop, the capture '
-                               'is decoded into the catalog automatically (what 2-decode.bat does).')
+        self.rx_btn.setToolTip('Runs the SDR receiver and decoder. Close SDR++ and SatDump first - only one '
+                               'program can use the SDR. When you stop, the capture is added to the catalog.')
+        self.src_btn = QtWidgets.QPushButton('\u2699  Source')
+        self.src_btn.setToolTip('Choose the SDR and how it is tuned: sample rate, frequency, gain, PPM, bias-T...')
+        self.src_btn.clicked.connect(self.show_source)
+        self.spec_btn = QtWidgets.QPushButton('Spectrum')
+        self.spec_btn.setCheckable(True)
+        self.spec_btn.setChecked(True)
+        self.spec_btn.setToolTip('Show or hide the live spectrum and waterfall')
         self.rx_dot = QtWidgets.QLabel()
         self.rx_status = QtWidgets.QLabel('Receiver off')
         self.rx_status.setStyleSheet('color: %s;' % MUTED)
@@ -1134,6 +1143,8 @@ class Tracker(QtWidgets.QMainWindow):
         hl.addWidget(title)
         hl.addSpacing(16)
         hl.addWidget(self.rx_btn)
+        hl.addWidget(self.src_btn)
+        hl.addWidget(self.spec_btn)
         hl.addSpacing(6)
         hl.addWidget(self.rx_dot)
         hl.addWidget(self.rx_status, 1)
@@ -1173,7 +1184,17 @@ class Tracker(QtWidgets.QMainWindow):
         self.pick_bar.hide()
         self.map.locationPicked.connect(self._picked)
         lv.addWidget(self.pick_bar)
-        lv.addWidget(self.map, 1)
+        # map above, live spectrum + waterfall below (drag the divider; the Spectrum button hides it)
+        self.spectrum = spectrum.SpectrumPanel()
+        self.receiver.spectrum_port = self.spectrum.view.port
+        self.map_split = QtWidgets.QSplitter(Qt.Vertical)
+        self.map_split.addWidget(self.map)
+        self.map_split.addWidget(self.spectrum)
+        self.map_split.setStretchFactor(0, 3)
+        self.map_split.setStretchFactor(1, 2)
+        self.map_split.setSizes([560, 330])
+        self.spec_btn.toggled.connect(self.spectrum.setVisible)
+        lv.addWidget(self.map_split, 1)
         lv.addLayout(opts)
         lv.addWidget(self.timeline)
         lv.addLayout(row)
@@ -1252,6 +1273,16 @@ class Tracker(QtWidgets.QMainWindow):
             self.start_pick()
 
     # ---- receiver
+    def show_source(self):
+        d = source_dialog.SourceDialog(self, receiving=self.receiver.busy)
+        if d.exec_() and not self.receiver.busy:
+            self.rx_status.setText(self._source_text())
+
+    def _source_text(self):
+        s = sdr_settings.load()
+        return 'Receiver off  \u00b7  %s  \u00b7  %.4f MHz, %g MS/s' % (
+            s['label'], sdr_settings.center_hz(s) / 1e6, s['sample_rate'] / 1e6)
+
     def toggle_receiver(self):
         if self.receiver.state == 'running':
             self.receiver.stop()
@@ -1492,10 +1523,10 @@ class Tracker(QtWidgets.QMainWindow):
         if not self.receiver.busy:
             outside = age < 120 and self.data.live_cap != 'output-%s' % self.receiver.stamp   # not our own last run
             if outside:
-                self.rx_status.setText('1-receive.bat is running outside the app (%s) - close its window before '
-                                       'starting the receiver here' % self.data.live_cap)
-            elif not self.receiver.stamp or self.rx_status.text().startswith('1-receive.bat'):
-                self.rx_status.setText('Receiver off')     # (after a run here, its result message stays up)
+                self.rx_status.setText('Another receiver is running (%s) - stop it (Iridium Console or another '
+                                       'tracker window) before starting the receiver here' % self.data.live_cap)
+            elif not self.receiver.stamp or self.rx_status.text().startswith('Another receiver'):
+                self.rx_status.setText(self._source_text())     # (after a run here, its result message stays up)
         self.status.setText('%s    |    %s    |    %s' % (live, self.tle_note, 'You: %.4f, %.4f' % (HOME_LAT, HOME_LON) if catalog.HOME else 'Location not set'))
         self.refresh()
 
