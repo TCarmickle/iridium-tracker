@@ -54,6 +54,8 @@ FIT_DAYS = 7          # orbits are fitted to each satellite's most recent week o
 HEARTBEAT_S = 45      # a receiver's decoder log is written every 10 s; this long without a change = stopped
 PLANE_MAX_SIGMA_KM = 300  # a satellite's orbit plane must be known this well to place its plane
 PLANE_JOIN_DEG = 5.0      # a satellite without a slot number joins a plane whose node is this close
+PLANE_SPACING_DEG = 31.6  # Iridium's planes, numbered 1-6 in order, are this far apart (design value)
+LINK_EVERY_S = 30         # how often an unlinked plane/slot is tried against the satellites while receiving
 ORBIT_RADIUS = 6378.137 + 781   # Iridium's design altitude, only used to draw the plane rings
 PLANE_COLORS = {1: (77, 148, 255), 2: (176, 120, 240), 3: (40, 200, 200), 4: (240, 100, 180),
                 5: (215, 150, 80), 6: (150, 200, 60), None: (150, 150, 150)}
@@ -192,6 +194,10 @@ class Data:
         self.live_cap = None    # the newest capture (the one the receiver writes while running)
         self.live_fixes, self.live_heard, self.live_events = [], {}, []
         self.frame_queue = []   # (kind, line) of new frames in the newest capture, for the activity lights
+        self.unlinked = {}      # (capture, (plane, slot)) -> [(t, Hz)] of time & location frames not yet tied to a satellite
+        self.live_links = {}    # (capture, (plane, slot)) -> name, matched while receiving
+        self.link_tried = {}    # (capture, (plane, slot)) -> (time tried, frames then)
+        self.links_version = 0  # goes up when a plane/slot gets linked (the satellite list needs updating)
         self.live_doppler = {}  # (capture, name) -> Doppler curve [(t, Hz), ...]
         self.heartbeat = 0      # last time the newest capture's files changed (its decoder log: every 10 s)
         self.last_burst = 0     # last time that capture received a burst
@@ -204,13 +210,61 @@ class Data:
         for n, i in self.info.items():
             if net_id in i['net_ids']:
                 return n
+        hit = catalog.match_position(self.tles(), datetime.datetime.fromtimestamp(t, UTC), lat, lon)
+        return hit[0] if hit and hit[1] > 85 else None
+
+    def tles(self):
+        """the public satellite list - for names only"""
         if self._tles is None:
             try:
                 self._tles = catalog.load_tles()
             except OSError:
                 self._tles = []
-        hit = catalog.match_position(self._tles, datetime.datetime.fromtimestamp(t, UTC), lat, lon)
-        return hit[0] if hit and hit[1] > 85 else None
+        return self._tles
+
+    def link_slots(self, events):
+        """while receiving: tie each plane/slot heard in time & location frames to a satellite by its Doppler
+        curve - the same match (and confidence rule) catalog.py uses when a capture is finished"""
+        now = time.time()
+        linked = []
+        for key, pts in list(self.unlinked.items()):
+            cap, ps = key
+            if ps in self.slot_name or key in self.live_links:
+                self.unlinked.pop(key)
+                continue
+            recent = [p for p in pts if p[0] > pts[-1][0] - 900]       # this pass
+            tried_at, tried_n = self.link_tried.get(key, (0, 0))
+            if len(recent) < 3 or recent[-1][0] - recent[0][0] < 20 or \
+                    (now - tried_at < LINK_EVERY_S and len(recent) < tried_n + 5):
+                continue
+            self.link_tried[key] = (now, len(recent))
+            fits = catalog.match_doppler(self.tles(), [(datetime.datetime.fromtimestamp(t, UTC), hz) for t, hz in recent], [0])
+            if not fits:
+                continue
+            rms, name = fits[0]
+            second = fits[1][0] if len(fits) > 1 else 1e9
+            if rms < 300 and second > 2.5 * rms:                    # catalog.py's "confident"
+                self.live_links[key] = name
+                self._apply_link(cap, ps, name)
+                linked.append(name)
+                events.append('%s  plane %d #%d is %s (matched by its Doppler curve, %.0f Hz rms)'
+                              % (fmt_clock(now), ps[0], ps[1], name, rms))
+        if linked:
+            self.links_version += 1
+            self.fit_orbits(set(linked))
+
+    def _apply_link(self, cap, ps, name):
+        self.slot_name[ps] = name
+        i = self._info(name)
+        i['slots'].add(ps)
+        i['how'].add('Doppler')
+        pts = self.unlinked.pop((cap, ps), [])
+        if pts:                     # its frames so far become a Doppler curve for the orbit fit
+            g = self.live_doppler.setdefault((cap, name), [])
+            if not g:
+                self.doppler.setdefault(name, []).append(g)
+            g.extend(pts)
+            i['last'] = max(i['last'], pts[-1][0])
 
     def fit_orbits(self, names=None):
         """compute orbits from our own fixes and Doppler curves"""
@@ -297,6 +351,11 @@ class Data:
             self._add_live_fix_info(fx)
         for (_, n), g in self.live_doppler.items():
             self.doppler.setdefault(n, []).append(g)
+        self.live_links = {k: n for k, n in self.live_links.items() if k[0] not in done}
+        for (cap, ps), n in self.live_links.items():     # slots matched while receiving (not in the catalog yet)
+            if ps not in self.slot_name:
+                self.slot_name[ps] = n
+                self._info(n)['slots'].add(ps)
         self.fit_orbits()
 
     def _info(self, name):
@@ -352,6 +411,20 @@ class Data:
             else:
                 unknown -= 1          # a plane we can't number yet
                 groups[unknown] = [s]
+        # a plane none of whose satellites has a slot number yet: number it from a numbered plane, since
+        # planes 1-6 are PLANE_SPACING_DEG apart in order
+        numbered = {k: mean_node(g) for k, g in groups.items() if k > 0}
+        for k in [k for k in groups if k < 0]:
+            node = mean_node(groups[k])
+            best = None
+            for ref, ref_node in numbered.items():
+                d = (math.degrees(node - ref_node) + 180) % 360 - 180
+                n = ref + round(d / PLANE_SPACING_DEG)
+                miss = abs(d - (n - ref) * PLANE_SPACING_DEG)
+                if 1 <= n <= 6 and miss < 6 and (best is None or miss < best[1]):
+                    best = (n, miss)
+            if best and best[0] not in groups:
+                groups[best[0]] = groups.pop(k)
         out = []
         for k, g in groups.items():
             node = mean_node(g)
@@ -412,6 +485,7 @@ class Data:
                               % (len(self.live_fixes) - n_before, cap))
         if refit:
             self.fit_orbits(refit)
+        self.link_slots(events)
         return events
 
     def _read_live(self, text, cap, start, newest, refit):
@@ -453,6 +527,8 @@ class Data:
                         self.doppler.setdefault(name, []).append(self.live_doppler[(cap, name)])
                     self.live_doppler[(cap, name)].append((t, hz))
                     refit.add(name)
+                else:                   # not tied to a satellite yet: kept for link_slots
+                    self.unlinked.setdefault((cap, ps), []).append((t, hz))
                 events.append('%s  heard plane %d #%d%s  (%.0f dB)' % (fmt_clock(t), ps[0], ps[1],
                                                                      '  = ' + name if name else '', snr))
         return events
@@ -1613,7 +1689,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.refresh()
 
     def poll(self):
-        before = (len(self.data.all_fixes()), len(self.data.info), self.data.cat_mtime)
+        before = (len(self.data.all_fixes()), len(self.data.info), self.data.cat_mtime, self.data.links_version)
         for ev in self.data.poll():
             self.events.insertItem(0, ev)
         queue, self.data.frame_queue = self.data.frame_queue, []
@@ -1623,7 +1699,7 @@ class Tracker(QtWidgets.QMainWindow):
             queue = queue[-200:]
             for i, (kind, line) in enumerate(queue):
                 QtCore.QTimer.singleShot(int(i * 1900 / len(queue)), lambda k=kind, l=line: self._frame(k, l))
-        if (len(self.data.all_fixes()), len(self.data.info), self.data.cat_mtime) != before:
+        if (len(self.data.all_fixes()), len(self.data.info), self.data.cat_mtime, self.data.links_version) != before:
             self.reload_lists()
         d, now = self.data, time.time()
         burst = ('last burst %s ago' % fmt_age(now - d.last_burst)) if d.last_burst else 'no bursts yet'
