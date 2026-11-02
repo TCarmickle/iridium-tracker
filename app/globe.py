@@ -441,7 +441,8 @@ def _segments(pts):
 
 class GlobeWindow(QtWidgets.QDialog):
     def __init__(self, parent, home, load_tile):
-        super().__init__(parent)
+        super().__init__(None)      # its own window: taskbar button, minimize/maximize (closed with the main window)
+        self.setWindowFlags(Qt.Window | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
         self.setWindowTitle('Globe - satellites and orbits from your own observations')
         self.view = GlobeView(home, load_tile)
         bar = QtWidgets.QHBoxLayout()

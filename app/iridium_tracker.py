@@ -1656,6 +1656,9 @@ class Tracker(QtWidgets.QMainWindow):
 
     def closeEvent(self, e):
         self.receiver.shutdown()
+        for win in (self.sky, self.globe, self.sat_info):      # separate windows: close them too
+            if win is not None:
+                win.close()
         super().closeEvent(e)
 
     # ---- lists

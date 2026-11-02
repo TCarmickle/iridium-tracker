@@ -148,7 +148,8 @@ class SkyDialog(QtWidgets.QDialog):
     PERIODS = [('This run', None), ('Last hour', 3600), ('Last 24 hours', 86400), ('Everything', 0)]
 
     def __init__(self, parent, data, from_home, current_run_start):
-        super().__init__(parent)
+        super().__init__(None)      # its own window: taskbar button, minimize/maximize (closed with the main window)
+        self.setWindowFlags(Qt.Window | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
         self.setWindowTitle('Sky plot - where your antenna hears satellites')
         self.data, self.from_home, self.run_start = data, from_home, current_run_start
         self.plot = SkyPlot()

@@ -280,10 +280,10 @@ def _facts(rows):
 
 class SatInfoDialog(QtWidgets.QDialog):
     def __init__(self, tracker):
-        super().__init__(tracker)
+        super().__init__(None)      # its own window: taskbar button, minimize/maximize (closed with the main window)
         self.tracker = tracker
         self.name = None
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
+        self.setWindowFlags(Qt.Window | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
         self.title = QtWidgets.QLabel()
         self.title.setTextFormat(Qt.RichText)
         self.tabs = QtWidgets.QTabWidget()
