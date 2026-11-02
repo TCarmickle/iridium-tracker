@@ -9,7 +9,7 @@ from PyQt5.QtCore import Qt
 GREEN = QtGui.QColor(80, 255, 120)
 RED = QtGui.QColor(255, 50, 50)
 OFF = QtGui.QColor(48, 54, 64)
-FLASH_S = 0.07      # a flash: full brightness for this long, then straight off (no fade)
+FLASH_S = 0.3       # a flash: full brightness for this long, then straight off (no fade)
 
 
 def led_colour(on, flashed_at, now):
@@ -19,21 +19,12 @@ def led_colour(on, flashed_at, now):
 
 
 def paint_led(p, rect, colour, glow):
+    """a plain solid oval with crisp edges: no halo, highlight, outline or smoothing"""
     p.save()
-    p.setRenderHint(QtGui.QPainter.Antialiasing)
-    if glow > 0:            # bright halo while lit
-        halo = QtGui.QColor(colour)
-        halo.setAlpha(150)
-        p.setPen(Qt.NoPen)
-        p.setBrush(halo)
-        p.drawEllipse(rect.adjusted(-4, -3, 4, 3))
-    p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 160), 1))
+    p.setRenderHint(QtGui.QPainter.Antialiasing, False)
+    p.setPen(Qt.NoPen)
     p.setBrush(colour)
     p.drawEllipse(rect)
-    if glow > 0:            # hot white centre, like a real LED flash
-        p.setPen(Qt.NoPen)
-        p.setBrush(QtGui.QColor(255, 255, 255, 200))
-        p.drawEllipse(rect.adjusted(rect.width() * 0.3, rect.height() * 0.25, -rect.width() * 0.3, -rect.height() * 0.25))
     p.restore()
 
 

@@ -382,11 +382,14 @@ class SpectrumPanel(QtWidgets.QWidget):
     def attach_sound(self, player):
         """connect the sound controls to a sound.SoundPlayer"""
         self.player = player
-        self.volume.setValue(int(round(player.volume * 100)))
         self.sound.currentIndexChanged.connect(self._sound_mode)
         self.volume.valueChanged.connect(lambda v: player.set_volume(v / 100))
         self.view.listenPicked.connect(lambda hz: player.set_mode('tuned', hz))
         self.audio_btn.setMenu(self._audio_menu(player))
+        # every start: sound on, tuned to the ring-alert channel, at half volume
+        self.volume.setValue(50)
+        player.set_volume(0.5)
+        self.sound.setCurrentIndex(2)
 
     def _audio_menu(self, player):
         """the Audio menu: low-pass, high-pass and squelch (applied in the tracker, remembered)"""
