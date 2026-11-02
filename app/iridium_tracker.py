@@ -453,7 +453,8 @@ class Data:
                         self.doppler.setdefault(name, []).append(self.live_doppler[(cap, name)])
                     self.live_doppler[(cap, name)].append((t, hz))
                     refit.add(name)
-                events.append('%s  heard plane %d #%d%s' % (fmt_clock(t), ps[0], ps[1], '  = ' + name if name else ''))
+                events.append('%s  heard plane %d #%d%s  (%.0f dB)' % (fmt_clock(t), ps[0], ps[1],
+                                                                     '  = ' + name if name else '', snr))
         return events
 
 

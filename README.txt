@@ -81,7 +81,9 @@ SPECTRUM AND WATERFALL
 Under the map, while receiving: the live spectrum (top) and waterfall (bottom) of exactly what
 the decoder hears - each Iridium burst shows up as a short dash in the waterfall. The ring-alert
 and messaging channels are shaded green, the phone channels blue.
-- Mouse wheel zooms in on a frequency, drag moves along, double-click shows everything.
+- Mouse wheel over the waterfall zooms in on a frequency (both views), drag moves along,
+  double-click shows everything. Mouse wheel over the spectrum trace steps the tuned sound
+  frequency 1 kHz per click (10 kHz with Shift).
 - Hover to read the frequency and level (and how long ago, in the waterfall).
 - Auto range keeps the noise dark and bursts bright; untick it to set Min / Max yourself.
 - Peak hold draws the strongest level seen at each frequency - handy when aiming an antenna.

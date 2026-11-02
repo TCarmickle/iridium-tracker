@@ -13,6 +13,7 @@ from PyQt5.QtCore import QPointF, Qt
 BG, PANEL, GRID, TEXT, MUTED = '#0e1116', '#14171c', '#262b35', '#e6e9ef', '#8b93a1'
 ROWS = 500          # waterfall history (about 30 s at 15 frames/s)
 DECAY_DB = 3.0      # the peak line falls this much per frame after a burst (fast rise, slow fall)
+TUNE_STEP_HZ = 1000  # the mouse wheel over the trace moves the tuned frequency in these steps
 
 # where things are in the Iridium band (MHz)
 BANDS = [(1616.0, 1626.0, 'duplex channels (phones, data)', QtGui.QColor(76, 154, 255, 28)),
@@ -161,12 +162,31 @@ class SpectrumView(QtWidgets.QWidget):
     def wheelEvent(self, e):
         if not self.n:
             return
+        if e.pos().y() < int(self.height() * 0.42):     # over the trace: step the tuned listening frequency
+            self._tune_wheel(e)
+            return
+        # over the waterfall: zoom (the trace and the waterfall together)
         f0, f1 = self._span()
         fm = self.f_of(e.pos().x(), self.width())
         k = 0.8 if e.angleDelta().y() > 0 else 1.25
         span = min(self.rate, max(self.rate / self.n * 32, (f1 - f0) * k))
         r = (fm - f0) / (f1 - f0)
         self._set_view(fm - span * r, fm + span * (1 - r))
+
+    def _tune_wheel(self, e):
+        """each wheel click moves the tuned frequency 1 kHz (10 kHz with Shift), snapped to that step"""
+        if self.listen_hz is None:      # only while the sound is on Tuned
+            return
+        self.wheel_acc = getattr(self, 'wheel_acc', 0) + e.angleDelta().y()
+        clicks = int(self.wheel_acc / 120)          # touchpads send small deltas: add them up
+        if not clicks:
+            return
+        self.wheel_acc -= clicks * 120
+        step = TUNE_STEP_HZ * (10 if e.modifiers() & Qt.ShiftModifier else 1)
+        f = round(self.listen_hz / step) * step + clicks * step
+        self.listen_hz = min(max(f, self.center - self.rate / 2), self.center + self.rate / 2)
+        self.listenPicked.emit(self.listen_hz)
+        self.dirty = True
 
     def _set_view(self, f0, f1):
         lo, hi = self.center - self.rate / 2, self.center + self.rate / 2
