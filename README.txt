@@ -67,6 +67,16 @@ The "Source" button next to Start receiver works like SDR++'s source menu:
 Changes apply the next time you start the receiver.
 
 
+SKY PLOT (Sky button)
+---------------------
+Where in your sky the satellites were when your antenna heard them: the centre is straight
+overhead, the edge is the horizon, north is up and east is right. Big dots are position fixes
+(coloured by signal strength), small dots are other frames from identified satellites. Empty
+areas are directions or heights your antenna can't hear - a house or roof in the way, or the
+antenna's blind spot (a vertical whip hears little straight up). Move the antenna and watch the
+empty areas fill in; "Show" picks this run, the last hour, the last day or everything.
+
+
 ACTIVITY LIGHTS
 ---------------
 Next to the receiver status, two small lights flash for every burst: green (top) = a message

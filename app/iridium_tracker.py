@@ -38,6 +38,7 @@ import lights  # noqa: E402
 import sdr_settings  # noqa: E402
 import source_dialog  # noqa: E402
 import spectrum  # noqa: E402
+import skyplot  # noqa: E402
 import sound  # noqa: E402
 import orbitfit  # noqa: E402  (orbits from our own observations)
 import receiver  # noqa: E402  (the SDR receiver and decoder, run from here)
@@ -1277,6 +1278,11 @@ class Tracker(QtWidgets.QMainWindow):
         self.spec_btn.setCheckable(True)
         self.spec_btn.setChecked(True)
         self.spec_btn.setToolTip('Show or hide the live spectrum and waterfall')
+        self.sky_btn = QtWidgets.QPushButton('\U0001F9ED  Sky')
+        self.sky_btn.setToolTip('Sky plot: where in your sky the satellites were when your antenna heard them -\n'
+                                'shows blind spots, e.g. overhead or behind the house')
+        self.sky_btn.clicked.connect(self.show_sky)
+        self.sky = None
         self.rx_dot = QtWidgets.QLabel()
         self.rx_status = ElidedLabel('Receiver off')
         self.rx_status.setStyleSheet('color: %s;' % MUTED)
@@ -1293,6 +1299,7 @@ class Tracker(QtWidgets.QMainWindow):
         hl.addWidget(self.rx_btn)
         hl.addWidget(self.src_btn)
         hl.addWidget(self.spec_btn)
+        hl.addWidget(self.sky_btn)
         hl.addSpacing(6)
         hl.addWidget(self.rx_dot)
         hl.addWidget(self.activity)
@@ -1451,6 +1458,21 @@ class Tracker(QtWidgets.QMainWindow):
             net = int(m.group(1))
             return next((n for n, i in self.data.info.items() if net in i['net_ids']), None)
         return None
+
+    # ---- sky plot
+    def show_sky(self):
+        if self.sky is None:
+            self.sky = skyplot.SkyDialog(self, self.data, from_home, self._run_start)
+        self.sky.show()
+        self.sky.raise_()
+        self.sky.refresh()
+
+    def _run_start(self):
+        """start of the run being received now, or of the latest one"""
+        if self.receiver.busy:
+            return self.receiver.t_start
+        starts = [c['start'] for c in self.data.captures] + [f['t'] for f in self.data.live_fixes]
+        return max(c['start'] for c in self.data.captures) if self.data.captures else (min(starts) if starts else None)
 
     # ---- receiver
     def show_source(self):
