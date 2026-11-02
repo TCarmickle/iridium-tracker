@@ -50,6 +50,7 @@ MIN_EL = 8.2          # Iridium serves phones down to about 8 degrees elevation
 MAX_SIGMA_KM = 1500   # hide a satellite once our orbit for it is more uncertain than this
 FAINT_SIGMA_KM = 150  # draw it faded beyond this uncertainty
 FIT_DAYS = 7          # orbits are fitted to each satellite's most recent week of observations
+HEARTBEAT_S = 45      # a receiver's decoder log is written every 10 s; this long without a change = stopped
 PLANE_MAX_SIGMA_KM = 300  # a satellite's orbit plane must be known this well to place its plane
 PLANE_JOIN_DEG = 5.0      # a satellite without a slot number joins a plane whose node is this close
 ORBIT_RADIUS = 6378.137 + 781   # Iridium's design altitude, only used to draw the plane rings
@@ -171,6 +172,10 @@ def short_time(t):
     return fmt_clock(t)[:-6] + fmt_clock(t)[-3:] if d.date() == datetime.date.today() else d.strftime('%b %d').replace(' 0', ' ')
 
 
+def fmt_age(s):
+    return '%d s' % s if s < 120 else '%d min' % (s // 60) if s < 7200 else '%.1f h' % (s / 3600)
+
+
 def fmt_clock(t):
     return datetime.datetime.fromtimestamp(t).strftime('%I:%M:%S %p').lstrip('0')
 
@@ -187,7 +192,8 @@ class Data:
         self.live_fixes, self.live_heard, self.live_events = [], {}, []
         self.frame_queue = []   # (kind, line) of new frames in the newest capture, for the activity lights
         self.live_doppler = {}  # (capture, name) -> Doppler curve [(t, Hz), ...]
-        self.last_live_frame = 0
+        self.heartbeat = 0      # last time the newest capture's files changed (its decoder log: every 10 s)
+        self.last_burst = 0     # last time that capture received a burst
         self.load_catalog()
 
     def identify(self, net_id, t, lat, lon):
@@ -365,12 +371,21 @@ class Data:
                 events.append('catalog reloaded')
         except OSError:
             pass
+        # is a receiver writing right now? Its decoder log changes every 10 s even when nothing is heard,
+        # so the newest of a capture's files is its heartbeat; bursts only touch .live / .bits
+        current = [f for f in glob.glob(os.path.join(paths.CAPTURES, 'output-*'))
+                   if f.endswith(('.live', '.log', '.bits'))]
+        if current:
+            newest = max(current, key=os.path.getmtime)
+            self.live_cap = os.path.basename(newest).rsplit('.', 1)[0]
+            self.heartbeat = os.path.getmtime(newest)
+            stem = os.path.join(paths.CAPTURES, self.live_cap)
+            self.last_burst = max((os.path.getmtime(stem + e) for e in ('.live', '.bits')
+                                   if os.path.exists(stem + e) and os.path.getsize(stem + e) > 200), default=0)
         # every capture the receiver wrote that hasn't been decoded into the catalog yet
         lives = sorted(glob.glob(os.path.join(paths.CAPTURES, 'output-*.live')), key=os.path.getmtime)
         if not lives:
             return events
-        self.live_cap = os.path.basename(lives[-1])[:-5]
-        self.last_live_frame = os.path.getmtime(lives[-1])
         done = {c['name'] for c in self.captures}
         refit = set()
         for path in lives:
@@ -1606,10 +1621,19 @@ class Tracker(QtWidgets.QMainWindow):
                 QtCore.QTimer.singleShot(int(i * 1900 / len(queue)), lambda k=kind, l=line: self._frame(k, l))
         if (len(self.data.all_fixes()), len(self.data.info), self.data.cat_mtime) != before:
             self.reload_lists()
-        age = time.time() - self.data.last_live_frame
-        live = ('LIVE: receiving %s (last frame %d s ago)' % (self.data.live_cap, age)) if age < 120 else 'Receiver not running'
+        d, now = self.data, time.time()
+        burst = ('last burst %s ago' % fmt_age(now - d.last_burst)) if d.last_burst else 'no bursts yet'
+        writing = now - d.heartbeat < HEARTBEAT_S
+        if self.receiver.state == 'running':        # this window's receiver: it knows its own state
+            live = 'LIVE: receiving %s  (%s)' % (d.live_cap, burst)
+        elif self.receiver.busy:
+            live = 'Receiver finishing - adding the capture to the catalog'
+        elif writing:
+            live = 'LIVE: another receiver is writing %s  (%s)' % (d.live_cap, burst)
+        else:
+            live = 'Receiver not running'
         if not self.receiver.busy:
-            outside = age < 120 and self.data.live_cap != 'output-%s' % self.receiver.stamp   # not our own last run
+            outside = writing and d.live_cap != 'output-%s' % self.receiver.stamp   # not our own last run
             if outside:
                 self.rx_status.setText('Another receiver is running (%s) - stop it (Iridium Console or another '
                                        'tracker window) before starting the receiver here' % self.data.live_cap)

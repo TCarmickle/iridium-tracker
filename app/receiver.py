@@ -270,11 +270,7 @@ class Receiver(QtCore.QObject):
         self._parser_output()
         size = os.path.getsize(self.bits_path) if os.path.exists(self.bits_path) else 0
         if size < 200:      # nothing was received: don't leave empty files behind
-            for ext in ('.bits', '.live', '.log', '.start'):
-                try:
-                    os.remove(self.bits_path[:-5] + ext)
-                except OSError:
-                    pass
+            self._remove_capture()
             self.state = 'idle'
             self.running.emit(False)
             self.status.emit('Receiver stopped%s - nothing was received' % (': ' + self.stop_reason if self.stop_reason else ''))
@@ -311,6 +307,16 @@ class Receiver(QtCore.QObject):
             if os.path.exists(self.bits_path) and os.path.getsize(self.bits_path) >= 200:
                 subprocess.Popen([PY, os.path.join(HERE, 'catalog.py'), '--ready=output-' + self.stamp],
                                  cwd=HERE, creationflags=NO_WINDOW)
+            else:
+                self._remove_capture()
+
+    def _remove_capture(self):
+        """delete the files of a run that received nothing"""
+        for ext in ('.bits', '.live', '.log', '.start'):
+            try:
+                os.remove(self.bits_path[:-5] + ext)
+            except OSError:
+                pass
 
 
 # for testing without the SDR: copies an old capture to stdout at about 200 lines a second

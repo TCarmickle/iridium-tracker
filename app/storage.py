@@ -116,6 +116,21 @@ def enforce(catalogued, protect=(), s=None):
     Returns (files deleted, bytes freed)."""
     s = s or settings()
     caps = captures()
+    n = freed = 0
+    for name, files in list(caps.items()):      # runs that received nothing (e.g. the app closed mid-run)
+        if name in catalogued or name in protect or any(f.endswith(REDUCED) for f in files):
+            continue
+        bits = [f for f in files if f.endswith('.bits')]
+        if time.time() - max(os.path.getmtime(f) for f in files) > 600 and not _has_frames(files) \
+                and all(os.path.getsize(f) < 200 for f in bits):
+            for f in files:
+                try:
+                    freed += os.path.getsize(f)
+                    os.remove(f)
+                    n += 1
+                except OSError:
+                    pass
+            del caps[name]
     done = []
     for name, files in caps.items():
         raw = raw_files(files)
@@ -129,7 +144,6 @@ def enforce(catalogued, protect=(), s=None):
     done.sort()
     total = sum(_size(r) for _, _, r in done)
     cutoff = time.time() - s['keep_raw_days'] * 86400
-    n = freed = 0
     for mtime, name, raw in done:
         if mtime < cutoff or total > s['max_raw_mb'] * 2 ** 20:
             size = _size(raw)
