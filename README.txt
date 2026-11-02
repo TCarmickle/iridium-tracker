@@ -67,6 +67,16 @@ The "Source" button next to Start receiver works like SDR++'s source menu:
 Changes apply the next time you start the receiver.
 
 
+GLOBE (Globe button)
+--------------------
+The same picture as the map, on a 3D globe: the satellites at their orbital height, the
+orbital-plane rings, the selected satellite's past (orange) and future (yellow) path, your
+position fixes (red) and you. The night side is shaded from the Sun's real position. Anything
+behind the Earth is drawn faintly. Drag to spin, mouse wheel to zoom, double-click to come back
+to your location, click a satellite to select it. It follows the timeline, so Play and
+scrubbing move the satellites on the globe too.
+
+
 SKY PLOT (Sky button)
 ---------------------
 Where in your sky the satellites were when your antenna heard them: the centre is straight

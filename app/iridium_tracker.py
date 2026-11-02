@@ -39,6 +39,7 @@ import sdr_settings  # noqa: E402
 import source_dialog  # noqa: E402
 import spectrum  # noqa: E402
 import skyplot  # noqa: E402
+import globe  # noqa: E402
 import sound  # noqa: E402
 import orbitfit  # noqa: E402  (orbits from our own observations)
 import receiver  # noqa: E402  (the SDR receiver and decoder, run from here)
@@ -558,6 +559,30 @@ def darken_tile(data):
     out[..., 2::-1] = np.clip(rgb @ _DARK_MAP.T + 8, 0, 255).astype(np.uint8)
     out[..., 3] = 255
     return QtGui.QImage(out.tobytes(), w, h, 4 * w, QtGui.QImage.Format_RGB32).copy()
+
+
+def load_tile_rgb(z, x, y):
+    """one darkened map tile as an RGB array (from the cache, downloading it if needed) - for the globe"""
+    path = os.path.join(TILE_DIR, str(z), str(x), '%d.png' % y)
+    try:
+        if os.path.exists(path):
+            data = open(path, 'rb').read()
+        else:
+            r = requests.get(TILE_URL.format(z=z, x=x, y=y), timeout=15, headers=TILE_HEADERS)
+            r.raise_for_status()
+            data = r.content
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            open(path, 'wb').write(data)
+    except Exception:
+        return None
+    img = darken_tile(data)
+    if img is None:
+        return None
+    img = img.convertToFormat(QtGui.QImage.Format_RGB32)
+    ptr = img.constBits()
+    ptr.setsize(img.byteCount())
+    bgra = np.frombuffer(ptr, np.uint8).reshape(img.height(), img.bytesPerLine() // 4, 4)[:, :img.width()]
+    return bgra[..., 2::-1].copy()
 
 
 class TileLoader(QtCore.QObject):
@@ -1283,6 +1308,10 @@ class Tracker(QtWidgets.QMainWindow):
                                 'shows blind spots, e.g. overhead or behind the house')
         self.sky_btn.clicked.connect(self.show_sky)
         self.sky = None
+        self.globe_btn = QtWidgets.QPushButton('\U0001F310  Globe')
+        self.globe_btn.setToolTip('A 3D globe: the satellites, their orbital planes and your fixes around the Earth')
+        self.globe_btn.clicked.connect(self.show_globe)
+        self.globe = None
         self.rx_dot = QtWidgets.QLabel()
         self.rx_status = ElidedLabel('Receiver off')
         self.rx_status.setStyleSheet('color: %s;' % MUTED)
@@ -1300,6 +1329,7 @@ class Tracker(QtWidgets.QMainWindow):
         hl.addWidget(self.src_btn)
         hl.addWidget(self.spec_btn)
         hl.addWidget(self.sky_btn)
+        hl.addWidget(self.globe_btn)
         hl.addSpacing(6)
         hl.addWidget(self.rx_dot)
         hl.addWidget(self.activity)
@@ -1458,6 +1488,16 @@ class Tracker(QtWidgets.QMainWindow):
             net = int(m.group(1))
             return next((n for n, i in self.data.info.items() if net in i['net_ids']), None)
         return None
+
+    # ---- globe
+    def show_globe(self):
+        if self.globe is None:
+            self.globe = globe.GlobeWindow(self, (HOME_LAT, HOME_LON), load_tile_rgb)
+            self.globe.view.satelliteClicked.connect(self.select)
+        self.globe.view.home = (HOME_LAT, HOME_LON)
+        self.globe.view.set_scene(self.map.scene)
+        self.globe.show()
+        self.globe.raise_()
 
     # ---- sky plot
     def show_sky(self):
@@ -1839,6 +1879,8 @@ class Tracker(QtWidgets.QMainWindow):
         self.map.scene = {'sats': sats, 'planes': planes, 'tracks': tracks, 'footprints': footprints, 'fixes': fixes, 'fix_lines': fix_lines,
                           'sun': sun_position(t), 'night': self.night_chk.isChecked()}
         self.map.update()
+        if self.globe is not None and self.globe.isVisible():
+            self.globe.view.set_scene(self.map.scene)
         self._update_table(by_name)
         self._update_detail(by_name.get(self.selected))
 
