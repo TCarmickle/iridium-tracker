@@ -379,6 +379,11 @@ class Data:
         """satellites we have our own orbit for"""
         return [n for n in self.info if n in self.orbits]
 
+    @property
+    def doppler_only(self):
+        """satellites identified by their Doppler curve that we have no orbit for (listed, not drawn)"""
+        return [n for n, i in self.info.items() if n not in self.orbits and 'Doppler' in i['how']]
+
     def all_fixes(self):
         return self.fixes + self.live_fixes
 
@@ -1661,7 +1666,7 @@ class Tracker(QtWidgets.QMainWindow):
             if c['end'] - c['start'] > 120:
                 self.replay_box.addItem('%s  (%.1f h, %d fixes)' % (fmt_time(c['start']), (c['end'] - c['start']) / 3600, c['fixes']), c)
         self.replay_box.blockSignals(False)
-        names = sorted(d.tracked, key=lambda n: int(re.sub(r'\D', '', n) or 0))
+        names = sorted(d.tracked + d.doppler_only, key=lambda n: int(re.sub(r'\D', '', n) or 0))
         self.table.blockSignals(True)
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(names))
@@ -1679,10 +1684,11 @@ class Tracker(QtWidgets.QMainWindow):
         self.table.blockSignals(False)
         waiting = sorted(n for n, why in d.no_orbit.items() if 'direction' in why)
         self.summary.setText(
-            '<b>%d satellites with our own orbit</b> &middot; %d position fixes &middot; %d of 66 plane/slots heard'
+            '<b>%d satellites with our own orbit</b> &middot; %d identified by Doppler only &middot; '
+            '%d position fixes &middot; %d of 66 plane/slots heard'
             '<br><span style="color:%s">Every position and track comes only from your decoded fixes and Doppler. '
             'Satellites are shown once they have sent a position fix%s; %d others were heard but have not sent one yet.</span>'
-            % (len(names), len(d.all_fixes()), len(d.slots_heard), MUTED,
+            % (len(d.tracked), len(d.doppler_only), len(d.all_fixes()), len(d.slots_heard), MUTED,
                ' (needs another fix: %s)' % ', '.join(waiting) if waiting else '',
                sum(1 for why in d.no_orbit.values() if 'no position' in why)))
         self.tle_note = 'Orbits: computed from your own observations only'
@@ -1892,7 +1898,7 @@ class Tracker(QtWidgets.QMainWindow):
             if item is None:
                 continue
             if s is None:
-                item.setText('position unknown')
+                item.setText('position unknown' if n in self.data.orbits else 'Doppler only, no orbit')
                 item.setBackground(QtGui.QBrush())
                 item.setForeground(QtGui.QColor(MUTED))
             else:
@@ -1945,6 +1951,17 @@ class Tracker(QtWidgets.QMainWindow):
                                     'Move the timeline closer to when you heard it, or catch another fix.<hr>%s'
                                     % (self.selected, fmt_time(self.t), o.sigma_km(self.t)[0], fmt_time(o.info['last_obs']),
                                        self._fixes_html(self.selected)))
+            elif self.selected in self.data.info:      # identified by Doppler, but no orbit yet
+                i = self.data.info[self.selected]
+                why = self.data.no_orbit.get(self.selected, '')
+                self.detail.setText(
+                    '<h3 style="margin:0">%s</h3>Identified by its Doppler curve: the way its frequency shifted '
+                    'as it passed matched this satellite.<br>Slot: %s &middot; last heard %s &middot; best signal %.0f dB'
+                    '<br><span style="color:%s">Not on the map: we have no orbit for it yet%s. A position fix from it '
+                    '(or a longer Doppler curve) will put it there.</span>'
+                    % (self.selected, ', '.join('P%d S%02d' % ps for ps in sorted(i['slots'])) or '-',
+                       fmt_time(i['last']) if i['last'] else '-', i['best'], MUTED,
+                       ' (%s)' % why if why else ''))
             else:
                 self.detail.setText('Click a satellite on the map or in the list to see where it is, '
                                     'how you identified it, how good our orbit for it is, and its next pass over you.')
@@ -2026,7 +2043,7 @@ class Tracker(QtWidgets.QMainWindow):
             self.map.center_on(s['lon'], s['lat'])
 
     def jump_next_pass(self):
-        if not self.selected:
+        if self.selected not in self.data.orbits:
             return
         res = self.next_pass(self.selected)
         if res and not res[3]:

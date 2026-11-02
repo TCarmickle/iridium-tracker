@@ -29,6 +29,11 @@ ORBIT_R = (R_EARTH + 781.0) / R_EARTH
 # dist/tilt/heading of the camera, and how high the point it looks at is (Earth radii from the centre)
 TOP_VIEW = dict(dist=3.6, tilt=0.0, heading=0.0, target_r=1.0)
 SIDE_VIEW = dict(dist=1.8, tilt=72.0, heading=0.0, target_r=ORBIT_R)    # across the Earth, satellites mid-screen
+# standing at your location: an eye just above the ground, looking along `heading` and `pitch` degrees up
+EYE_R = (R_EARTH + 0.5) / R_EARTH
+GROUND_FOV = (90.0, 25.0, 130.0)     # field of view: start, narrowest, widest
+GROUND_START = dict(heading=0.0, pitch=25.0)
+COMPASS = [('N', 0), ('NE', 45), ('E', 90), ('SE', 135), ('S', 180), ('SW', 225), ('W', 270), ('NW', 315)]
 SETTLE_MS = 180                 # after the last zoom/drag step, re-render at full resolution
 
 
@@ -70,6 +75,8 @@ class GlobeView(QtWidgets.QWidget):
         self.lat0, self.lon0 = home[0], home[1]     # the point the camera looks at
         self.dist, self.tilt, self.heading = TOP_VIEW['dist'], TOP_VIEW['tilt'], TOP_VIEW['heading']
         self.target_r = TOP_VIEW['target_r']
+        self.ground = False                 # standing at your location instead of looking at the Earth
+        self.pitch, self.fov = GROUND_START['pitch'], GROUND_FOV[0]
         self.scene = None
         self.tex = None
         self.earth = None                   # cached rendering of the Earth (QImage) and what it was for
@@ -92,7 +99,15 @@ class GlobeView(QtWidgets.QWidget):
         self.update()
 
     def set_view(self, dist, tilt, heading, target_r=1.0):
+        self.ground = False
         self.dist, self.tilt, self.heading, self.target_r = dist, tilt, heading, target_r
+        self._moved()
+
+    def stand_here(self):
+        """look at the sky as if standing at your location"""
+        if not self.ground:
+            self.ground = True
+            self.heading, self.pitch, self.fov = GROUND_START['heading'], GROUND_START['pitch'], GROUND_FOV[0]
         self._moved()
 
     def _moved(self):
@@ -104,13 +119,18 @@ class GlobeView(QtWidgets.QWidget):
     # ---- the camera
     def _camera(self):
         """(position, right, up, forward, focal length in pixels)"""
-        la, lo = math.radians(self.lat0), math.radians(self.lon0)
+        la, lo = math.radians(self.home[0] if self.ground else self.lat0), math.radians(self.home[1] if self.ground else self.lon0)
         U = np.array([math.cos(la) * math.cos(lo), math.cos(la) * math.sin(lo), math.sin(la)])   # up, at the target
         E = np.array([-math.sin(lo), math.cos(lo), 0.0])                                        # east
         N = np.cross(U, E)                                                                      # north
         h, t = math.radians(self.heading), math.radians(self.tilt)
         F = N * math.cos(h) + E * math.sin(h)           # the way we're facing, along the ground
         right = E * math.cos(h) - N * math.sin(h)
+        if self.ground:
+            pt = math.radians(self.pitch)
+            fwd = F * math.cos(pt) + U * math.sin(pt)
+            f = min(self.width(), self.height()) / 2 / math.tan(math.radians(self.fov / 2))
+            return U * EYE_R, right, np.cross(right, fwd), fwd, f
         back = U * math.cos(t) - F * math.sin(t)        # from the target towards the camera
         pos = U * self.target_r + self.dist * back
         fwd = -back
@@ -121,6 +141,8 @@ class GlobeView(QtWidgets.QWidget):
     def _centre_y(self):
         """where the point we look at sits on screen: the middle when looking down, higher up as the camera
         tilts, so a side view isn't half empty sky above the horizon"""
+        if self.ground:
+            return self.height() / 2
         return self.height() * (0.5 - 0.2 * math.sin(math.radians(self.tilt)))
 
     def project(self, xyz):
@@ -155,7 +177,7 @@ class GlobeView(QtWidgets.QWidget):
         sun = self.scene['sun'] if self.scene else (0.0, 0.0)
         night = bool(self.scene and self.scene.get('night'))
         key = (round(self.lat0, 3), round(self.lon0, 3), round(self.dist, 4), round(self.tilt, 2), self.target_r,
-               round(self.heading, 2), W, H, round(sun[0], 1), round(sun[1], 1), self.tex is not None, night)
+               round(self.heading, 2), self.ground, round(self.pitch, 2), round(self.fov, 2), W, H, round(sun[0], 1), round(sun[1], 1), self.tex is not None, night)
         if key == self.earth_key:
             return self.earth
         pos, right, up, fwd, f = self._camera()
@@ -170,10 +192,16 @@ class GlobeView(QtWidgets.QWidget):
         disc = b * b - c
         hit = (disc > 0) & (-b - np.sqrt(np.clip(disc, 0, None)) > 0)
         img = np.zeros((H, W, 4), np.uint8)
+        if self.ground:     # the sky: dark blue at the horizon fading to black overhead
+            el = np.clip(d @ (pos / np.linalg.norm(pos)).astype(np.float32), 0, 1)
+            k_sky = (1 - el) ** 3
+            sky = ~hit
+            img[sky] = np.stack([10 + 70 * k_sky[sky], 9 + 36 * k_sky[sky], 7 + 18 * k_sky[sky],
+                                 np.full(sky.sum(), 255, np.float32)], -1).astype(np.uint8)
         # atmosphere: a faint blue glow just outside the edge of the Earth
         miss = ~hit & (b < 0)
         dmin = np.sqrt(np.clip(c + 1.0 - b * b, 0, None))
-        glow = miss & (dmin < 1.06)
+        glow = miss & (dmin < 1.06) & (not self.ground)
         a = np.clip((1.06 - dmin[glow]) / 0.06, 0, 1) * 80
         img[glow] = np.stack([np.full_like(a, 255), np.full_like(a, 154), np.full_like(a, 76), a], -1).astype(np.uint8)
         if hit.any():
@@ -207,7 +235,8 @@ class GlobeView(QtWidgets.QWidget):
 
     # ---- mouse
     def mousePressEvent(self, e):
-        self.drag = (e.pos(), e.button(), self.lat0, self.lon0, self.tilt, self.heading, False)
+        self.drag = (e.pos(), e.button(), self.lat0, self.lon0, self.pitch if self.ground else self.tilt,
+                     self.heading, False)
 
     def mouseMoveEvent(self, e):
         if self.drag and e.buttons() & (Qt.LeftButton | Qt.RightButton):
@@ -215,7 +244,11 @@ class GlobeView(QtWidgets.QWidget):
             d = e.pos() - p0
             if abs(d.x()) + abs(d.y()) > 2:
                 self.drag = (p0, button, la, lo, tilt, heading, True)
-                if button == Qt.RightButton:        # tilt and turn
+                if self.ground:                     # look around: drag the sky
+                    deg = self.fov / min(self.width(), self.height())
+                    self.heading = (heading - d.x() * deg + 180) % 360 - 180
+                    self.pitch = max(-30.0, min(90.0, tilt + d.y() * deg))
+                elif button == Qt.RightButton:      # tilt and turn
                     self.tilt = max(0.0, min(TILT_MAX, tilt - d.y() * 0.3))
                     self.heading = (heading - d.x() * 0.3 + 180) % 360 - 180
                 else:                               # grab the Earth and move it
@@ -243,8 +276,11 @@ class GlobeView(QtWidgets.QWidget):
         self.drag = None
 
     def center_home(self):
-        """look at your location again, keeping the current zoom, tilt and direction"""
+        """look at your location again, keeping the current zoom, tilt and direction
+        (standing there: look back at the horizon to the north)"""
         self.lat0, self.lon0 = self.home
+        if self.ground:
+            self.heading, self.pitch = GROUND_START['heading'], GROUND_START['pitch']
         self._moved()
 
     def mouseDoubleClickEvent(self, e):
@@ -252,7 +288,10 @@ class GlobeView(QtWidgets.QWidget):
 
     def wheelEvent(self, e):
         step = 1 / 1.15 if e.angleDelta().y() > 0 else 1.15
-        self.dist = min(DIST_MAX, max(DIST_MIN, self.dist * step))
+        if self.ground:
+            self.fov = min(GROUND_FOV[2], max(GROUND_FOV[1], self.fov * step))
+        else:
+            self.dist = min(DIST_MAX, max(DIST_MIN, self.dist * step))
         self._moved()
 
     def _hit(self, pos):
@@ -284,6 +323,39 @@ class GlobeView(QtWidgets.QWidget):
                     last = i
             p.drawPath(path)
 
+    def _sky_points(self, az, el):
+        """points in the sky seen from your location (degrees), far enough out to project"""
+        la, lo = math.radians(self.home[0]), math.radians(self.home[1])
+        U = np.array([math.cos(la) * math.cos(lo), math.cos(la) * math.sin(lo), math.sin(la)])
+        E = np.array([-math.sin(lo), math.cos(lo), 0.0])
+        N = np.cross(U, E)
+        az, el = np.radians(np.atleast_1d(az))[:, None], np.radians(np.atleast_1d(el))[:, None]
+        dirs = (N * np.cos(az) + E * np.sin(az)) * np.cos(el) + U * np.sin(el)
+        return U * EYE_R + 0.5 * dirs
+
+    def _draw_compass(self, p):
+        """standing view: lines 30 and 60 degrees up, and the compass points along the horizon"""
+        az = np.arange(0, 361, 3.0)
+        for el in (30.0, 60.0):
+            self._line(p, self._sky_points(az, np.full_like(az, el)), QtGui.QColor(139, 147, 161, 70), 1.0, faint_alpha=0)
+            x, y, _, inview = self.project(self._sky_points([self.heading], [el]))
+            if inview[0]:
+                p.setPen(QtGui.QColor(139, 147, 161, 150))
+                p.drawText(QPointF(x[0] + 4, y[0] - 3), '%d°' % el)
+        font = p.font()
+        bold = QtGui.QFont(font)
+        bold.setBold(True)
+        for name, a in COMPASS:
+            x, y, _, inview = self.project(self._sky_points([a], [0.0]))
+            if not inview[0]:
+                continue
+            p.setPen(QtGui.QPen(QtGui.QColor(139, 147, 161, 160), 1))
+            p.drawLine(QPointF(x[0], y[0]), QPointF(x[0], y[0] - 8))
+            p.setFont(bold if len(name) == 1 else font)
+            p.setPen(QtGui.QColor('#e6e9ef') if len(name) == 1 else QtGui.QColor('#8b93a1'))
+            p.drawText(QtCore.QRectF(x[0] - 15, y[0] - 26, 30, 16), Qt.AlignCenter, name)
+        p.setFont(font)
+
     def paintEvent(self, _):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.Antialiasing)
@@ -294,6 +366,8 @@ class GlobeView(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
         p.drawImage(QtCore.QRectF(0, 0, w, h), img)
         self.hits = []
+        if self.ground:
+            self._draw_compass(p)
         sc = self.scene
         if sc:
             import iridium_tracker as it      # colours shared with the map
@@ -318,7 +392,7 @@ class GlobeView(QtWidgets.QWidget):
                     p.drawEllipse(QPointF(x[0], y[0]), 3.5, 3.5)
             # you
             hx, hy, hf, _ = self.project(to_xyz(self.home[0], self.home[1], 2.0))
-            if hf[0]:
+            if hf[0] and not self.ground:
                 p.setPen(QtGui.QPen(Qt.white, 1.5))
                 p.setBrush(it.C_HOME)
                 p.drawEllipse(QPointF(hx[0], hy[0]), 4, 4)
@@ -345,7 +419,8 @@ class GlobeView(QtWidgets.QWidget):
                         '%.0f&deg; above your horizon' % st['el'] if st['el'] > 0 else 'below your horizon')))
             p.setOpacity(1.0)
         p.setPen(QtGui.QColor('#8b93a1'))
-        p.drawText(QPointF(10, h - 10), 'Drag: move  ·  right-drag: tilt / turn  ·  wheel: zoom  ·  double-click: back to you')
+        p.drawText(QPointF(10, h - 10), 'Drag: look around  ·  wheel: zoom  ·  double-click: face north' if self.ground else
+                   'Drag: move  ·  right-drag: tilt / turn  ·  wheel: zoom  ·  double-click: back to you')
         p.drawText(QPointF(w - 200, h - 10), '© OpenStreetMap contributors')
 
 
@@ -378,12 +453,16 @@ class GlobeWindow(QtWidgets.QDialog):
             b.setToolTip(tip)
             b.clicked.connect(lambda _, v=preset: self.view.set_view(v['dist'], v['tilt'], self.view.heading, v['target_r']))
             bar.addWidget(b)
+        stand = QtWidgets.QPushButton('🧍  Stand here')
+        stand.setToolTip('See the sky as if you were standing at your location: the satellites passing overhead,\n'
+                         'with the compass along the horizon. Drag to look around, wheel to zoom.')
+        stand.clicked.connect(self.view.stand_here)
+        bar.addWidget(stand)
         me = QtWidgets.QPushButton('◎  Center on me')
         me.setToolTip('Bring your location back to the centre of the view (top or side view)')
         me.clicked.connect(self.view.center_home)
         bar.addWidget(me)
-        bar.addWidget(QtWidgets.QLabel('<span style="color:#8b93a1">Right-drag up/down to tilt, '
-                                       'left/right to turn</span>'))
+        bar.addWidget(QtWidgets.QLabel('<span style="color:#8b93a1">Top/side view: right-drag to tilt and turn</span>'))
         bar.addStretch(1)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)

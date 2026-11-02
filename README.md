@@ -18,7 +18,7 @@ once they have sent you a position fix, and fade as the time since you last hear
 - **Spectrum and waterfall** like SDR++: the live spectrum of exactly what the decoder hears, with
   zoom, hover readout, auto range and peak hold - and **sound**: hear the raw radio (static and burst
   clicks) for the whole band or one channel you click, like SDR++
-- **3D globe**: satellites, orbital-plane rings, tracks and your fixes in 3D around the Earth (top or side view), following the timeline
+- **3D globe**: satellites, orbital-plane rings, tracks and your fixes in 3D around the Earth (top view, side view, or standing at your location looking up), following the timeline
 - **Sky plot**: where in your sky your antenna hears satellites (position fixes coloured by signal),
   to find blind spots and compare antenna placements
 - **Activity lights**: flash green for every decoded message and red for every damaged burst, and

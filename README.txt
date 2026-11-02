@@ -76,7 +76,9 @@ behind the Earth is drawn faintly. Drag to move around the Earth, mouse wheel to
 right-drag up/down to tilt and left/right to turn, "Center on me" (or double-click) to come
 back to your location,
 click a satellite to select it. "Top view" looks straight down; "Side view" looks across the
-Earth towards the horizon, with the orbits arching over it. It follows the timeline, so Play
+Earth towards the horizon, with the orbits arching over it. "Stand here" shows the sky as if you
+were standing at your location - the satellites passing overhead, with the compass along the
+horizon and lines 30 and 60 degrees up; drag to look around, wheel to zoom. It follows the timeline, so Play
 and scrubbing move the satellites on the globe too.
 
 
