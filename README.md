@@ -18,6 +18,7 @@ once they have sent you a position fix, and fade as the time since you last hear
 - **Spectrum and waterfall** like SDR++: the live spectrum of exactly what the decoder hears, with
   zoom, hover readout, auto range and peak hold - and **sound**: hear the raw radio (static and burst
   clicks) for the whole band or one channel you click, like SDR++
+- **Satellite info**: click any satellite for its launch and hardware facts, its Doppler curves (plotted against the prediction they were matched to), every pass you heard, and our orbit vs the public catalog
 - **3D globe**: satellites, orbital-plane rings, tracks and your fixes in 3D around the Earth (top view, side view, or standing at your location looking up), following the timeline
 - **Sky plot**: where in your sky your antenna hears satellites (position fixes coloured by signal),
   to find blind spots and compare antenna placements

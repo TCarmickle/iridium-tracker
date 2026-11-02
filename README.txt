@@ -67,6 +67,20 @@ The "Source" button next to Start receiver works like SDR++'s source menu:
 Changes apply the next time you start the receiver.
 
 
+SATELLITE INFO (click a satellite)
+----------------------------------
+Clicking a satellite on the map, the globe or in the list opens a window about it, with tabs:
+  About          its launch (date and mission), block, hardware, the public catalog's orbit, and
+                 how your receiver identified it
+  Doppler curve  each pass's measured frequency shift plotted against the predicted curve it was
+                 matched to: when it was closest, how high it was, and how much better it matched
+                 than the next-best satellite
+  Heard          every pass you picked it up (double-click one to jump the timeline there)
+  Orbit          our own orbit for it, compared with the public catalog's
+Launch and catalog facts come from the public CelesTrak list; the map and globe still use only
+your own observations.
+
+
 GLOBE (Globe button)
 --------------------
 The same picture as the map, on a 3D globe: the satellites at their orbital height, the

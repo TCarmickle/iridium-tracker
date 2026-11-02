@@ -40,6 +40,7 @@ import source_dialog  # noqa: E402
 import spectrum  # noqa: E402
 import skyplot  # noqa: E402
 import globe  # noqa: E402
+import satinfo  # noqa: E402
 import sound  # noqa: E402
 import orbitfit  # noqa: E402  (orbits from our own observations)
 import receiver  # noqa: E402  (the SDR receiver and decoder, run from here)
@@ -1240,6 +1241,8 @@ class Tracker(QtWidgets.QMainWindow):
 
         self.map = MapView()
         self.map.satelliteClicked.connect(self.select)
+        self.map.satelliteClicked.connect(self.show_sat_info)
+        self.sat_info = None
         self.timeline = Timeline()
         self.timeline.timeChanged.connect(self.scrub)
 
@@ -1499,6 +1502,7 @@ class Tracker(QtWidgets.QMainWindow):
         if self.globe is None:
             self.globe = globe.GlobeWindow(self, (HOME_LAT, HOME_LON), load_tile_rgb)
             self.globe.view.satelliteClicked.connect(self.select)
+            self.globe.view.satelliteClicked.connect(self.show_sat_info)
         self.globe.view.home = (HOME_LAT, HOME_LON)
         self.globe.view.set_scene(self.map.scene)
         self.globe.show()
@@ -1695,6 +1699,17 @@ class Tracker(QtWidgets.QMainWindow):
 
     def _table_clicked(self, row, _col):
         self.select(self.table.item(row, 0).text(), from_table=True)
+        self.show_sat_info(self.selected)
+
+    def show_sat_info(self, name):
+        """the pop-up with everything about a satellite (one window, switched to whichever was clicked)"""
+        if not name:
+            return
+        if self.sat_info is None:
+            self.sat_info = satinfo.SatInfoDialog(self)
+        self.sat_info.show_satellite(name)
+        self.sat_info.show()
+        self.sat_info.raise_()
 
     def select(self, name, from_table=False):
         self.selected = name
