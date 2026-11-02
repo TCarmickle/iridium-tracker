@@ -4,8 +4,10 @@ same samples the decoder sees, sent to the tracker over a local UDP socket.
 
 Usage (receiver.py starts it):
   python sdr_source.py CONF THRESHOLD_DB [--spectrum-port N] [--ppm X] [--auto-gain] [--no-iq] [--no-dc]
-Spectrum datagrams: b'IRSP', centre Hz (float64), sample rate (float64), then FFT_SIZE float32 dB values
-(lowest frequency first).
+Every sample goes through the FFT (no gaps), so even an 8 ms Iridium burst can't fall between frames.
+Spectrum datagrams, FRAME_RATE a second: b'IRS2', centre Hz (float64), sample rate (float64), then
+FFT_SIZE float32 dB values of the PEAK over the frame's FFTs, then FFT_SIZE of their AVERAGE (lowest
+frequency first).
 """
 import argparse
 import os
@@ -16,8 +18,8 @@ import sys
 
 import numpy as np
 import osmosdr
-from gnuradio import gr
-from gnuradio.fft import logpwrfft
+from gnuradio import blocks, fft as gr_fft, gr
+from gnuradio.fft import window
 
 import iridium.iridium_extractor_flowgraph as fg
 
@@ -50,21 +52,41 @@ osmosdr.source = _source
 
 
 class UdpSpectrum(gr.sync_block):
-    """sends each FFT frame to the tracker; a closed or missing tracker never stops the decoder"""
+    """collects the power spectra of all samples and sends their peak and average FRAME_RATE times a
+    second; a closed or missing tracker never stops the decoder"""
 
-    def __init__(self, port, center, rate):
+    def __init__(self, port, center, rate, win):
         gr.sync_block.__init__(self, 'udp_spectrum', in_sig=[(np.float32, FFT_SIZE)], out_sig=None)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addr = ('127.0.0.1', port)
-        self.head = struct.pack('<4sdd', b'IRSP', float(center), float(rate))
+        self.head = struct.pack('<4sdd', b'IRS2', float(center), float(rate))
+        self.per_frame = max(1, int(rate / FFT_SIZE / FRAME_RATE))
+        self.norm = 10 * np.log10(np.sum(win) ** 2)     # a full-scale tone reads 0 dB
+        self._clear()
+
+    def _clear(self):
+        self.peak = np.zeros(FFT_SIZE, np.float32)
+        self.total = np.zeros(FFT_SIZE, np.float64)
+        self.count = 0
 
     def work(self, input_items, output_items):
-        for v in input_items[0]:
-            try:
-                self.sock.sendto(self.head + np.asarray(v, np.float32).tobytes(), self.addr)
-            except OSError:
-                pass
-        return len(input_items[0])
+        x = input_items[0]
+        i = 0
+        while i < len(x):
+            take = min(len(x) - i, self.per_frame - self.count)
+            chunk = x[i:i + take]
+            np.maximum(self.peak, chunk.max(axis=0), out=self.peak)
+            self.total += chunk.sum(axis=0)
+            self.count += take
+            i += take
+            if self.count >= self.per_frame:
+                db = 10 * np.log10(np.stack([self.peak, self.total / self.count]) + 1e-20) - self.norm
+                try:
+                    self.sock.sendto(self.head + db.astype(np.float32).tobytes(), self.addr)
+                except OSError:
+                    pass
+                self._clear()
+        return len(x)
 
 
 def _try(what, fn, *a):
@@ -90,12 +112,15 @@ def _init(self, *a, **k):
     _try('IQ correction: %s' % ('on' if not opts.no_iq else 'off'), src.set_iq_balance_mode, 0 if opts.no_iq else 2, 0)
     _try('DC correction: %s' % ('on' if not opts.no_dc else 'off'), src.set_dc_offset_mode, 0 if opts.no_dc else 2, 0)
     if opts.spectrum_port:
-        fft = logpwrfft.logpwrfft_c(sample_rate=self._input_sample_rate, fft_size=FFT_SIZE, ref_scale=2.0,
-                                     frame_rate=FRAME_RATE, avg_alpha=1.0, average=False, shift=True)
-        sink = UdpSpectrum(opts.spectrum_port, self._center_frequency, self._input_sample_rate)
-        self.connect(src, fft, sink)
-        self._spectrum_blocks = (fft, sink)     # keep them alive
-        print('Spectrum: %d-point FFT, %d frames/s' % (FFT_SIZE, FRAME_RATE), file=sys.stderr)
+        win = window.blackmanharris(FFT_SIZE)
+        chain = [blocks.stream_to_vector(gr.sizeof_gr_complex, FFT_SIZE),
+                 gr_fft.fft_vcc(FFT_SIZE, True, win, True),
+                 blocks.complex_to_mag_squared(FFT_SIZE),
+                 UdpSpectrum(opts.spectrum_port, self._center_frequency, self._input_sample_rate, win)]
+        self.connect(src, *chain)
+        self._spectrum_blocks = chain       # keep them alive
+        print('Spectrum: %d-point FFT of every sample, peak + average %d times/s' % (FFT_SIZE, FRAME_RATE),
+              file=sys.stderr)
 
 
 fg.FlowGraph.__init__ = _init

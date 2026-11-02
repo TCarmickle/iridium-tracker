@@ -12,6 +12,7 @@ from PyQt5.QtCore import QPointF, Qt
 
 BG, PANEL, GRID, TEXT, MUTED = '#0e1116', '#14171c', '#262b35', '#e6e9ef', '#8b93a1'
 ROWS = 500          # waterfall history (about 30 s at 15 frames/s)
+DECAY_DB = 3.0      # the peak line falls this much per frame after a burst (fast rise, slow fall)
 
 # where things are in the Iridium band (MHz)
 BANDS = [(1616.0, 1626.0, 'duplex channels (phones, data)', QtGui.QColor(76, 154, 255, 28)),
@@ -44,7 +45,7 @@ class SpectrumView(QtWidgets.QWidget):
         self.lut = colormap()
         self.center = self.rate = 0.0
         self.n = 0
-        self.trace = self.peak = None
+        self.trace = self.peak = self.avg = None
         self.water = None           # ROWS x n uint8 (colour index), newest row first
         self.water_db = None        # the dB values behind it (to recolour when the range changes)
         self.last_frame = 0.0
@@ -64,15 +65,21 @@ class SpectrumView(QtWidgets.QWidget):
     def _read(self):
         while self.sock.hasPendingDatagrams():
             d = bytes(self.sock.receiveDatagram().data())
-            if len(d) < 24 or d[:4] != b'IRSP':
+            if len(d) < 24 or d[:4] not in (b'IRSP', b'IRS2'):
                 continue
             _, center, rate = struct.unpack('<4sdd', d[:20])
-            v = np.frombuffer(d[20:], np.float32).astype(np.float64)
-            if self.paused or not np.all(np.isfinite(v)):
+            x = np.frombuffer(d[20:], np.float32).astype(np.float64)
+            if d[:4] == b'IRS2':        # peak and average of every FFT in the frame
+                v, av = x[:len(x) // 2], x[len(x) // 2:]
+            else:                       # a single snapshot
+                v = av = x
+            if self.paused or not np.all(np.isfinite(x)):
                 continue
             if len(v) != self.n or center != self.center or rate != self.rate:
                 self._reset(center, rate, len(v))
-            self.trace = v if self.trace is None else 0.6 * self.trace + 0.4 * v
+            # peak line: jumps up with a burst, then falls back slowly so you can see it
+            self.trace = v.copy() if self.trace is None else np.maximum(v, self.trace - DECAY_DB)
+            self.avg = av.copy() if self.avg is None else 0.7 * self.avg + 0.3 * av
             self.peak = np.maximum(self.peak, v) if self.peak is not None else v.copy()
             self.water_db = np.roll(self.water_db, 1, axis=0)
             self.water_db[0] = v
@@ -86,7 +93,7 @@ class SpectrumView(QtWidgets.QWidget):
 
     def _reset(self, center, rate, n):
         self.center, self.rate, self.n = center, rate, n
-        self.trace = self.peak = None
+        self.trace = self.peak = self.avg = None
         self.water = np.zeros((ROWS, n), np.uint8)
         self.water_db = np.full((ROWS, n), -200.0)
         self.frames = 0
@@ -218,9 +225,14 @@ class SpectrumView(QtWidgets.QWidget):
             p.fillRect(QtCore.QRectF(max(0, x0), 0, min(w, x1) - max(0, x0), top_h), col)
             p.setPen(QtGui.QColor(MUTED))
             lx = max(x0, 48) + 4
-            p.drawText(QtCore.QRectF(lx, 2, max(0, min(w, x1) - lx - 4), 14), Qt.AlignLeft | Qt.AlignVCenter, name)
+            room = min(w, x1) - lx - 4
+            if room > 40:       # shorten the name to fit its section, or leave it out
+                p.drawText(QtCore.QRectF(lx, 2, room, 14), Qt.AlignLeft | Qt.AlignVCenter,
+                           p.fontMetrics().elidedText(name, Qt.ElideRight, int(room)))
         p.setPen(QtGui.QPen(QtGui.QColor(GRID), 1))
         lo_db, hi_db = self.db_lo, self.db_hi
+        if self.auto and self.avg is not None:
+            lo_db = min(lo_db, float(np.percentile(self.avg, 30)) - 6)
         step = 10 if hi_db - lo_db > 40 else 5
         y_of = lambda db: top_h - (db - lo_db) / (hi_db - lo_db) * top_h
         for db in np.arange(np.ceil(lo_db / step) * step, hi_db, step):
@@ -242,13 +254,15 @@ class SpectrumView(QtWidgets.QWidget):
         if self.peak_hold and self.peak is not None:
             p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 80, 150), 1))
             p.drawPolyline(QtGui.QPolygonF([QPointF(x, y_of(v)) for x, v in zip(xs, self.peak[a:b])]))
-        if self.trace is not None:
+        if self.avg is not None:        # average: the noise floor, as a filled area
+            pts = [QPointF(x, min(top_h, y_of(v))) for x, v in zip(xs, self.avg[a:b])]
+            p.setPen(QtGui.QPen(QtGui.QColor(76, 154, 255, 110), 1))
+            p.setBrush(QtGui.QColor(76, 154, 255, 40))
+            p.drawPolygon(QtGui.QPolygonF([QPointF(0, top_h)] + pts + [QPointF(w, top_h)]))
+        if self.trace is not None:      # peak: every burst in the last moments
             pts = [QPointF(x, min(top_h, y_of(v))) for x, v in zip(xs, self.trace[a:b])]
-            fill = QtGui.QPolygonF([QPointF(0, top_h)] + pts + [QPointF(w, top_h)])
-            p.setPen(Qt.NoPen)
-            p.setBrush(QtGui.QColor(76, 154, 255, 45))
-            p.drawPolygon(fill)
-            p.setPen(QtGui.QPen(QtGui.QColor(120, 190, 255), 1.2))
+            p.setPen(QtGui.QPen(QtGui.QColor(150, 210, 255), 1.3))
+            p.setBrush(Qt.NoBrush)
             p.drawPolyline(QtGui.QPolygonF(pts))
         cx = self.x_of(self.center, w)
         p.setPen(QtGui.QPen(QtGui.QColor(255, 107, 107, 120), 1, Qt.DashLine))
@@ -277,8 +291,7 @@ class SpectrumView(QtWidgets.QWidget):
             i = int((fm - (self.center - self.rate / 2)) / self.rate * self.n)
             if 0 <= i < self.n:
                 if my < top_h and self.trace is not None:
-                    db = self.trace[i]
-                    what = '%.4f MHz   %.1f dB' % (fm / 1e6, db)
+                    what = '%.4f MHz   peak %.1f dB   average %.1f dB' % (fm / 1e6, self.trace[i], self.avg[i])
                 else:
                     row = int((my - wf_top) / max(1, rows) * rows)
                     db = self.water_db[min(max(row, 0), ROWS - 1), i]
@@ -361,7 +374,7 @@ class SpectrumPanel(QtWidgets.QWidget):
                 sb.setValue(int(round(val)))
                 sb.blockSignals(False)
         if v.n:
-            self.info.setText('%.4f MHz centre  ·  %.2f MS/s  ·  %d-point FFT  ·  frequencies in MHz  ·  %s'
+            self.info.setText('%.4f MHz centre  ·  %.2f MS/s  ·  %d-point FFT  ·  line = peak, fill = average  ·  MHz  ·  %s'
                               % (v.center / 1e6, v.rate / 1e6, v.n, 'live' if v.live else 'stopped'))
         else:
             self.info.setText('waiting for the receiver')
