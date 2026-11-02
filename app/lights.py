@@ -6,31 +6,34 @@ import time
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import Qt
 
-GREEN = QtGui.QColor(60, 230, 110)
-RED = QtGui.QColor(255, 70, 70)
+GREEN = QtGui.QColor(80, 255, 120)
+RED = QtGui.QColor(255, 50, 50)
 OFF = QtGui.QColor(48, 54, 64)
-FLASH_S = 0.25      # how long a flash takes to fade out
+FLASH_S = 0.07      # a flash: full brightness for this long, then straight off (no fade)
 
 
 def led_colour(on, flashed_at, now):
-    """the LED's colour: full brightness right after a flash, fading back to dark"""
-    k = max(0.0, 1.0 - (now - flashed_at) / FLASH_S) if flashed_at else 0.0
-    return QtGui.QColor(int(OFF.red() + (on.red() - OFF.red()) * k), int(OFF.green() + (on.green() - OFF.green()) * k),
-                        int(OFF.blue() + (on.blue() - OFF.blue()) * k)), k
+    """(colour, lit): fully on for FLASH_S after a flash, otherwise off"""
+    lit = bool(flashed_at) and now - flashed_at < FLASH_S
+    return (on if lit else OFF), (1.0 if lit else 0.0)
 
 
 def paint_led(p, rect, colour, glow):
     p.save()
     p.setRenderHint(QtGui.QPainter.Antialiasing)
-    if glow > 0:            # soft halo while lit
+    if glow > 0:            # bright halo while lit
         halo = QtGui.QColor(colour)
-        halo.setAlpha(int(110 * glow))
+        halo.setAlpha(150)
         p.setPen(Qt.NoPen)
         p.setBrush(halo)
-        p.drawEllipse(rect.adjusted(-3, -2, 3, 2))
+        p.drawEllipse(rect.adjusted(-4, -3, 4, 3))
     p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 160), 1))
     p.setBrush(colour)
     p.drawEllipse(rect)
+    if glow > 0:            # hot white centre, like a real LED flash
+        p.setPen(Qt.NoPen)
+        p.setBrush(QtGui.QColor(255, 255, 255, 200))
+        p.drawEllipse(rect.adjusted(rect.width() * 0.3, rect.height() * 0.25, -rect.width() * 0.3, -rect.height() * 0.25))
     p.restore()
 
 
@@ -45,16 +48,17 @@ class ActivityLights(QtWidgets.QWidget):
         self.last = {'ok': 0.0, 'bad': 0.0}
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._tick)
+        self.timer.setTimerType(Qt.PreciseTimer)
 
     def flash(self, ok):
         self.last['ok' if ok else 'bad'] = time.time()
         if not self.timer.isActive():
-            self.timer.start(30)
-        self.update()
+            self.timer.start(15)
+        self.repaint()      # show it now, not at the next convenient moment
 
     def _tick(self):
         self.update()
-        if time.time() - max(self.last.values()) > FLASH_S:
+        if time.time() - max(self.last.values()) > FLASH_S + 0.03:
             self.timer.stop()
 
     def paintEvent(self, _):
@@ -84,12 +88,12 @@ class SatelliteLights(QtCore.QObject):
     def flash(self, name):
         self.last[name] = time.time()
         if not self.timer.isActive():
-            self.timer.start(30)
+            self.timer.start(15)
         self.changed.emit()
 
     def _tick(self):
         self.changed.emit()
-        if not self.last or time.time() - max(self.last.values()) > FLASH_S:
+        if not self.last or time.time() - max(self.last.values()) > FLASH_S + 0.03:
             self.timer.stop()
 
 

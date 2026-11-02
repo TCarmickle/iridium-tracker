@@ -73,6 +73,7 @@ QComboBox QAbstractItemView { background: %(SURFACE)s; border: 1px solid %(BORDE
 QCheckBox { spacing: 6px; }
 QTableWidget, QListWidget { background: %(PANEL)s; alternate-background-color: #1f242c;
                             border: 1px solid %(BORDER)s; border-radius: 6px; }
+QTableWidget { selection-background-color: #782830; selection-color: #ffffff; }
 QHeaderView::section { background: %(SURFACE)s; color: %(MUTED)s; border: none;
                        border-bottom: 1px solid %(BORDER)s; padding: 5px 6px; font-weight: 600; }
 QScrollArea { background: %(PANEL)s; border: 1px solid %(BORDER)s; border-radius: 6px; }
@@ -162,6 +163,12 @@ def circle_points(lat, lon, radius_deg, n=72):
 
 def fmt_time(t, seconds=False):
     return datetime.datetime.fromtimestamp(t).strftime('%b %d  %I:%M:%S %p' if seconds else '%b %d %I:%M %p').replace(' 0', ' ')
+
+
+def short_time(t):
+    """'5:10 PM' today, 'Nov 1' before"""
+    d = datetime.datetime.fromtimestamp(t)
+    return fmt_clock(t)[:-6] + fmt_clock(t)[-3:] if d.date() == datetime.date.today() else d.strftime('%b %d').replace(' 0', ' ')
 
 
 def fmt_clock(t):
@@ -545,6 +552,8 @@ class MapView(QtWidgets.QWidget):
         self.hits = []
         self.drag = None
         self.picking = False
+        self.legend_open = True     # the map key; click it to fold / unfold
+        self.legend_rect = QtCore.QRectF()
 
     def set_picking(self, on):
         """pick mode: the next click on the map (not a drag) sets the antenna location"""
@@ -600,6 +609,11 @@ class MapView(QtWidgets.QWidget):
         self.update()
 
     def mousePressEvent(self, e):
+        if self.legend_rect.contains(QPointF(e.pos())):
+            self.legend_open = not self.legend_open
+            self.drag = None
+            self.update()
+            return
         self.drag = (e.pos(), self.cx, self.cy, False)
 
     def mouseMoveEvent(self, e):
@@ -858,15 +872,30 @@ class MapView(QtWidgets.QWidget):
                  ('sat', 'Predicted position (faded + dotted ring = uncertain)'),
                  ('view', 'green = above your horizon now'),
                  ('plane', 'Orbital plane (our orbits), arrows = direction')]
-        h = 18 * len(items) + 10
-        r = QtCore.QRectF(10, self.height() - h - 24, 300, h)
-        p.setPen(QtGui.QPen(QtGui.QColor(60, 66, 78)))
-        p.setBrush(QtGui.QColor(24, 28, 35, 225))
-        p.drawRoundedRect(r, 8, 8)
         font = p.font()
         font.setPointSize(8)
         p.setFont(font)
-        for k, (kind, text) in enumerate(items):
+        fm = p.fontMetrics()
+        h = 18 * len(items) + 10
+        open_ = self.legend_open and self.height() > h + 90      # folds itself on a short map
+        if not open_:
+            r = QtCore.QRectF(10, self.height() - 52, fm.width('Key \u25b8') + 20, 24)
+            self.legend_rect = r
+            p.setPen(QtGui.QPen(QtGui.QColor(60, 66, 78)))
+            p.setBrush(QtGui.QColor(24, 28, 35, 225))
+            p.drawRoundedRect(r, 8, 8)
+            p.setPen(QtGui.QColor(TEXT))
+            p.drawText(r, Qt.AlignCenter, 'Key \u25b8')
+        else:
+            width = max(fm.width(t) for _, t in items) + 58
+            r = QtCore.QRectF(10, self.height() - h - 24, width, h)
+            self.legend_rect = r
+            p.setPen(QtGui.QPen(QtGui.QColor(60, 66, 78)))
+            p.setBrush(QtGui.QColor(24, 28, 35, 225))
+            p.drawRoundedRect(r, 8, 8)
+            p.setPen(QtGui.QColor(MUTED))
+            p.drawText(QtCore.QRectF(r.right() - 22, r.top() + 2, 18, 14), Qt.AlignCenter, '\u2715')
+        for k, (kind, text) in enumerate(items if open_ else []):
             y = r.top() + 14 + 18 * k
             x = r.left() + 18
             if kind == 'fix':
@@ -1049,6 +1078,25 @@ class Timeline(QtWidgets.QWidget):
         p.end()
 
 
+class ElidedLabel(QtWidgets.QLabel):
+    """a one-line label that shortens its text with ... when there isn't room (full text in its tooltip)"""
+
+    def __init__(self, text=''):
+        super().__init__(text)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        self.setMinimumWidth(60)
+
+    def setText(self, text):
+        super().setText(text)
+        self.setToolTip(text)
+
+    def paintEvent(self, _):
+        p = QtGui.QPainter(self)
+        p.setPen(self.palette().color(QtGui.QPalette.WindowText))
+        p.drawText(self.rect(), Qt.AlignLeft | Qt.AlignVCenter,
+                   self.fontMetrics().elidedText(self.text(), Qt.ElideRight, self.width()))
+
+
 # ---------------------------------------------------------------- main window
 class Tracker(QtWidgets.QMainWindow):
     SPEEDS = [('1x  (real time)', 1), ('10x', 10), ('60x  (1 min/s)', 60), ('300x  (5 min/s)', 300), ('1000x', 1000)]
@@ -1056,7 +1104,8 @@ class Tracker(QtWidgets.QMainWindow):
     def __init__(self, replay=None):
         super().__init__()
         self.setWindowTitle('Iridium Tracker')
-        self.resize(1500, 900)
+        avail = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        self.resize(int(min(1700, avail.width() * 0.95)), int(min(1000, avail.height() * 0.92)))
         self.data = Data()
         self.t = time.time()
         self.playing, self.following = False, True
@@ -1136,7 +1185,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.spec_btn.setChecked(True)
         self.spec_btn.setToolTip('Show or hide the live spectrum and waterfall')
         self.rx_dot = QtWidgets.QLabel()
-        self.rx_status = QtWidgets.QLabel('Receiver off')
+        self.rx_status = ElidedLabel('Receiver off')
         self.rx_status.setStyleSheet('color: %s;' % MUTED)
         title = QtWidgets.QLabel('IRIDIUM TRACKER')
         title.setStyleSheet('font-size: 13px; font-weight: 700; letter-spacing: 2px; color: %s;' % TEXT)
@@ -1210,7 +1259,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.summary = QtWidgets.QLabel()
         self.summary.setWordWrap(True)
         self.table = QtWidgets.QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(['Satellite', 'Plane/slot', 'Net ID', 'Fixes', 'Last heard', 'At this time'])
+        self.table.setHorizontalHeaderLabels(['Satellite', 'Slot', 'Net ID', 'Fixes', 'Heard', 'At this time'])
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(26)
         self.table.setShowGrid(False)
@@ -1218,6 +1267,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setStretchLastSection(True)
         self.table.itemSelectionChanged.connect(self._table_selected)
         self.sat_lights = lights.SatelliteLights(self)     # a light by each satellite, flashing when it's heard
         self.table.setItemDelegateForColumn(0, lights.SatelliteLightDelegate(self.sat_lights, self.table))
@@ -1261,7 +1311,8 @@ class Tracker(QtWidgets.QMainWindow):
         split.addWidget(left)
         split.addWidget(right)
         split.setStretchFactor(0, 1)
-        split.setSizes([1080, 420])
+        right.setMinimumWidth(380)
+        split.setSizes([max(600, self.width() - 520), 520])
         self.setCentralWidget(split)
         self.status = QtWidgets.QLabel()
         self.statusBar().addWidget(self.status, 1)
@@ -1457,7 +1508,7 @@ class Tracker(QtWidgets.QMainWindow):
             i = d.info[n]
             vals = [n, ', '.join('P%d S%02d' % ps for ps in sorted(i['slots'])) or '-',
                     ', '.join('%03d' % x for x in sorted(i['net_ids'])) or '-', str(i['fixes']),
-                    fmt_time(i['last']) if i['last'] else '-', '']
+                    short_time(i['last']) if i['last'] else '-', '']
             for c, v in enumerate(vals):
                 item = QtWidgets.QTableWidgetItem(v)
                 if c == 3:
@@ -1851,7 +1902,7 @@ def main():
         w.show()
         QtCore.QTimer.singleShot(9000, lambda: (w.refresh(), w.grab().save(out), app.quit()))
     else:
-        w.show()
+        w.showMaximized()
     sys.exit(app.exec_())
 
 
