@@ -2,6 +2,8 @@
 /python/
 
 # your own data - never committed: antenna location, captures, catalog, map cache
+/data/
+# (older versions kept it inside app)
 app/settings.json
 app/output*
 app/catalog-data*.json

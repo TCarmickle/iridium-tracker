@@ -15,7 +15,11 @@ once they have sent you a position fix, and fade as the time since you last hear
   fixes and Doppler curves, with an uncertainty that grows with time since the last observation
 - **Timeline** to scrub, play and replay past captures
 - **Per-satellite details**: every ring-alert position it sent you, how good its orbit is, next pass
+- **Iridium Console** (`Iridium Console.bat`): a burst-by-burst log of every decoded frame, ring-alert
+  positions and decoder status, alongside the tracker or receiving on its own
 - **Click the map to set your location**; the terrain height is looked up automatically
+- **Stays small**: raw recordings are cleaned up automatically (7 days / 1 GB by default), long-term
+  storage is ~1-2% of a capture, the map cache is capped, and receiving stops before the disk fills
 - **Self-contained**: one folder with its own Python, GNU Radio and decoder - nothing to install
   except the SDR's USB driver
 
@@ -50,7 +54,10 @@ labels; positions never do.
 The tracker only uses technical frames (ring alerts, time & location, Doppler). It does not decode
 or play voice or messages: Iridium calls and messages are private communications, and in many
 countries (including the US) intercepting or sharing their content is illegal.
-Your location, captures and catalog stay in the `app` folder and are excluded from this repository.
+Your location, captures and catalog stay in the `data` folder and are excluded from this repository.
+Raw recordings (which contain every burst heard, including other people's voice and message bursts)
+are deleted automatically after 7 days by default; only ring alerts and time & location frames are
+kept long-term, with phone paging IDs removed.
 
 ## License
 The tracker is free software under the [GNU GPL v3](LICENSE). It bundles gr-iridium and GNU Radio

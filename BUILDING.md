@@ -27,8 +27,8 @@ Copies each bundled package's license texts from conda's package cache into
 ```bat
 python build\make_package.py
 ```
-Writes `dist\IridiumTracker.zip` (~200 MB). It never includes `app\settings.json` (your
-location), captures, the catalog or the map cache.
+Writes `dist\IridiumTracker.zip` (~200 MB). It never includes the `data` folder (your
+location, captures, catalog, map cache).
 
 ## Running from source
 `Iridium Tracker.bat` runs `app\start.py` with the runtime in `python\`. To develop with another
@@ -39,9 +39,13 @@ conda environment that has the packages in `environment.yml`: `python app\start.
 |---|---|
 | `app\start.py` | entry point |
 | `app\iridium_tracker.py` | the window: map, timeline, satellite list |
+| `app\console.py` | Iridium Console: detailed burst-by-burst view, or receiving without the window |
 | `app\receiver.py` | runs iridium-extractor + iridium-parser while receiving |
 | `app\catalog.py` | adds finished captures to the catalog (`catalog-data.json`, `catalog.txt`) |
 | `app\orbitfit.py` | fits orbits to your own position fixes and Doppler |
+| `app\paths.py` | where data lives (`data\` next to `app\`; override with `IRIDIUM_TRACKER_DATA`) |
+| `app\storage.py` | reduced frame files, retention limits, map cache cap, disk checks |
+| `app\data_dialog.py` | the Data panel |
 | `app\location_dialog.py` | typed location, terrain height lookup |
 | `app\iridium-toolkit\` | [iridium-toolkit](https://github.com/muccc/iridium-toolkit) (BSD-2), vendored at commit `7938ae0` |
 | `tools\` | developer tools (orbit accuracy check, capture summary) |

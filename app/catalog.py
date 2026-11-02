@@ -22,18 +22,21 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)
+import paths  # noqa: E402  (where the data lives)
+import storage  # noqa: E402
 # iridium-toolkit: inside this folder (a packaged copy) or next to it
 TOOLKIT = next((d for d in (os.path.join(HERE, 'iridium-toolkit'), os.path.join(HERE, '..', 'iridium-toolkit'))
                 if os.path.exists(os.path.join(d, 'iridium-parser.py'))), os.path.join(HERE, 'iridium-toolkit'))
 PARSER = os.path.join(TOOLKIT, 'iridium-parser.py')
 # public orbit list, used only to put names on satellites (positions always come from our own fixes);
 # kept fresh from CelesTrak, with SatDump's copy as a fallback
-TLE_FILE = os.path.join(HERE, 'iridium-names.tle')
+TLE_FILE = os.path.join(paths.DATA, 'iridium-names.tle')
 TLE_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=iridium-NEXT&FORMAT=tle'
 SATDUMP_TLES = os.path.join(os.environ.get('APPDATA', ''), 'satdump', 'satdump_tles.txt')
-DATA = os.path.join(HERE, 'catalog-data.json')
-REPORT = os.path.join(HERE, 'catalog.txt')
-SETTINGS = os.path.join(HERE, 'settings.json')
+DATA = os.path.join(paths.DATA, 'catalog-data.json')
+REPORT = os.path.join(paths.DATA, 'catalog.txt')
+SETTINGS = os.path.join(paths.DATA, 'settings.json')
 
 
 def load_home():
@@ -150,9 +153,9 @@ def capture_start(stem):
         return t.astimezone(UTC) + datetime.timedelta(seconds=30), 'estimated'
 
 
-def read_frames(path):
+def read_frames(lines):
     frames = []
-    for line in open(path, errors='replace'):
+    for line in lines:
         f = line.split()
         if len(f) < 6 or not f[0].endswith(':') or f[0] == 'ERR:':
             continue
@@ -198,14 +201,27 @@ def match_doppler(sats, pts, shifts):
     return fits
 
 
+def frames_source(stem):
+    """the decoded frames of a capture: full (.parsed / .live) or the reduced .frames.gz"""
+    for ext in ('.parsed', '.live', storage.REDUCED):
+        if os.path.exists(stem + ext) and os.path.getsize(stem + ext) > 0:
+            return stem + ext
+    return None
+
+
 def analyze(stem, sats):
     start, how = capture_start(stem)
-    frames = read_frames(stem + '.parsed')
+    src = frames_source(stem)
+    if src.endswith(storage.REDUCED):       # only ring alerts and time & location frames were kept
+        meta, lines = storage.read_reduced(src)
+    else:
+        meta, lines = {}, open(src, errors='replace')
+    frames = read_frames(lines)
     at = lambda ms: start + datetime.timedelta(milliseconds=ms)
     iso = lambda t: t.isoformat(timespec='seconds')
     cap = {'capture': os.path.basename(stem), 'start_utc': iso(start), 'clock': how,
-           'hours': round(max([f[1] for f in frames] or [0]) / 3.6e6, 2),
-           'counts': dict(collections.Counter(f[0] for f in frames)), 'slots': [], 'positions': []}
+           'hours': meta.get('hours', round(max([f[1] for f in frames] or [0]) / 3.6e6, 2)),
+           'counts': meta.get('counts', dict(collections.Counter(f[0] for f in frames))), 'slots': [], 'positions': []}
     clock_errs = []
 
     for kind, ms, hz, snr, line in frames:
@@ -361,23 +377,32 @@ def main():
     if redo and data:     # captures whose files are gone keep their old results
         shutil.copy(DATA, DATA[:-5] + '.backup.json')
     sats = load_tles()
-    for bits in sorted(glob.glob(os.path.join(HERE, 'output-*.bits'))):
-        stem = bits[:-5]
-        name = os.path.basename(stem)
-        if (name in data and not redo) or os.path.getsize(bits) < 200:
+    recording = set()
+    for name, files in sorted(storage.captures().items()):
+        stem = os.path.join(paths.CAPTURES, name)
+        bits = stem + '.bits'
+        if os.path.exists(bits) and name not in ready and time.time() - os.path.getmtime(bits) < 20:
+            recording.add(name)         # still being recorded
             continue
-        if name not in ready and time.time() - os.path.getmtime(bits) < 20:   # still being recorded
+        if name in data and not redo:
             continue
-        if not os.path.exists(stem + '.parsed'):
-            subprocess.run([sys.executable, PARSER, '--no-stats', bits], cwd=HERE, capture_output=True)
-        if not os.path.exists(stem + '.parsed'):
+        if not frames_source(stem) and os.path.exists(bits) and os.path.getsize(bits) >= 200:
+            subprocess.run([sys.executable, PARSER, '--no-stats', bits], cwd=paths.CAPTURES, capture_output=True)
+        src = frames_source(stem)
+        if not src:
             continue
         print('analyzing %s ...' % name)
-        data[name] = analyze(stem, sats)
-    json.dump(data, open(DATA, 'w'), indent=1)
+        cap = analyze(stem, sats)
+        if not src.endswith(storage.REDUCED):
+            storage.write_reduced(stem, src, cap['counts'], cap['hours'])
+        data[name] = cap
+    json.dump(data, open(DATA, 'w'), separators=(',', ':'))
     caps = [c for _, c in sorted(data.items()) if sum(c['counts'].values())]
     open(REPORT, 'w').write(build_report(caps))
     print('catalog written to %s' % REPORT)
+    n, freed = storage.enforce(set(data), protect=recording)
+    if n:
+        print('deleted %d raw capture files (%s) - see storage settings' % (n, storage.fmt_bytes(freed)))
 
 
 if __name__ == '__main__':

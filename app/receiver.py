@@ -1,9 +1,10 @@
-"""The Iridium receiver, run from inside the tracker (what receive.ps1 / 1-receive.bat do).
+r"""The Iridium receiver, run from the tracker or the console. Files go to data\captures:
 
   iridium-extractor (gr-iridium)  SDR samples -> raw bursts      -> output-<stamp>.bits
   iridium-parser (iridium-toolkit) raw bursts -> decoded frames  -> output-<stamp>.live
+  the decoder's messages (its once-a-second totals thinned out)  -> output-<stamp>.log
   output-<stamp>.start            the real UTC moment the burst clock started
-After Stop, catalog.py decodes the whole capture into the catalog.
+After Stop, catalog.py adds the capture to the catalog (see storage.py for what is kept).
 
 A too-low burst threshold floods the decoder with false bursts and eats all the RAM,
 so the decoder is stopped automatically once it uses more than LIMIT_GB.
@@ -19,6 +20,8 @@ import time
 from PyQt5 import QtCore
 
 import catalog
+import paths
+import storage
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RC = os.path.dirname(sys.executable)          # the radioconda (or packaged) Python running us
@@ -26,6 +29,7 @@ PY = os.path.join(RC, 'python.exe')
 EXTRACTOR = os.path.join(RC, 'Library', 'bin', 'iridium-extractor.py')
 THRESHOLD = 16      # dB over noise; never go below ~14 (10 dB crashed the PC)
 LIMIT_GB = 2
+STATUS_EVERY = 10   # the decoder prints its totals every second; the log keeps one line in this many
 NO_WINDOW = 0x08000000   # CREATE_NO_WINDOW
 
 
@@ -88,8 +92,14 @@ class Receiver(QtCore.QObject):
     def start(self):
         if self.busy:
             return
+        need = storage.settings()['min_free_gb']
+        if storage.free_gb() < need:
+            self.status.emit('Not starting: less than %.1f GB free on the disk holding %s' % (need, paths.DATA))
+            return
         self.stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
-        stem = os.path.join(HERE, 'output-' + self.stamp)
+        os.makedirs(paths.CAPTURES, exist_ok=True)
+        stem = os.path.join(paths.CAPTURES, 'output-' + self.stamp)
+        self.log_path = stem + '.log'
         self.bits_path, self.live_path, self.start_path = stem + '.bits', stem + '.live', stem + '.start'
         self.stream_start = None
         self.heard = self.decoded_n = self.fixes = 0
@@ -107,8 +117,9 @@ class Receiver(QtCore.QObject):
 
         self.extractor = self._proc()                    # SDR -> raw bursts
         self.extractor.setStandardOutputFile(self.bits_path)
-        self.extractor.setStandardErrorFile(stem + '.log')
+        self.extractor.readyReadStandardError.connect(self._extractor_err)
         self.extractor.finished.connect(self._extractor_finished)
+        self.err_rest, self.status_lines = '', 0
         if self.replay:
             self.extractor.start(PY, ['-c', REPLAY_CODE, self.replay])
         else:
@@ -117,7 +128,8 @@ class Receiver(QtCore.QObject):
             self.status.emit('Could not start iridium-extractor: %s' % self.extractor.errorString())
             self.parser.kill()
             return
-        self.bits_pos = self.log_pos = 0
+        self.bits_pos = 0
+        self.disk_check = time.time()
         self.bits_rest = ''
         self.state = 'running'
         self.timer.start(250)
@@ -128,9 +140,14 @@ class Receiver(QtCore.QObject):
     def _tick(self):
         now = datetime.datetime.now(datetime.timezone.utc)
         self._feed_bits(now)
-        self._read_log()
         if self.state != 'running':
             return
+        if time.time() - self.disk_check > 30:
+            self.disk_check = time.time()
+            need = storage.settings()['min_free_gb']
+            if storage.free_gb() < need:
+                self.stop('less than %.1f GB of disk space left' % need)
+                return
         if not self.replay and private_bytes(self.extractor.processId()) > LIMIT_GB * 2 ** 30:
             self.stop('decoder used over %d GB of memory (too many false bursts) - raise the threshold' % LIMIT_GB)
             return
@@ -165,19 +182,26 @@ class Receiver(QtCore.QObject):
                     with open(self.start_path, 'w') as f:
                         f.write(zero.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + 'Z\n')
 
-    def _read_log(self):
-        try:
-            with open(self.bits_path[:-5] + '.log', errors='replace') as f:
-                f.seek(self.log_pos)
-                text = f.read()
-                self.log_pos = f.tell()
-        except OSError:
-            return
-        for line in text.splitlines():
+    def _extractor_err(self):
+        """the decoder's messages: kept in the .log, except that its once-a-second totals are thinned out"""
+        text = self.err_rest + bytes(self.extractor.readAllStandardError()).decode(errors='replace')
+        lines = text.replace('\r\n', '\n').split('\n')
+        self.err_rest = lines.pop()
+        keep = []
+        for line in lines:
             if re.match(r'^\d{10} \|', line):
-                self.last_status = ''          # the decoder's per-second totals: it is running fine
-            elif line.strip() and not re.search(r'DeprecationWarning|setDaemon', line):
+                self.last_status = ''          # its per-second totals: it is running fine
+                self.status_lines += 1
+                if self.status_lines % STATUS_EVERY != 1:
+                    continue
+            elif re.search(r'DeprecationWarning|setDaemon', line) or not line.strip():
+                continue
+            else:
                 self.last_status = line.strip()[:120]
+            keep.append(line)
+        if keep:
+            with open(self.log_path, 'a') as f:
+                f.write('\n'.join(keep) + '\n')
 
     def _parser_output(self):
         data = bytes(self.parser.readAllStandardOutput()).decode(errors='replace')
@@ -212,7 +236,7 @@ class Receiver(QtCore.QObject):
     def _extractor_finished(self, *_):
         if self.state == 'running':           # it ended by itself: the SDR is missing or busy, or a crash
             self.state = 'stopping'
-            self._read_log()
+            self._extractor_err()
             self.stop_reason = self.last_status or 'the decoder stopped by itself'
             if 'Failed to open' in self.stop_reason or 'usb_claim' in self.stop_reason:
                 self.stop_reason = ('the SDR could not be opened - is it plugged in, and are SDR++, SatDump '
@@ -228,7 +252,12 @@ class Receiver(QtCore.QObject):
     def _parser_finished(self, *_):
         self._parser_output()
         size = os.path.getsize(self.bits_path) if os.path.exists(self.bits_path) else 0
-        if size < 200:      # nothing was received
+        if size < 200:      # nothing was received: don't leave empty files behind
+            for ext in ('.bits', '.live', '.log', '.start'):
+                try:
+                    os.remove(self.bits_path[:-5] + ext)
+                except OSError:
+                    pass
             self.state = 'idle'
             self.running.emit(False)
             self.status.emit('Receiver stopped%s - nothing was received' % (': ' + self.stop_reason if self.stop_reason else ''))

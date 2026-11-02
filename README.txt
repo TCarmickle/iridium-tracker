@@ -50,17 +50,45 @@ least 30-60 minutes outdoors. In the list on the right, click a satellite to see
 position it sent you and how good its orbit is.
 
 
-FILES IT WRITES (all in the app folder)
----------------------------------------
-output-<date-time>.bits    raw bursts from the decoder
-output-<date-time>.live    decoded frames (written while receiving)
-output-<date-time>.parsed  decoded frames (written after you stop)
-output-<date-time>.start   the exact time the capture started
-catalog-data.json          everything heard so far (satellites, planes, positions)
+THE CONSOLE (more detail)
+-------------------------
+Double-click "Iridium Console.bat" for a burst-by-burst view, like a radio log:
+every decoded frame with its type, signal strength and frequency, ring alerts with the
+satellite's name and position, damaged bursts, and the decoder's own status every 10 s.
+- It watches whatever the tracker's receiver is decoding, so you can run both together.
+- Or press R in the console to receive from there without the tracker (close the
+  tracker's receiver first). Press R again or Q to stop; the capture goes into the catalog.
+- B turns beeps on/off (short = damaged, long = decoded, extra long = ring alert with a
+  position). D shows/hides damaged bursts.
+- To list a finished capture:  Iridium Console.bat --capture output-<date-time>
+
+
+YOUR DATA (all in the data folder, next to app)
+-----------------------------------------------
+Updating or replacing the program never touches the data folder. Click the disk button at the
+top right of the tracker to see how much space it uses, change the limits, or clean up.
+
+settings.json              your antenna location and storage limits
+catalog-data.json          everything heard so far (satellites, planes, positions) - never
+                           deleted; this is what the tracker shows
 catalog.txt                the same as a readable report
 iridium-names.tle          public list of Iridium satellites, refreshed from CelesTrak every
                            couple of days - used ONLY to put names on satellites
+captures\                  one set of files per receiver run:
+  output-<date-time>.bits       raw bursts from the decoder
+  output-<date-time>.live       every burst decoded
+  output-<date-time>.log        the decoder's messages
+  output-<date-time>.start      the exact time the capture started (kept)
+  output-<date-time>.frames.gz  only the ring alerts and time & location frames (kept, ~1-2%
+                                of the size) - enough to rebuild the catalog
 tiles\                     cached map pictures from OpenStreetMap
+
+Keeping it small: once a capture is in the catalog, its raw files (.bits .live .log) are
+deleted after 7 days, or sooner if they add up to more than 1 GB (oldest first). The map
+cache is kept under 200 MB, and receiving stops if the disk gets below 1 GB free. All four
+limits can be changed in the disk panel. Raw files hold every burst the receiver heard,
+including other people's voice and message bursts (never decoded) - set "Keep raw
+recordings" to 0 days to delete them as soon as a capture is in the catalog.
 
 
 PRIVACY AND THE LAW

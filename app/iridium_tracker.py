@@ -30,7 +30,10 @@ from PyQt5.QtCore import Qt, QPointF
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+import paths     # noqa: E402  (where the data lives)
 import catalog   # noqa: E402  (capture reading, satellite names)
+import storage   # noqa: E402  (keeping the data small)
+import data_dialog  # noqa: E402
 import orbitfit  # noqa: E402  (orbits from our own observations)
 import receiver  # noqa: E402  (the SDR receiver and decoder, run from here)
 import location_dialog  # noqa: E402
@@ -42,6 +45,7 @@ E2 = F * (2 - F)
 MIN_EL = 8.2          # Iridium serves phones down to about 8 degrees elevation
 MAX_SIGMA_KM = 1500   # hide a satellite once our orbit for it is more uncertain than this
 FAINT_SIGMA_KM = 150  # draw it faded beyond this uncertainty
+FIT_DAYS = 7          # orbits are fitted to each satellite's most recent week of observations
 PLANE_MAX_SIGMA_KM = 300  # a satellite's orbit plane must be known this well to place its plane
 PLANE_JOIN_DEG = 5.0      # a satellite without a slot number joins a plane whose node is this close
 ORBIT_RADIUS = 6378.137 + 781   # Iridium's design altitude, only used to draw the plane rings
@@ -79,7 +83,7 @@ QStatusBar { background: #101317; color: %(MUTED)s; }
 QStatusBar QLabel { background: transparent; color: %(MUTED)s; }
 QToolTip { background: %(SURFACE)s; color: %(TEXT)s; border: 1px solid %(BORDER)s; padding: 4px; }
 """ % dict(BG=BG, PANEL=PANEL, SURFACE=SURFACE, BORDER=BORDER, TEXT=TEXT, MUTED=MUTED, ACCENT=ACCENT)
-TILE_DIR = os.path.join(HERE, 'tiles')
+TILE_DIR = paths.TILES
 TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
 TILE_HEADERS = {'User-Agent': 'IridiumTracker/1.0 (personal hobby satellite map)'}
 
@@ -212,6 +216,12 @@ class Data:
             if f['name'] == n and f.get('hz'):
                 by_cap.setdefault(f['cap'], []).append((f['t'], f['hz']))
         groups += list(by_cap.values())
+        # only the latest week counts: older observations don't improve today's orbit, and this keeps
+        # the fit quick however much history builds up
+        if fixes:
+            since = max(t for t, _ in fixes) - FIT_DAYS * 86400
+            fixes = [fx for fx in fixes if fx[0] >= since]
+            groups = [g for g in groups if g and max(t for t, _ in g) >= since]
         orbit, why = orbitfit.fit(fixes, groups, catalog.HOME, plane_nodes_at)
         self.orbits.pop(n, None)
         self.no_orbit.pop(n, None)
@@ -344,7 +354,7 @@ class Data:
         except OSError:
             pass
         # every capture the receiver wrote that hasn't been decoded into the catalog yet
-        lives = sorted(glob.glob(os.path.join(HERE, 'output-*.live')), key=os.path.getmtime)
+        lives = sorted(glob.glob(os.path.join(paths.CAPTURES, 'output-*.live')), key=os.path.getmtime)
         if not lives:
             return events
         self.live_cap = os.path.basename(lives[-1])[:-5]
@@ -464,6 +474,7 @@ class TileLoader(QtCore.QObject):
         try:
             if os.path.exists(path):
                 data = open(path, 'rb').read()
+                os.utime(path)      # recently used: the cache limit removes the oldest-used pictures first
             else:
                 r = self.session.get(TILE_URL.format(z=z, x=x, y=y), timeout=15)
                 r.raise_for_status()
@@ -1130,6 +1141,10 @@ class Tracker(QtWidgets.QMainWindow):
         self.loc_btn.setToolTip('Change or detect your antenna location')
         self.loc_btn.clicked.connect(self.start_pick)
         hl.addWidget(self.loc_btn)
+        self.data_btn = QtWidgets.QPushButton()
+        self.data_btn.setToolTip('How much space your data uses, storage limits and clean-up')
+        self.data_btn.clicked.connect(self.show_data)
+        hl.addWidget(self.data_btn)
         self._show_location()
         self._receiver_running(False)
 
@@ -1228,6 +1243,10 @@ class Tracker(QtWidgets.QMainWindow):
         self.poll_timer = QtCore.QTimer(self)
         self.poll_timer.timeout.connect(self.poll)
         self.poll_timer.start(2000)
+        self.data_timer = QtCore.QTimer(self)      # keep the data size on the button current
+        self.data_timer.timeout.connect(self._show_data_size)
+        self.data_timer.start(60000)
+        QtCore.QTimer.singleShot(3000, self._housekeeping)
         self.poll()
         if catalog.HOME is None:
             self.start_pick()
@@ -1262,6 +1281,25 @@ class Tracker(QtWidgets.QMainWindow):
             self.rx_btn.setText('Finishing...')
         if self.receiver.state != 'running' or text.startswith('Starting'):
             self.events.insertItem(0, '%s  %s' % (fmt_clock(time.time()), text))
+
+    # ---- data
+    def _show_data_size(self):
+        self.data_btn.setText('\U0001F4BE  %s' % storage.fmt_bytes(storage.usage()['total']))
+
+    def _housekeeping(self):
+        """apply the storage limits at startup (raw recordings past their time, map cache size)"""
+        protect = {'output-%s' % self.receiver.stamp} if self.receiver.busy else set()
+        n, freed = storage.enforce(data_dialog.catalogued(), protect=protect)
+        t = storage.prune_tiles()
+        if n or t:
+            self.events.insertItem(0, '%s  Storage clean-up: %d old raw capture files (%s)%s removed' % (
+                fmt_clock(time.time()), n, storage.fmt_bytes(freed), ', %d map pictures' % t if t else ''))
+        self._show_data_size()
+
+    def show_data(self):
+        protect = {'output-%s' % self.receiver.stamp} if self.receiver.busy else set()
+        data_dialog.DataDialog(self, protect).exec_()
+        self._show_data_size()
 
     # ---- location
     def _show_location(self):
@@ -1711,7 +1749,7 @@ class Tracker(QtWidgets.QMainWindow):
 
 
 def main():
-    log = os.path.join(HERE, 'tracker-error.log')
+    log = paths.ERROR_LOG
 
     def excepthook(et, ev, tb):
         text = ''.join(traceback.format_exception(et, ev, tb))
