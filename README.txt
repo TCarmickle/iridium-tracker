@@ -66,6 +66,15 @@ The "Source" button next to Start receiver works like SDR++'s source menu:
 Changes apply the next time you start the receiver.
 
 
+ACTIVITY LIGHTS
+---------------
+Next to the receiver status, two small lights flash for every burst: green (top) = a message
+was decoded, red (bottom) = a damaged burst that couldn't be decoded. In the satellite list, the
+light at the left of each satellite flashes green when a frame from that satellite comes in
+(identified by its network ID or plane/slot). Damaged bursts can't be traced to a satellite -
+the part saying which satellite sent them is what couldn't be decoded.
+
+
 SPECTRUM AND WATERFALL
 ----------------------
 Under the map, while receiving: the live spectrum (top) and waterfall (bottom) of exactly what

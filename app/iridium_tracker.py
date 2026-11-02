@@ -34,6 +34,7 @@ import paths     # noqa: E402  (where the data lives)
 import catalog   # noqa: E402  (capture reading, satellite names)
 import storage   # noqa: E402  (keeping the data small)
 import data_dialog  # noqa: E402
+import lights  # noqa: E402
 import sdr_settings  # noqa: E402
 import source_dialog  # noqa: E402
 import spectrum  # noqa: E402
@@ -177,6 +178,7 @@ class Data:
         self.live_read = {}     # live file -> how far we've read it
         self.live_cap = None    # the newest capture (the one the receiver writes while running)
         self.live_fixes, self.live_heard, self.live_events = [], {}, []
+        self.frame_queue = []   # (kind, line) of new frames in the newest capture, for the activity lights
         self.live_doppler = {}  # (capture, name) -> Doppler curve [(t, Hz), ...]
         self.last_live_frame = 0
         self.load_catalog()
@@ -401,6 +403,8 @@ class Data:
                 snr = float(f[5].split('|')[2]) if '|' in f[5] else 0.0
             except ValueError:
                 continue
+            if newest:
+                self.frame_queue.append((kind, line))
             m = re.search(r'sat:(\d+) beam:(\d+).*?pos=\(([-+\d.]+)/([-+\d.]+)\) alt=(-?\d+)', line)
             x = re.search(r'xyz=\(([-+\d]+),([-+\d]+),([-+\d]+)\)', line)
             if kind == 'IRA' and m and x and int(m.group(5)) > 100:
@@ -1117,6 +1121,8 @@ class Tracker(QtWidgets.QMainWindow):
         self.receiver.status.connect(self._receiver_status)
         self.receiver.running.connect(self._receiver_running)
         self.receiver.decoded.connect(self.poll)
+        self.receiver.frame.connect(self._frame)
+        self.activity = lights.ActivityLights()
         self.rx_btn = QtWidgets.QPushButton()
         self.rx_btn.setMinimumWidth(170)
         self.rx_btn.clicked.connect(self.toggle_receiver)
@@ -1147,6 +1153,7 @@ class Tracker(QtWidgets.QMainWindow):
         hl.addWidget(self.spec_btn)
         hl.addSpacing(6)
         hl.addWidget(self.rx_dot)
+        hl.addWidget(self.activity)
         hl.addWidget(self.rx_status, 1)
         self.loc_btn = QtWidgets.QPushButton()
         self.loc_btn.setToolTip('Change or detect your antenna location')
@@ -1212,6 +1219,9 @@ class Tracker(QtWidgets.QMainWindow):
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
         self.table.itemSelectionChanged.connect(self._table_selected)
+        self.sat_lights = lights.SatelliteLights(self)     # a light by each satellite, flashing when it's heard
+        self.table.setItemDelegateForColumn(0, lights.SatelliteLightDelegate(self.sat_lights, self.table))
+        self.sat_lights.changed.connect(self.table.viewport().update)
         pal = self.table.palette()      # same strong highlight whether or not the list has focus
         for group in (QtGui.QPalette.Active, QtGui.QPalette.Inactive):
             pal.setColor(group, QtGui.QPalette.Highlight, C_SELECTED_ROW)
@@ -1271,6 +1281,26 @@ class Tracker(QtWidgets.QMainWindow):
         self.poll()
         if catalog.HOME is None:
             self.start_pick()
+
+    # ---- activity lights
+    def _frame(self, kind, line):
+        ok = kind not in ('RAW', 'ERR')
+        self.activity.flash(ok)
+        if ok:      # (a damaged burst can't say which satellite sent it)
+            name = self._satellite_of(line)
+            if name:
+                self.sat_lights.flash(name)
+
+    def _satellite_of(self, line):
+        """which satellite sent a frame: by plane/slot (time & location) or network ID (ring alerts, broadcasts)"""
+        m = re.search(r' P(\d) S(\d+) ', line)
+        if m:
+            return self.data.slot_name.get((int(m.group(1)), int(m.group(2))))
+        m = re.search(r'sat:(\d+)', line)
+        if m:
+            net = int(m.group(1))
+            return next((n for n, i in self.data.info.items() if net in i['net_ids']), None)
+        return None
 
     # ---- receiver
     def show_source(self):
@@ -1516,6 +1546,13 @@ class Tracker(QtWidgets.QMainWindow):
         before = (len(self.data.all_fixes()), len(self.data.info), self.data.cat_mtime)
         for ev in self.data.poll():
             self.events.insertItem(0, ev)
+        queue, self.data.frame_queue = self.data.frame_queue, []
+        if queue and not self.receiver.busy:
+            # another program is receiving (e.g. the Iridium Console): its frames arrive here in batches,
+            # so spread their flashes over the time until the next look
+            queue = queue[-200:]
+            for i, (kind, line) in enumerate(queue):
+                QtCore.QTimer.singleShot(int(i * 1900 / len(queue)), lambda k=kind, l=line: self._frame(k, l))
         if (len(self.data.all_fixes()), len(self.data.info), self.data.cat_mtime) != before:
             self.reload_lists()
         age = time.time() - self.data.last_live_frame

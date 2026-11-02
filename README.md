@@ -17,6 +17,8 @@ once they have sent you a position fix, and fade as the time since you last hear
 - **Per-satellite details**: every ring-alert position it sent you, how good its orbit is, next pass
 - **Spectrum and waterfall** like SDR++: the live spectrum of exactly what the decoder hears, with
   zoom, hover readout, auto range and peak hold
+- **Activity lights**: flash green for every decoded message and red for every damaged burst, and
+  by each satellite in the list when that satellite is heard
 - **Choose your SDR** like SDR++'s source menu: any gr-osmosdr device (RTL-SDR, RTL-TCP, HackRF,
   Airspy, bladeRF, SoapySDR...), sample rate, frequency, gain, PPM, bias-T, IQ/DC correction
 - **Iridium Console** (`Iridium Console.bat`): a burst-by-burst log of every decoded frame, ring-alert

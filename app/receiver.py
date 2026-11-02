@@ -57,10 +57,12 @@ class Receiver(QtCore.QObject):
     """start() / stop() the SDR receiver. Signals:
        status(text)      one-line state for the UI
        running(bool)     receiver started / fully stopped
-       decoded()         the capture has been added to the catalog"""
+       decoded()         the capture has been added to the catalog
+       frame(kind, line) each burst as the parser finishes it (kind RAW / ERR = damaged)"""
     status = QtCore.pyqtSignal(str)
     running = QtCore.pyqtSignal(bool)
     decoded = QtCore.pyqtSignal()
+    frame = QtCore.pyqtSignal(str, str)
 
     def __init__(self, replay=None):
         super().__init__()
@@ -140,7 +142,7 @@ class Receiver(QtCore.QObject):
             return
         self.bits_pos = 0
         self.disk_check = time.time()
-        self.bits_rest = ''
+        self.bits_rest = self.out_rest = ''
         self.state = 'running'
         self.timer.start(250)
         self.running.emit(True)
@@ -219,8 +221,12 @@ class Receiver(QtCore.QObject):
             return
         with open(self.live_path, 'a', newline='') as f:
             f.write(data.replace('\r\n', '\n').replace('\n', '\r\n'))
-        for line in data.splitlines():
+        lines = (self.out_rest + data.replace('\r\n', '\n')).split('\n')
+        self.out_rest = lines.pop()             # a line the parser hasn't finished yet
+        for line in lines:
             kind = line.split(':', 1)[0]
+            if kind:
+                self.frame.emit(kind, line)
             if kind in ('RAW', 'ERR'):
                 self.heard += 1
             elif kind:
