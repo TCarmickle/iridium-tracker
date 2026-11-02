@@ -242,9 +242,13 @@ class GlobeView(QtWidgets.QWidget):
                 self.satelliteClicked.emit(hit[0])
         self.drag = None
 
-    def mouseDoubleClickEvent(self, e):
+    def center_home(self):
+        """look at your location again, keeping the current zoom, tilt and direction"""
         self.lat0, self.lon0 = self.home
         self._moved()
+
+    def mouseDoubleClickEvent(self, e):
+        self.center_home()
 
     def wheelEvent(self, e):
         step = 1 / 1.15 if e.angleDelta().y() > 0 else 1.15
@@ -374,6 +378,10 @@ class GlobeWindow(QtWidgets.QDialog):
             b.setToolTip(tip)
             b.clicked.connect(lambda _, v=preset: self.view.set_view(v['dist'], v['tilt'], self.view.heading, v['target_r']))
             bar.addWidget(b)
+        me = QtWidgets.QPushButton('◎  Center on me')
+        me.setToolTip('Bring your location back to the centre of the view (top or side view)')
+        me.clicked.connect(self.view.center_home)
+        bar.addWidget(me)
         bar.addWidget(QtWidgets.QLabel('<span style="color:#8b93a1">Right-drag up/down to tilt, '
                                        'left/right to turn</span>'))
         bar.addStretch(1)
