@@ -74,7 +74,7 @@ QComboBox QAbstractItemView { background: %(SURFACE)s; border: 1px solid %(BORDE
 QCheckBox { spacing: 6px; }
 QTableWidget, QListWidget { background: %(PANEL)s; alternate-background-color: #1f242c;
                             border: 1px solid %(BORDER)s; border-radius: 6px; }
-QTableWidget { selection-background-color: #782830; selection-color: #ffffff; }
+QTableWidget { selection-background-color: transparent; selection-color: %(TEXT)s; }
 QHeaderView::section { background: %(SURFACE)s; color: %(MUTED)s; border: none;
                        border-bottom: 1px solid %(BORDER)s; padding: 5px 6px; font-weight: 600; }
 QScrollArea { background: %(PANEL)s; border: 1px solid %(BORDER)s; border-radius: 6px; }
@@ -97,7 +97,7 @@ C_PAST = QtGui.QColor(243, 156, 18)
 C_FUTURE = QtGui.QColor(235, 225, 20)
 C_FIX = QtGui.QColor(220, 30, 30)
 C_HOME = QtGui.QColor(200, 0, 0)
-C_SELECTED_ROW = QtGui.QColor(120, 40, 48)   # the selected satellite's row in the list
+C_SELECTED_NAME = QtGui.QColor(31, 98, 200)   # the selected satellite's name in the list
 
 
 # ---------------------------------------------------------------- geometry (vectorized)
@@ -1279,17 +1279,20 @@ class Tracker(QtWidgets.QMainWindow):
         self.table.verticalHeader().setDefaultSectionSize(26)
         self.table.setShowGrid(False)
         self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        # no built-in selection: it would paint over the cells' own colours (blue name, green "up").
+        # A click picks the satellite and _update_table highlights it.
+        self.table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.table.setFocusPolicy(Qt.NoFocus)
         self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
-        self.table.itemSelectionChanged.connect(self._table_selected)
+        self.table.cellClicked.connect(self._table_clicked)
         self.sat_lights = lights.SatelliteLights(self)     # a light by each satellite, flashing when it's heard
         self.table.setItemDelegateForColumn(0, lights.SatelliteLightDelegate(self.sat_lights, self.table))
         self.sat_lights.changed.connect(self.table.viewport().update)
-        pal = self.table.palette()      # same strong highlight whether or not the list has focus
+        pal = self.table.palette()      # no row-wide selection colour: _update_table highlights the name
         for group in (QtGui.QPalette.Active, QtGui.QPalette.Inactive):
-            pal.setColor(group, QtGui.QPalette.Highlight, C_SELECTED_ROW)
+            pal.setColor(group, QtGui.QPalette.Highlight, QtGui.QColor(0, 0, 0, 0))
             pal.setColor(group, QtGui.QPalette.HighlightedText, QtGui.QColor(255, 255, 255))
         self.table.setPalette(pal)
         self.detail = QtWidgets.QLabel('Click a satellite on the map or in the list.')
@@ -1541,19 +1544,15 @@ class Tracker(QtWidgets.QMainWindow):
                sum(1 for why in d.no_orbit.values() if 'no position' in why)))
         self.tle_note = 'Orbits: computed from your own observations only'
 
-    def _table_selected(self):
-        rows = self.table.selectionModel().selectedRows()
-        if rows:
-            self.select(self.table.item(rows[0].row(), 0).text(), from_table=True)
+    def _table_clicked(self, row, _col):
+        self.select(self.table.item(row, 0).text(), from_table=True)
 
     def select(self, name, from_table=False):
         self.selected = name
         if not from_table:
             self.table.blockSignals(True)
-            self.table.clearSelection()
             for r in range(self.table.rowCount()):
                 if self.table.item(r, 0).text() == name:
-                    self.table.selectRow(r)
                     self.table.scrollToItem(self.table.item(r, 0))
             self.table.blockSignals(False)
         self.pass_cache = (None, 0, None)
@@ -1755,14 +1754,15 @@ class Tracker(QtWidgets.QMainWindow):
                 item.setText(('%.0f° up' % s['el'] if s['el'] > 0 else 'below') + '  ±%.0f km' % s['sigma'])
                 item.setBackground(QtGui.QColor(28, 84, 52) if s['el'] > 0 else QtGui.QBrush())
                 item.setForeground(QtGui.QColor(TEXT))
-            # the selected satellite's whole row stands out, matching its red icon on the map
+            # the selected satellite: its name highlighted blue and the row in bold; the green
+            # "above your horizon" cell keeps its colour
             sel = n == self.selected
             for c in range(self.table.columnCount()):
                 cell = self.table.item(r, c)
                 if cell is None:
                     continue
-                if sel:
-                    cell.setBackground(C_SELECTED_ROW)
+                if c == 0:
+                    cell.setBackground(C_SELECTED_NAME if sel else QtGui.QBrush())
                 elif c != 5:
                     cell.setBackground(QtGui.QBrush())
                 font = cell.font()
