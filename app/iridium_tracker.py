@@ -1274,7 +1274,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.summary = QtWidgets.QLabel()
         self.summary.setWordWrap(True)
         self.table = QtWidgets.QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(['Satellite', 'Slot', 'Net ID', 'Fixes', 'Heard', 'At this time'])
+        self.table.setHorizontalHeaderLabels(['Satellite', 'Slot', 'Net ID', 'Tracks', 'Heard', 'At this time'])
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(26)
         self.table.setShowGrid(False)
