@@ -1327,7 +1327,8 @@ class MapView(QtWidgets.QWidget):
                  ('past', 'Predicted track, past (our own orbit fit)'),
                  ('future', 'Predicted track, future'),
                  ('sat', 'Predicted position (faded + dotted ring = uncertain)'),
-                 ('view', 'green = above your horizon now'),
+                 ('view', 'green body = above your horizon now'),
+                 ('live', 'green ring = your receiver heard it in the last minute'),
                  ('orbcomm', 'orange-edged = Orbcomm, green-edged = ISS / ham (others: Iridium)'),
                  ('plane', 'Orbital plane (Iridium, our orbits), arrows = direction')]
         font = p.font()
@@ -1371,6 +1372,11 @@ class MapView(QtWidgets.QWidget):
             elif kind == 'plane':
                 p.setPen(QtGui.QPen(QtGui.QColor(*PLANE_COLORS[1]), 2.5))
                 p.drawLine(QPointF(x - 9, y), QPointF(x + 9, y))
+            elif kind == 'live':
+                p.setPen(QtGui.QPen(QtGui.QColor(0, 200, 0), 2))
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(QPointF(x, y), 8, 8)
+                draw_satellite(p, x, y, QtGui.QColor(120, 126, 138), 0.6)
             else:
                 draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.8)
             p.setPen(QtGui.QColor(ink['text']))
@@ -1644,7 +1650,14 @@ class Tracker(QtWidgets.QMainWindow):
             self.sys_box.addItem('%s only' % s['label'], s['key'])
         self.sys_box.setToolTip('Show every satellite system, or just one')
         self.tracks_box = QtWidgets.QComboBox()
-        self.tracks_box.addItems(['Tracks: selected + in view', 'Tracks: selected only', 'Tracks: all heard', 'Tracks: none'])
+        # (the order is what refresh() reads: 0 overhead + selected, 1 selected, 2 all, 3 none)
+        self.tracks_box.addItems(['Tracks: overhead + selected', 'Tracks: selected only', 'Tracks: all satellites',
+                                  'Tracks: none'])
+        self.tracks_box.setToolTip('Which satellites get their orbit track drawn on the map and globe:\n'
+                                   'overhead (above your horizon now) plus the one you selected, only the selected one,\n'
+                                   'every satellite with an orbit, or none')
+        self.tracks_box.setCurrentIndex(min(3, max(0, int(theme.load_ui().get('tracks', 0)))))
+        self.tracks_box.currentIndexChanged.connect(lambda i: theme.save_ui(tracks=i))
         self.fp_box = QtWidgets.QComboBox()
         self.fp_box.addItems(['Footprint: selected', 'Footprints: all in view', 'Footprints: none'])
         self.fix_box = QtWidgets.QComboBox()
