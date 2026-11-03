@@ -41,6 +41,7 @@ import spectrum  # noqa: E402
 import skyplot  # noqa: E402
 import globe  # noqa: E402
 import satinfo  # noqa: E402
+import systems  # noqa: E402
 import sound  # noqa: E402
 import orbitfit  # noqa: E402  (orbits from our own observations)
 import receiver  # noqa: E402  (the SDR receiver and decoder, run from here)
@@ -52,6 +53,7 @@ RE, F = 6378.137, 1 / 298.257223563
 E2 = F * (2 - F)
 MIN_EL = 8.2          # Iridium serves phones down to about 8 degrees elevation
 MAX_SIGMA_KM = 1500   # hide a satellite once our orbit for it is more uncertain than this
+OMEGA_EARTH = 7.2921151467e-5   # Earth rotation, rad/s
 FAINT_SIGMA_KM = 150  # draw it faded beyond this uncertainty
 FIT_DAYS = 7          # orbits are fitted to each satellite's most recent week of observations
 HEARTBEAT_S = 45      # a receiver's decoder log is written every 10 s; this long without a change = stopped
@@ -168,6 +170,15 @@ def circle_points(lat, lon, radius_deg, n=72):
     return out
 
 
+def fmt_ids(i, empty='-'):
+    """a satellite's IDs as its packets show them: Iridium network IDs (decimal), Orbcomm satellite IDs (hex)"""
+    f = '%02X' if i.get('system') == 'orbcomm' else '%03d'
+    return ', '.join(f % x for x in sorted(i['net_ids'])) or empty
+
+
+COL_TRACKS, COL_AT = 3, 5     # satellite list columns: Tracks, At this time (the name says the system)
+
+
 def fmt_time(t, seconds=False):
     return datetime.datetime.fromtimestamp(t).strftime('%b %d  %I:%M:%S %p' if seconds else '%b %d %I:%M %p').replace(' 0', ' ')
 
@@ -192,7 +203,12 @@ class Data:
 
     def __init__(self):
         self.cat_mtime = None
-        self._tles = None
+        self._tles = {}         # system -> public catalog satellites (names only)
+        self.oc_ids = {}        # Orbcomm satellite ID -> name
+        self._ham_names = None  # NORAD number -> catalog name, for ham satellites
+        self._ham_fits = {}     # ham satellite -> (data size, time) of its last Doppler-only fit
+        self.gnss_eph = {}      # GNSS satellite id (G05...) -> (time, its newest broadcast ephemeris fields)
+        self.gnss_fixes = []    # GNSS position fixes of the receiver itself
         self.live_read = {}     # live file -> how far we've read it
         self.live_cap = None    # the newest capture (the one the receiver writes while running)
         self.live_fixes, self.live_heard, self.live_events = [], {}, []
@@ -211,19 +227,29 @@ class Data:
         network IDs already linked in the catalog, otherwise by asking the public catalog which
         satellite that was (the name only - its orbit is never used for display)."""
         for n, i in self.info.items():
-            if net_id in i['net_ids']:
+            if i['system'] == 'iridium' and net_id in i['net_ids']:
                 return n
         hit = catalog.match_position(self.tles(), datetime.datetime.fromtimestamp(t, UTC), lat, lon)
         return hit[0] if hit and hit[1] > 85 else None
 
-    def tles(self):
-        """the public satellite list - for names only"""
-        if self._tles is None:
+    def tles(self, system='iridium'):
+        """the public satellite list of a system - for names only"""
+        if system not in self._tles:
             try:
-                self._tles = catalog.load_tles()
+                self._tles[system] = catalog.load_tles(system)
             except OSError:
-                self._tles = []
-        return self._tles
+                self._tles[system] = []
+        return self._tles[system]
+
+    def identify_orbcomm(self, sat_id, t, xyz_km):
+        """name of the Orbcomm satellite that sent its position: the satellite ID's name once known,
+        otherwise the catalog satellite at that spot (the name only)"""
+        if sat_id in self.oc_ids:
+            return self.oc_ids[sat_id]
+        name, _ = catalog.match_ecef(self.tles('orbcomm'), datetime.datetime.fromtimestamp(t, UTC), xyz_km)
+        if name:
+            self.oc_ids[sat_id] = name
+        return name
 
     def link_slots(self, events):
         """while receiving: tie each plane/slot heard in time & location frames to a satellite by its Doppler
@@ -273,6 +299,7 @@ class Data:
         """compute orbits from our own fixes and Doppler curves"""
         if names is None:
             self.orbits, self.no_orbit = {}, {}
+            self._ham_fits = {}     # every orbit is redone, Doppler-only ones too
             names = set(self.info)
         if catalog.HOME is None:      # first run: nothing to fit until the antenna location is set
             return
@@ -285,11 +312,12 @@ class Data:
                 self._fit_one(n, lambda t, n=n: [p['node'] for p in self.planes(t) if n not in p['members']])
 
     def _fit_one(self, n, plane_nodes_at=None):
+        sys_ = systems.of_name(n)
         fixes = [(f['t'], f['xyz_km']) for f in self.all_fixes() if f['name'] == n and f.get('xyz_km')]
         groups = list(self.doppler.get(n, []))
         by_cap = {}
         for f in self.all_fixes():   # the ring alerts' own frequencies are Doppler measurements too
-            if f['name'] == n and f.get('hz'):
+            if f['name'] == n and f.get('hz') and sys_ is systems.IRIDIUM:
                 by_cap.setdefault(f['cap'], []).append((f['t'], f['hz']))
         groups += list(by_cap.values())
         # only the latest week counts: older observations don't improve today's orbit, and this keeps
@@ -298,13 +326,55 @@ class Data:
             since = max(t for t, _ in fixes) - FIT_DAYS * 86400
             fixes = [fx for fx in fixes if fx[0] >= since]
             groups = [g for g in groups if g and max(t for t, _ in g) >= since]
-        orbit, why = orbitfit.fit(fixes, groups, catalog.HOME, plane_nodes_at)
+        if sys_ is systems.GNSS:
+            orbit, why = self._gnss_orbit(n)
+        elif sys_ is systems.HAM:
+            got = self._fit_ham(n, groups)
+            if got is None:
+                return          # nothing new since the last fit
+            orbit, why = got
+        else:
+            orbit, why = orbitfit.fit(fixes, groups, catalog.HOME, plane_nodes_at,
+                                      carrier=sys_['carrier_hz'], inc_hint=sys_['inc_hint'])
         self.orbits.pop(n, None)
         self.no_orbit.pop(n, None)
         if orbit:
             self.orbits[n] = orbit
         else:
             self.no_orbit[n] = why
+
+    def _gnss_orbit(self, n):
+        """GNSS satellites broadcast their own orbit (ephemeris): its position comes from that, like Orbcomm's
+        reported positions - only once it has been decoded (needs ~30 s of continuous tracking)"""
+        sat = self.info.get(n, {}).get('sat')
+        got = self.gnss_eph.get(sat)
+        if not got:
+            return None, 'its broadcast orbit (ephemeris) has not been decoded yet - needs about 30 s of steady tracking'
+        try:
+            import gnss
+            t, fields = got
+            return gnss.EphemerisOrbit(gnss.parse_eph('$EPH,%.3f,%s,%s' % (t, sat, fields.replace(' ', ',')))), None
+        except Exception as e:      # (gnss.py missing, or an ephemeris it can't read)
+            return None, 'could not use its ephemeris (%s)' % e
+
+    def _fit_ham(self, n, groups):
+        """ISS / ham satellites send no position: an orbit from their Doppler curves alone, kept only if
+        orbitfit's confidence gate accepts it (it needs passes on more than one orbit). A fit takes ~2 s, so
+        it is redone only when there is new data worth it. Returns (orbit or None, reason), or None if skipped.
+        Passes heard on 2 m and 70 cm are scaled to one reference frequency so they fit together."""
+        groups = [g for g in groups if len(g) >= 3]
+        key = (len(groups), sum(len(g) for g in groups))
+        last = self._ham_fits.get(n)
+        if last and (key == last[0] or (key[0] == last[0][0] and key[1] - last[0][1] < 5 and time.time() - last[1] < 30)):
+            return None
+        ref = 436.5e6
+        scaled = []
+        for g in groups:
+            f0 = float(np.median([h for _, h in g]))
+            scaled.append([(t, ref + (h - f0) * ref / f0) for t, h in g])
+        orbit, why, _ = orbitfit.fit_doppler(scaled, catalog.HOME, ref)
+        self._ham_fits[n] = (key, time.time())
+        return orbit, why
 
     def load_catalog(self):
         path = catalog.DATA
@@ -314,6 +384,7 @@ class Data:
         except (OSError, ValueError):
             caps = {}
         self.captures, self.fixes = [], []
+        self.gnss_eph, self.gnss_fixes = {}, []
         self.doppler = {}       # name -> list of Doppler curves [(t, Hz), ...]
         self.info = {}          # name -> details
         self.slot_name = {}     # (plane, slot) -> name
@@ -322,9 +393,22 @@ class Data:
         for cap_name, c in sorted(caps.items()):
             if not sum(c['counts'].values()):
                 continue
+            if systems.get(c.get('system')).get('system') == 'gnss':
+                for ps in c.get('passes', []):
+                    systems.register(ps['name'], 'gnss')
+                for sat, (t, fields) in c.get('ephemerides', {}).items():
+                    if t >= self.gnss_eph.get(sat, (0, ''))[0]:
+                        self.gnss_eph[sat] = (t, fields)
+                self.gnss_fixes += c.get('gnss_fixes', [])
+            if systems.get(c.get('system')).get('system') == 'ham':
+                if self._ham_names is None:
+                    self._ham_names = catalog.norad_names()
+                for ps in c.get('passes', []):      # named the catalog's way, even if analyzed while offline
+                    ps['name'] = catalog.ham_name(ps.get('norad'), ps['name'], self._ham_names)
+                    systems.register(ps['name'], 'ham')
             start = ts(c['start_utc'])
             self.captures.append({'name': cap_name, 'start': start, 'end': start + c['hours'] * 3600,
-                                  'fixes': len(c['positions'])})
+                                  'fixes': len(c['positions']), 'system': c.get('system', 'iridium')})
             for p in c['positions']:
                 fx = dict(p, t=ts(p['time']), cap=cap_name, live=False)
                 self.fixes.append(fx)
@@ -335,6 +419,24 @@ class Data:
                     i['last'] = max(i['last'], fx['t'])
                     i['best'] = max(i['best'], p['snr'])
                     i['how'].add('position')
+                    if c.get('system') == 'orbcomm':
+                        self.oc_ids[p['net_id']] = p['name']
+            for ps in c.get('passes', []):       # Orbcomm / ham: each satellite's packets over a pass
+                i = self._info(ps['name'])
+                i['last'] = max(i['last'], ts(ps['last']))
+                i['best'] = max(i['best'], ps['best_snr'])
+                if ps.get('sat_id') is not None:
+                    i['net_ids'].add(ps['sat_id'])
+                if 'sat' in ps:             # GNSS: tracked by its own code
+                    i['how'].add('tracked')
+                    i['sat'] = ps['sat']
+                    i['frames'] = i.get('frames', 0) + ps['frames']
+                if 'norad' in ps:           # ham: identified by its decoded frames
+                    i['how'].add('frames')
+                    i['norad'] = ps['norad']
+                    i['callsigns'] = sorted(set(i.get('callsigns', [])) | set(ps.get('callsigns', [])))
+                    i['frames'] = i.get('frames', 0) + ps['frames']
+                self.doppler.setdefault(ps['name'], []).append(ps['doppler'])
             for s in c['slots']:
                 self.slots_heard.add((s['plane'], s['slot']))
                 if s['name'] and s['confidence'] == 'confident':
@@ -363,7 +465,8 @@ class Data:
 
     def _info(self, name):
         if name not in self.info:
-            self.info[name] = {'fixes': 0, 'net_ids': set(), 'slots': set(), 'last': 0, 'best': 0, 'how': set()}
+            self.info[name] = {'fixes': 0, 'net_ids': set(), 'slots': set(), 'last': 0, 'best': 0, 'how': set(),
+                               'system': systems.of_name(name)['key']}
         return self.info[name]
 
     def _add_live_fix_info(self, fx):
@@ -382,8 +485,9 @@ class Data:
 
     @property
     def doppler_only(self):
-        """satellites identified by their Doppler curve that we have no orbit for (listed, not drawn)"""
-        return [n for n, i in self.info.items() if n not in self.orbits and 'Doppler' in i['how']]
+        """satellites identified by their Doppler curve (Iridium) or their decoded frames (ISS, ham) that we
+        have no orbit for (listed, not drawn)"""
+        return [n for n, i in self.info.items() if n not in self.orbits and ({'Doppler', 'frames', 'tracked'} & i['how'])]
 
     def all_fixes(self):
         return self.fixes + self.live_fixes
@@ -394,6 +498,8 @@ class Data:
         orbit lines up with. Returns a list of {plane, node, inc, members, spread, sigma}."""
         sats = []
         for n, o in self.orbits.items():
+            if systems.of_name(n) is not systems.IRIDIUM:
+                continue
             if o.plane_sigma_km > PLANE_MAX_SIGMA_KM:
                 continue
             node, inc = o.plane_at(t)
@@ -455,7 +561,7 @@ class Data:
             pass
         # is a receiver writing right now? Its decoder log changes every 10 s even when nothing is heard,
         # so the newest of a capture's files is its heartbeat; bursts only touch .live / .bits
-        current = [f for f in glob.glob(os.path.join(paths.CAPTURES, 'output-*'))
+        current = [f for p in systems.capture_prefixes() for f in glob.glob(os.path.join(paths.CAPTURES, p + '*'))
                    if f.endswith(('.live', '.log', '.bits'))]
         if current:
             newest = max(current, key=os.path.getmtime)
@@ -465,7 +571,8 @@ class Data:
             self.last_burst = max((os.path.getmtime(stem + e) for e in ('.live', '.bits')
                                    if os.path.exists(stem + e) and os.path.getsize(stem + e) > 200), default=0)
         # every capture the receiver wrote that hasn't been decoded into the catalog yet
-        lives = sorted(glob.glob(os.path.join(paths.CAPTURES, 'output-*.live')), key=os.path.getmtime)
+        lives = sorted((f for p in systems.capture_prefixes() for f in glob.glob(os.path.join(paths.CAPTURES, p + '*.live'))),
+                       key=os.path.getmtime)
         if not lives:
             return events
         done = {c['name'] for c in self.captures}
@@ -485,7 +592,14 @@ class Data:
                 continue
             newest = path == lives[-1]
             n_before = len(self.live_fixes)
-            evs = self._read_live(text, cap, catalog.capture_start(path[:-5])[0].timestamp(), newest, refit)
+            if systems.of_capture(cap) is systems.ORBCOMM:
+                evs = self._read_live_orbcomm(text, cap, newest, refit)
+            elif systems.of_capture(cap).get('system') == 'ham':
+                evs = self._read_live_ham(text, cap, newest, refit)
+            elif systems.of_capture(cap).get('system') == 'gnss':
+                evs = self._read_live_gnss(text, cap, newest, refit)
+            else:
+                evs = self._read_live(text, cap, catalog.capture_start(path[:-5])[0].timestamp(), newest, refit)
             if newest:
                 events += evs
             elif len(self.live_fixes) > n_before:
@@ -539,6 +653,117 @@ class Data:
                     self.unlinked.setdefault((cap, ps), []).append((t, hz))
                 events.append('%s  heard plane %d #%d%s  (%.0f dB)' % (fmt_clock(t), ps[0], ps[1],
                                                                      '  = ' + name if name else '', snr))
+        return events
+
+    def _read_live_orbcomm(self, text, cap, newest, refit):
+        """Orbcomm packets from a capture's live file: positions (ephemeris) and the Doppler of every packet"""
+        events = []
+        for line in text.splitlines():
+            pk = catalog.read_orbcomm([line])
+            if not pk:
+                continue
+            kind, t, hz, sid, snr, rest = pk[0]
+            if newest:
+                self.frame_queue.append((kind, line))
+            if kind == 'OBAD' or sid is None:
+                continue
+            if kind == 'OEP' and len(rest) >= 6:
+                xyz = [float(v) for v in rest[:3]]
+                name = self.identify_orbcomm(sid, t, xyz)
+                lat, lon, alt = catalog.ecef_to_lla(*xyz)
+                fx = {'t': t, 'lat': lat, 'lon': lon, 'name': name, 'net_id': sid, 'beam': None, 'alt_km': round(alt),
+                      'snr': snr, 'cap': cap, 'live': newest, 'hz': hz, 'xyz_km': xyz,
+                      'vel_kms': [float(v) for v in rest[3:6]]}
+                self.live_fixes.append(fx)
+                self._add_live_fix_info(fx)
+                if name:
+                    refit.add(name)
+                events.append('%s  POSITION  %s  %+.2f, %+.2f  (%.0f dB)' % (fmt_clock(t), name or 'Orbcomm ID %02X' % sid,
+                                                                            lat, lon, snr))
+            name = self.oc_ids.get(sid)
+            if name:                    # every packet's frequency is a point on its Doppler curve
+                self.live_heard[name] = t
+                self._info(name)['last'] = max(self._info(name)['last'], t)
+                if not self.live_doppler.get((cap, name)):
+                    self.live_doppler[(cap, name)] = []
+                    self.doppler.setdefault(name, []).append(self.live_doppler[(cap, name)])
+                self.live_doppler[(cap, name)].append((t, hz))
+        return events
+
+    def _read_live_ham(self, text, cap, newest, refit):
+        """ISS / ham frames from a capture's live file: each identified frame is a point on its satellite's
+        Doppler curve; frames that can't be tied to one satellite are only shown in the log"""
+        events = []
+        if self._ham_names is None:
+            self._ham_names = catalog.norad_names()
+        for line in text.splitlines():
+            fr = catalog.read_ham([line])
+            if not fr:
+                continue
+            kind, t, hz, norad, name, snr, call, cands = fr[0]
+            if newest:
+                self.frame_queue.append((kind, line))
+            if kind != 'HFR':
+                continue
+            if not name:
+                events.append('%s  frame from %s on %.4f MHz - could be %s (they share a frequency)'
+                              % (fmt_clock(t), call, hz / 1e6, ', '.join(cands[:4]) + (' ...' if len(cands) > 4 else '')))
+                continue
+            name = catalog.ham_name(norad, name, self._ham_names)
+            systems.register(name, 'ham')
+            i = self._info(name)
+            i['how'].add('frames')
+            i['norad'] = norad
+            i['frames'] = i.get('frames', 0) + 1
+            if call != '-':
+                i['callsigns'] = sorted(set(i.get('callsigns', [])) | {call})
+            i['last'] = max(i['last'], t)
+            i['best'] = max(i['best'], snr)
+            self.live_heard[name] = t
+            if not self.live_doppler.get((cap, name)):
+                self.live_doppler[(cap, name)] = []
+                self.doppler.setdefault(name, []).append(self.live_doppler[(cap, name)])
+            self.live_doppler[(cap, name)].append((t, hz))
+            refit.add(name)
+            events.append('%s  FRAME  %s%s  %.4f MHz  (%.0f dB)' % (fmt_clock(t), name, ' from ' + call if call != '-' else '',
+                                                                    hz / 1e6, snr))
+        return events
+
+
+    def _read_live_gnss(self, text, cap, newest, refit):
+        """GNSS lines from a capture's live file: tracked satellites (Doppler, signal), their broadcast orbits,
+        and position fixes of the receiver"""
+        events = []
+        for kind, t, f in catalog.read_gnss(text.splitlines()):
+            if newest:
+                self.frame_queue.append((kind, '%s: %.3f %s' % (kind, t, ' '.join(f))))
+            if kind == 'GCH' and len(f) >= 4:
+                sat = f[0]
+                name = catalog.gnss_name(sat)
+                systems.register(name, 'gnss')
+                i = self._info(name)
+                new = 'tracked' not in i['how']
+                i['how'].add('tracked')
+                i['sat'] = sat
+                i['frames'] = i.get('frames', 0) + 1
+                i['last'] = max(i['last'], t)
+                i['best'] = max(i['best'], float(f[2]))
+                self.live_heard[name] = t
+                if not self.live_doppler.get((cap, name)):
+                    self.live_doppler[(cap, name)] = []
+                    self.doppler.setdefault(name, []).append(self.live_doppler[(cap, name)])
+                self.live_doppler[(cap, name)].append((t, catalog.GNSS_L1 + float(f[3])))
+                if new:
+                    events.append('%s  TRACKING  %s  (%.0f dB-Hz, Doppler %+.0f Hz)' % (fmt_clock(t), name, float(f[2]), float(f[3])))
+            elif kind == 'GEPH' and len(f) >= 2:
+                self.gnss_eph[f[0]] = (t, ' '.join(f[1:]))
+                refit.add(catalog.gnss_name(f[0]))
+                events.append('%s  ORBIT  %s broadcast its ephemeris' % (fmt_clock(t), catalog.gnss_name(f[0])))
+            elif kind == 'GPOS' and len(f) >= 4:
+                fx = {'t': t, 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]), 'nsat': int(f[3])}
+                self.gnss_fixes.append(fx)
+                events.append('%s  GNSS FIX  %+.5f, %+.5f, %.0f m (%d satellites)' % (fmt_clock(t), fx['lat'], fx['lon'],
+                                                                                  fx['height_m'], fx['nsat']))
         return events
 
 
@@ -642,11 +867,13 @@ def unmerc(wx, wy):
     return lon, lat
 
 
-def draw_satellite(p, x, y, color, scale=1.0):
+def draw_satellite(p, x, y, color, scale=1.0, system='iridium'):
+    """a satellite icon; the body colour shows its state, the solar panels' edge its system"""
     p.save()
     p.translate(x, y)
     p.scale(scale, scale)
-    p.setPen(QtGui.QPen(Qt.white, 1))
+    p.setPen(QtGui.QPen(Qt.white if system == 'iridium' else QtGui.QColor(*systems.get(system)['colour']),
+                        1 if system == 'iridium' else 1.6))
     p.setBrush(QtGui.QColor(40, 40, 40))
     p.drawRect(QtCore.QRectF(-11, -3, 7, 6))     # solar panels
     p.drawRect(QtCore.QRectF(4, -3, 7, 6))
@@ -836,9 +1063,11 @@ class MapView(QtWidgets.QWidget):
                 p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, int(255 * fx['alpha'])), 1.5))
                 p.setBrush(c)
                 r = 6 if fx.get('live') else 4.5
-                tip = ('<b>Measured position</b> (decoded by your antenna)<br>%s<br>%s  net ID %03d  beam %d<br>'
+                ident = ('net ID %03d  beam %d' % (fx['net_id'], fx['beam']) if fx.get('beam') is not None
+                         else 'satellite ID %02X' % fx['net_id'])        # Iridium ring alert / Orbcomm ephemeris
+                tip = ('<b>Measured position</b> (decoded by your antenna)<br>%s<br>%s  %s<br>'
                        'lat %+.2f  lon %+.2f  alt %d km<br>signal %.1f dB%s'
-                       % (fmt_time(fx['t'], True), fx['name'] or 'unmatched', fx['net_id'], fx['beam'],
+                       % (fmt_time(fx['t'], True), fx['name'] or 'unmatched', ident,
                           fx['lat'], fx['lon'], fx['alt_km'], fx['snr'], '<br><b>LIVE</b>' if fx.get('live') else ''))
                 for o in offs:
                     p.drawEllipse(QPointF(x + o, y), r, r)
@@ -885,10 +1114,10 @@ class MapView(QtWidgets.QWidget):
                         p.setPen(QtGui.QPen(QtGui.QColor(0, 200, 0), 2))
                         p.setBrush(Qt.NoBrush)
                         p.drawEllipse(QPointF(x + o, y), 15, 15)
-                    draw_satellite(p, x + o, y, col, 1.25 if s['selected'] else 0.9)
+                    draw_satellite(p, x + o, y, col, 1.25 if s['selected'] else 0.9, s['system'])
                     if s['selected'] or s['el'] > 0:
                         p.setPen(QtGui.QColor(TEXT))
-                        p.drawText(QPointF(x + o + 12, y - 8), s['name'].replace('IRIDIUM ', 'IR '))
+                        p.drawText(QPointF(x + o + 12, y - 8), systems.short_name(s['name']))
                     self.hits.append((x + o, y, s['name'], tip))
             p.setOpacity(1.0)
         self._draw_legend(p)
@@ -952,7 +1181,7 @@ class MapView(QtWidgets.QWidget):
                    'The line is the whole orbit ring at this moment; every satellite in this plane is somewhere on it, '
                    'moving the way the arrows point.'
                    % (name, len(pl['members']), '' if len(pl['members']) == 1 else 's',
-                      ', '.join(m.replace('IRIDIUM ', 'IR ') for m in pl['members']), pl['spread'], pl['sigma']))
+                      ', '.join(systems.short_name(m) for m in pl['members']), pl['spread'], pl['sigma']))
             k = 4 * (pl['plane'] or 7)
             fill = QtGui.QColor(col).darker(150)    # white text reads on the bright plane colours
             fill.setAlpha(235)
@@ -996,7 +1225,8 @@ class MapView(QtWidgets.QWidget):
                  ('future', 'Predicted track, future'),
                  ('sat', 'Predicted position (faded + dotted ring = uncertain)'),
                  ('view', 'green = above your horizon now'),
-                 ('plane', 'Orbital plane (our orbits), arrows = direction')]
+                 ('orbcomm', 'orange-edged = Orbcomm, green-edged = ISS / ham (others: Iridium)'),
+                 ('plane', 'Orbital plane (Iridium, our orbits), arrows = direction')]
         font = p.font()
         font.setPointSize(8)
         p.setFont(font)
@@ -1032,6 +1262,8 @@ class MapView(QtWidgets.QWidget):
                 p.drawLine(QPointF(x - 9, y), QPointF(x + 9, y))
             elif kind == 'sat':
                 draw_satellite(p, x, y, QtGui.QColor(120, 126, 138), 0.8)
+            elif kind == 'orbcomm':
+                draw_satellite(p, x, y, QtGui.QColor(120, 126, 138), 0.8, 'orbcomm')
             elif kind == 'plane':
                 p.setPen(QtGui.QPen(QtGui.QColor(*PLANE_COLORS[1]), 2.5))
                 p.drawLine(QPointF(x - 9, y), QPointF(x + 9, y))
@@ -1203,6 +1435,31 @@ class Timeline(QtWidgets.QWidget):
         p.end()
 
 
+class StatBox(QtWidgets.QFrame):
+    """one number with a caption under it, in a small box"""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName('stat')
+        self.setStyleSheet('QFrame#stat { background: %s; border: 1px solid %s; border-radius: 6px; }'
+                           ' QFrame#stat QLabel { background: transparent; border: none; }' % (SURFACE, BORDER))
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(8, 5, 8, 5)
+        lay.setSpacing(0)
+        self.value = QtWidgets.QLabel()
+        self.value.setStyleSheet('font-size: 18px; font-weight: 700; color: %s;' % TEXT)
+        self.caption = QtWidgets.QLabel()
+        self.caption.setStyleSheet('font-size: 10px; color: %s;' % MUTED)
+        self.caption.setWordWrap(True)
+        lay.addWidget(self.value)
+        lay.addWidget(self.caption)
+
+    def set(self, value, caption, tip=''):
+        self.value.setText(str(value))
+        self.caption.setText(caption)
+        self.setToolTip(tip)
+
+
 class ElidedLabel(QtWidgets.QLabel):
     """a one-line label that shortens its text with ... when there isn't room (full text in its tooltip)"""
 
@@ -1228,7 +1485,7 @@ class Tracker(QtWidgets.QMainWindow):
 
     def __init__(self, replay=None):
         super().__init__()
-        self.setWindowTitle('Iridium Tracker')
+        self.setWindowTitle('Satellite Tracker')
         avail = QtWidgets.QApplication.primaryScreen().availableGeometry()
         self.resize(int(min(1700, avail.width() * 0.95)), int(min(1000, avail.height() * 0.92)))
         self.data = Data()
@@ -1276,6 +1533,11 @@ class Tracker(QtWidgets.QMainWindow):
         row.addStretch(1)
 
         opts = QtWidgets.QHBoxLayout()
+        self.sys_box = QtWidgets.QComboBox()      # which satellite systems to show
+        self.sys_box.addItem('Systems: all', None)
+        for s in systems.DISPLAY:
+            self.sys_box.addItem('%s only' % s['label'], s['key'])
+        self.sys_box.setToolTip('Show every satellite system, or just one')
         self.tracks_box = QtWidgets.QComboBox()
         self.tracks_box.addItems(['Tracks: selected + in view', 'Tracks: selected only', 'Tracks: all heard', 'Tracks: none'])
         self.fp_box = QtWidgets.QComboBox()
@@ -1286,7 +1548,8 @@ class Tracker(QtWidgets.QMainWindow):
         self.planes_box.addItems(['Planes: all', "Planes: selected satellite's", 'Planes: none'])
         self.night_chk = QtWidgets.QCheckBox('Day/night')
         self.night_chk.setChecked(True)
-        for wdg in (self.tracks_box, self.fp_box, self.fix_box, self.planes_box, self.night_chk):
+        self.sys_box.currentIndexChanged.connect(self.reload_lists)
+        for wdg in (self.sys_box, self.tracks_box, self.fp_box, self.fix_box, self.planes_box, self.night_chk):
             opts.addWidget(wdg)
             sig = wdg.stateChanged if isinstance(wdg, QtWidgets.QCheckBox) else wdg.currentIndexChanged
             sig.connect(self.refresh)
@@ -1304,6 +1567,14 @@ class Tracker(QtWidgets.QMainWindow):
         self.rx_btn.clicked.connect(self.toggle_receiver)
         self.rx_btn.setToolTip('Runs the SDR receiver and decoder. Close SDR++ and SatDump first - only one '
                                'program can use the SDR. When you stop, the capture is added to the catalog.')
+        self.rx_system = QtWidgets.QComboBox()       # which system to receive (also in Source)
+        for sy in systems.ORDER:
+            lo = sy['band_hz'][0]
+            self.rx_system.addItem('%s  %s' % (sy['label'], '%.1f GHz' % (lo / 1e9) if lo > 1e9 else '%.0f MHz' % (lo / 1e6)),
+                                   sy['key'])
+        self.rx_system.setCurrentIndex(max(0, self.rx_system.findData(sdr_settings.load()['system'])))
+        self.rx_system.currentIndexChanged.connect(self._rx_system_changed)
+        self._rx_system_tip()
         self.src_btn = QtWidgets.QPushButton('\u2699  Source')
         self.src_btn.setToolTip('Choose the SDR and how it is tuned: sample rate, frequency, gain, PPM, bias-T...')
         self.src_btn.clicked.connect(self.show_source)
@@ -1323,7 +1594,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.rx_dot = QtWidgets.QLabel()
         self.rx_status = ElidedLabel('Receiver off')
         self.rx_status.setStyleSheet('color: %s;' % MUTED)
-        title = QtWidgets.QLabel('IRIDIUM TRACKER')
+        title = QtWidgets.QLabel('SATELLITE TRACKER')
         title.setStyleSheet('font-size: 13px; font-weight: 700; letter-spacing: 2px; color: %s;' % TEXT)
         header = QtWidgets.QFrame()
         header.setStyleSheet('QFrame#hdr { background: %s; border: 1px solid %s; border-radius: 8px; }'
@@ -1334,6 +1605,7 @@ class Tracker(QtWidgets.QMainWindow):
         hl.addWidget(title)
         hl.addSpacing(16)
         hl.addWidget(self.rx_btn)
+        hl.addWidget(self.rx_system)
         hl.addWidget(self.src_btn)
         hl.addWidget(self.spec_btn)
         hl.addWidget(self.sky_btn)
@@ -1396,9 +1668,38 @@ class Tracker(QtWidgets.QMainWindow):
         lv.addWidget(self.timeline)
         lv.addLayout(row)
 
-        # side panel
+        # side panel: which systems to show (drives the Systems filter), then numbers about them
+        self.sys_buttons = QtWidgets.QButtonGroup(self)
+        self.sys_buttons.setExclusive(True)
+        sys_row = QtWidgets.QHBoxLayout()
+        sys_row.setSpacing(4)
+        for i in range(self.sys_box.count()):
+            key = self.sys_box.itemData(i)
+            b = QtWidgets.QPushButton()
+            b.setCheckable(True)
+            b.setMinimumHeight(38)
+            col = QtGui.QColor(*systems.get(key)['colour']).name() if key else ACCENT
+            b.setStyleSheet('QPushButton { padding: 2px 4px; font-size: 11px; border: 1px solid %s; border-radius: 6px;'
+                            ' background: %s; color: %s; }'
+                            ' QPushButton:checked { background: %s; border: 2px solid %s; color: white; font-weight: 700; }'
+                            ' QPushButton:hover:!checked { border-color: %s; }'
+                            % (BORDER, SURFACE, TEXT, QtGui.QColor(col).darker(220).name(), col, col))
+            b.setToolTip('Show %s on the map, globe, sky plot and in this list'
+                         % ('every satellite system' if key is None else systems.get(key)['label']))
+            self.sys_buttons.addButton(b, i)
+            sys_row.addWidget(b, 1)
+        self.sys_buttons.button(0).setChecked(True)
+        self.sys_buttons.idClicked.connect(self.sys_box.setCurrentIndex)
+        self.sys_box.currentIndexChanged.connect(lambda i: self.sys_buttons.button(i).setChecked(True))
+        self.sys_box.hide()         # the buttons above the satellite list replace it
+        self.stats = [StatBox() for _ in range(4)]
+        stat_row = QtWidgets.QHBoxLayout()
+        stat_row.setSpacing(4)
+        for b in self.stats:
+            stat_row.addWidget(b, 1)
         self.summary = QtWidgets.QLabel()
         self.summary.setWordWrap(True)
+        self.summary.setStyleSheet('font-size: 10px;')
         self.table = QtWidgets.QTableWidget(0, 6)
         self.table.setHorizontalHeaderLabels(['Satellite', 'Slot', 'Net ID', 'Tracks', 'Heard', 'At this time'])
         self.table.verticalHeader().hide()
@@ -1444,6 +1745,8 @@ class Tracker(QtWidgets.QMainWindow):
 
         right = QtWidgets.QWidget()
         rv = QtWidgets.QVBoxLayout(right)
+        rv.addLayout(sys_row)
+        rv.addLayout(stat_row)
         rv.addWidget(self.summary)
         rv.addWidget(self.table, 1)
         rv.addWidget(self.detail_scroll, 1)
@@ -1479,7 +1782,7 @@ class Tracker(QtWidgets.QMainWindow):
 
     # ---- activity lights
     def _frame(self, kind, line):
-        ok = kind not in ('RAW', 'ERR')
+        ok = kind not in receiver.DAMAGED
         self.activity.flash(ok)
         if ok:      # (a damaged burst can't say which satellite sent it)
             name = self._satellite_of(line)
@@ -1487,14 +1790,18 @@ class Tracker(QtWidgets.QMainWindow):
                 self.sat_lights.flash(name)
 
     def _satellite_of(self, line):
-        """which satellite sent a frame: by plane/slot (time & location) or network ID (ring alerts, broadcasts)"""
+        """which satellite sent a frame: by plane/slot (time & location) or network ID (ring alerts, broadcasts);
+        Orbcomm packets carry their satellite's ID"""
+        pk = catalog.read_orbcomm([line]) if line.startswith('O') else None
+        if pk:
+            return self.data.oc_ids.get(pk[0][3])
         m = re.search(r' P(\d) S(\d+) ', line)
         if m:
             return self.data.slot_name.get((int(m.group(1)), int(m.group(2))))
         m = re.search(r'sat:(\d+)', line)
         if m:
             net = int(m.group(1))
-            return next((n for n, i in self.data.info.items() if net in i['net_ids']), None)
+            return next((n for n, i in self.data.info.items() if i['system'] == 'iridium' and net in i['net_ids']), None)
         return None
 
     # ---- globe
@@ -1511,7 +1818,7 @@ class Tracker(QtWidgets.QMainWindow):
     # ---- sky plot
     def show_sky(self):
         if self.sky is None:
-            self.sky = skyplot.SkyDialog(self, self.data, from_home, self._run_start)
+            self.sky = skyplot.SkyDialog(self, self.data, from_home, self._run_start, self.shows)
         self.sky.show()
         self.sky.raise_()
         self.sky.refresh()
@@ -1526,13 +1833,33 @@ class Tracker(QtWidgets.QMainWindow):
     # ---- receiver
     def show_source(self):
         d = source_dialog.SourceDialog(self, receiving=self.receiver.busy)
-        if d.exec_() and not self.receiver.busy:
-            self.rx_status.setText(self._source_text())
+        if d.exec_():
+            self.rx_system.blockSignals(True)        # the system may have been changed there
+            self.rx_system.setCurrentIndex(max(0, self.rx_system.findData(sdr_settings.load()['system'])))
+            self.rx_system.blockSignals(False)
+            self._rx_system_tip()
+            if not self.receiver.busy:
+                self.rx_status.setText(self._source_text())
+
+    def _rx_system_changed(self, _):
+        """the system picked beside the Start button: saved like Source's 'Receive', with an antenna reminder"""
+        s = sdr_settings.load()
+        s['system'] = self.rx_system.currentData()
+        sdr_settings.save(s)
+        sy = systems.get(s['system'])
+        self._rx_system_tip()
+        self.rx_status.setText(self._source_text())
+        self.events.insertItem(0, '%s  Receiving %s next - antenna: %s' % (fmt_clock(time.time()), sy['label'], sy['antenna']))
+
+    def _rx_system_tip(self):
+        sy = systems.get(self.rx_system.currentData())
+        self.rx_system.setToolTip('Which satellite system the receiver listens to (one at a time).\n'
+                                  'Antenna for %s: %s.\nMore settings in Source.' % (sy['label'], sy['antenna']))
 
     def _source_text(self):
         s = sdr_settings.load()
-        return 'Receiver off  \u00b7  %s  \u00b7  %.4f MHz, %g MS/s' % (
-            s['label'], sdr_settings.center_hz(s) / 1e6, s['sample_rate'] / 1e6)
+        return 'Receiver off  \u00b7  %s on %s  \u00b7  %.4f MHz, %g MS/s' % (
+            systems.get(s['system'])['label'], s['label'], sdr_settings.center_hz(s) / 1e6, sdr_settings.sample_rate(s) / 1e6)
 
     def toggle_receiver(self):
         if self.receiver.state == 'running':
@@ -1554,6 +1881,7 @@ class Tracker(QtWidgets.QMainWindow):
                                   % (color, QtGui.QColor(color).lighter(115).name()))
         self.rx_dot.setText('<span style="color:%s; font-size:16px">●</span>' % (ALERT if on else '#4a5263'))
         self.rx_btn.setEnabled(True)
+        self.rx_system.setEnabled(not on)        # switch systems while stopped
 
     def _receiver_status(self, text):
         self.rx_status.setText(text)
@@ -1673,35 +2001,81 @@ class Tracker(QtWidgets.QMainWindow):
             if c['end'] - c['start'] > 120:
                 self.replay_box.addItem('%s  (%.1f h, %d fixes)' % (fmt_time(c['start']), (c['end'] - c['start']) / 3600, c['fixes']), c)
         self.replay_box.blockSignals(False)
-        names = sorted(d.tracked + d.doppler_only, key=lambda n: int(re.sub(r'\D', '', n) or 0))
+        names = sorted((n for n in d.tracked + d.doppler_only if self.shows(n)),
+                       key=lambda n: (systems.DISPLAY.index(systems.of_name(n)), int(re.sub(r'\D', '', n) or 0), n))
         self.table.blockSignals(True)
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(names))
         for r, n in enumerate(names):
             i = d.info[n]
             vals = [n, ', '.join('P%d S%02d' % ps for ps in sorted(i['slots'])) or '-',
-                    ', '.join('%03d' % x for x in sorted(i['net_ids'])) or '-', str(i['fixes']),
+                    fmt_ids(i), str(i['fixes']),
                     short_time(i['last']) if i['last'] else '-', '']
             for c, v in enumerate(vals):
-                item = QtWidgets.QTableWidgetItem(v)
-                if c == 3:
+                item = QtWidgets.QTableWidgetItem(systems.short_name(v) if c == 0 else v)
+                if c == 0:
+                    item.setData(Qt.UserRole, n)
+                    item.setToolTip(n)
+                if c == COL_TRACKS:
                     item.setData(Qt.DisplayRole, i['fixes'])
                 self.table.setItem(r, c, item)
         self.table.setSortingEnabled(True)
         self.table.blockSignals(False)
-        waiting = sorted(n for n, why in d.no_orbit.items() if 'direction' in why)
-        self.summary.setText(
-            '<b>%d satellites with our own orbit</b> &middot; %d identified by Doppler only &middot; '
-            '%d position fixes &middot; %d of 66 plane/slots heard'
-            '<br><span style="color:%s">Every position and track comes only from your decoded fixes and Doppler. '
-            'Satellites are shown once they have sent a position fix%s; %d others were heard but have not sent one yet.</span>'
-            % (len(d.tracked), len(d.doppler_only), len(d.all_fixes()), len(d.slots_heard), MUTED,
-               ' (needs another fix: %s)' % ', '.join(waiting) if waiting else '',
-               sum(1 for why in d.no_orbit.values() if 'no position' in why)))
+        self._fill_summary(names)
         self.tle_note = 'Orbits: computed from your own observations only'
 
+    def _fill_summary(self, names):
+        """the system buttons' counts, the number boxes and the note under them, for the systems shown"""
+        d = self.data
+        listed = d.tracked + d.doppler_only
+        for i in range(self.sys_box.count()):
+            key = self.sys_box.itemData(i)
+            n = sum(1 for x in listed if key is None or systems.of_name(x)['key'] == key)
+            label = 'All' if key is None else {'ham': 'ISS / ham'}.get(key, systems.get(key)['label'].split(' (')[0])
+            self.sys_buttons.button(i).setText('%s\n%d' % (label, n))
+        want = self.sys_box.currentData()
+        orbit = sum(1 for x in names if x in d.orbits)
+        heard = len(names) - orbit
+        fixes = [f for f in d.all_fixes() if self.shows(f['name'], f['cap'])]
+        boxes = [(len(names), 'satellites listed', 'satellites you have received'),
+                 (orbit, 'with our own orbit', 'on the map: an orbit worked out from your own receptions'),
+                 (heard, 'heard, no orbit yet', 'in the list but not on the map yet (see each one for why)')]
+        if want == 'iridium':
+            boxes = [(orbit, 'with our own orbit', boxes[1][2]),
+                     (heard, 'Doppler only', 'identified by their Doppler curve, no orbit yet'),
+                     (len(fixes), 'position fixes', 'ring alerts that reported a satellite position'),
+                     ('%d/66' % len(d.slots_heard), 'plane slots heard', 'of the 66 plane/slot positions in the constellation')]
+        elif want == 'gnss':
+            boxes = [(len(names), 'satellites tracked', 'GPS / Galileo satellites tracked by PocketSDR'),
+                     (orbit, 'with broadcast orbit', 'their own orbit (ephemeris) decoded: on the map'),
+                     (len(d.gnss_eph), 'ephemerides decoded', 'broadcast orbits decoded so far'),
+                     (len(d.gnss_fixes), 'GPS position fixes', 'your own position, worked out from the satellites')]
+        elif want == 'ham':
+            boxes = [(len(names), 'satellites heard', 'ISS and CubeSats identified by their decoded frames'),
+                     (orbit, 'orbit from Doppler', 'accepted Doppler-only orbits: on the map'),
+                     (heard, 'waiting for passes', 'need passes on more than one orbit'),
+                     (sum(d.info[x].get('frames', 0) for x in names), 'frames decoded', 'frames that named their satellite')]
+        else:
+            boxes.append((len(fixes), 'position fixes', 'positions the satellites reported (Iridium ring alerts, '
+                                                      'Orbcomm ephemeris)'))
+        for box, (v, cap, tip) in zip(self.stats, boxes):
+            box.set(v, cap, tip)
+        waiting = sorted(n for n, why in d.no_orbit.items() if 'direction' in why and self.shows(n))
+        self.summary.setText('<span style="color:%s">Every position and track comes only from your own receptions.%s</span>'
+                             % (MUTED, ' Needs another fix: %s.' % ', '.join(waiting) if waiting else ''))
+
+    def shows(self, name_or_system, cap=None):
+        """is this satellite (or system key, or a fix from capture `cap`) shown by the Systems filter?"""
+        want = self.sys_box.currentData()
+        if want is None:
+            return True
+        if cap is not None and not name_or_system:
+            return systems.of_capture(cap)['system'] == want
+        key = name_or_system if name_or_system in systems.SYSTEMS else systems.of_name(name_or_system)['key']
+        return key == want
+
     def _table_clicked(self, row, _col):
-        self.select(self.table.item(row, 0).text(), from_table=True)
+        self.select(self.table.item(row, 0).data(Qt.UserRole), from_table=True)
         self.show_sat_info(self.selected)
 
     def show_sat_info(self, name):
@@ -1719,7 +2093,7 @@ class Tracker(QtWidgets.QMainWindow):
         if not from_table:
             self.table.blockSignals(True)
             for r in range(self.table.rowCount()):
-                if self.table.item(r, 0).text() == name:
+                if self.table.item(r, 0).data(Qt.UserRole) == name:
                     self.table.scrollToItem(self.table.item(r, 0))
             self.table.blockSignals(False)
         self.pass_cache = (None, 0, None)
@@ -1816,6 +2190,8 @@ class Tracker(QtWidgets.QMainWindow):
         self.timeline.set_time(t, keep_visible=self.playing or self.following)
         sats = []
         for n in d.tracked:
+            if not self.shows(n):
+                continue
             orbit = d.orbits[n]
             sigma = float(orbit.sigma_km(t)[0])
             if sigma > MAX_SIGMA_KM:
@@ -1826,7 +2202,7 @@ class Tracker(QtWidgets.QMainWindow):
             i = d.info[n]
             ident = ' &middot; '.join(filter(None, [', '.join('plane %d #%d' % ps for ps in sorted(i['slots'])),
                                                     ', '.join('net ID %03d' % x for x in sorted(i['net_ids']))]))
-            sats.append({'name': n, 'lat': float(lat[0]), 'lon': float(lon[0]), 'alt': float(alt[0]), 'el': float(el[0]),
+            sats.append({'name': n, 'system': i['system'], 'lat': float(lat[0]), 'lon': float(lon[0]), 'alt': float(alt[0]), 'el': float(el[0]),
                          'az': float(az[0]), 'rng': float(rng[0]), 'selected': n == self.selected, 'ident': ident,
                          'sigma': sigma, 'live': self.following and time.time() - d.live_heard.get(n, 0) < 60})
         by_name = {s['name']: s for s in sats}
@@ -1836,18 +2212,26 @@ class Tracker(QtWidgets.QMainWindow):
         if self.selected and tmode != 3:
             want.add(self.selected)
         tracks = []
-        span = np.arange(-3000, 3001, 30.0)
         for n in want:
             if n not in by_name:
                 continue
             orbit = d.orbits[n]
+            # one whole orbit of this satellite: half back, half ahead (Iridium ~100 min, GPS ~12 h), 201 points
+            half = orbit.period_min * 30.0
+            span = np.linspace(-half, half, 201)
             X, Y, Z = orbit.ecef(t + span).T
             lat, lon, _ = to_lla(X, Y, Z)
             lon = np.degrees(np.unwrap(np.radians(lon)))
             lon -= round((lon[100] - by_name[n]['lon']) / 360) * 360
             ok = orbit.sigma_km(t + span) <= MAX_SIGMA_KM
             pts = [pt if good else None for pt, good in zip(zip(lat.tolist(), lon.tolist()), ok)]
-            tracks.append({'past': pts[:101], 'future': pts[100:], 'selected': n == self.selected})
+            # the globe shows the orbit in space as it is now: undo Earth's turn since t, so the ground
+            # track (a weave for slow GPS orbits) becomes the orbit's own circle around the planet
+            slon = lon + np.degrees(OMEGA_EARTH * span)
+            ring = [pt if good else None for pt, good in zip(zip(lat.tolist(), slon.tolist()), ok)]
+            tracks.append({'past': pts[:101], 'future': pts[100:], 'selected': n == self.selected,
+                           'space_past': ring[:101], 'space_future': ring[100:],
+                           'alt_km': by_name[n]['alt']})       # the globe draws the orbit at this height
 
         fmode = self.fp_box.currentIndex()
         footprints = []
@@ -1862,6 +2246,8 @@ class Tracker(QtWidgets.QMainWindow):
         for f in d.all_fixes():
             if xmode == 2:
                 break
+            if not self.shows(f['name'], f['cap']):
+                continue
             if xmode == 0:
                 age = t - f['t']
                 if age < -30 or age > 3600:
@@ -1887,7 +2273,7 @@ class Tracker(QtWidgets.QMainWindow):
                 fix_lines.append({'pts': [(x['lat'], x['lon']) for x in seg], 'alpha': seg[-1]['alpha']})
 
         planes = []
-        pmode = self.planes_box.currentIndex()
+        pmode = self.planes_box.currentIndex() if self.shows('iridium') else 2     # planes are Iridium's
         u = np.radians(np.arange(0, 361, 2.0))
         for pl in (d.planes(t) if pmode != 2 else []):
             sel = self.selected in pl['members']
@@ -1910,9 +2296,9 @@ class Tracker(QtWidgets.QMainWindow):
 
     def _update_table(self, by_name):
         for r in range(self.table.rowCount()):
-            n = self.table.item(r, 0).text()
+            n = self.table.item(r, 0).data(Qt.UserRole)
             s = by_name.get(n)
-            item = self.table.item(r, 5)
+            item = self.table.item(r, COL_AT)
             if item is None:
                 continue
             if s is None:
@@ -1932,7 +2318,7 @@ class Tracker(QtWidgets.QMainWindow):
                     continue
                 if c == 0:
                     cell.setBackground(C_SELECTED_NAME if sel else QtGui.QBrush())
-                elif c != 5:
+                elif c != COL_AT:
                     cell.setBackground(QtGui.QBrush())
                 font = cell.font()
                 if font.bold() != sel:
@@ -1969,6 +2355,17 @@ class Tracker(QtWidgets.QMainWindow):
                                     'Move the timeline closer to when you heard it, or catch another fix.<hr>%s'
                                     % (self.selected, fmt_time(self.t), o.sigma_km(self.t)[0], fmt_time(o.info['last_obs']),
                                        self._fixes_html(self.selected)))
+            elif self.selected in self.data.info and 'frames' in self.data.info[self.selected]['how']:
+                i = self.data.info[self.selected]       # ISS / ham: heard, no orbit yet
+                self.detail.setText(
+                    '<h3 style="margin:0">%s</h3>Identified by its decoded frames (%d)%s.<br>Last heard %s &middot; '
+                    'best signal %.0f dB &middot; %d Doppler curve%s'
+                    '<br><span style="color:%s">Not on the map: it doesn\'t send its position, so its orbit has to '
+                    'come from its Doppler curves - that needs passes on more than one orbit.</span>'
+                    % (self.selected, i.get('frames', 0),
+                       ', callsign ' + ', '.join(i['callsigns']) if i.get('callsigns') else '',
+                       fmt_time(i['last']) if i['last'] else '-', i['best'], len(self.data.doppler.get(self.selected, [])),
+                       '' if len(self.data.doppler.get(self.selected, [])) == 1 else 's', MUTED))
             elif self.selected in self.data.info:      # identified by Doppler, but no orbit yet
                 i = self.data.info[self.selected]
                 why = self.data.no_orbit.get(self.selected, '')
@@ -2005,10 +2402,15 @@ class Tracker(QtWidgets.QMainWindow):
                         oi['doppler_groups'], '' if oi['doppler_groups'] == 1 else 's', oi['doppler_points'],
                         'heading (north/south) from the measured orbital plane it lines up with<br>' if oi.get('direction_from_plane') else '',
                         oi['fix_rms_km'], o.period_min, s['sigma']))
+        if oi.get('doppler_only'):      # ISS / ham: from Doppler curves alone
+            orbit_txt = ('from %d Doppler curves alone (%d frames), no position fixes<br>'
+                         'fits them to &plusmn;%.0f Hz &middot; period %.2f min<br>'
+                         '<b>Uncertainty at this time:</b> &plusmn;%.0f km'
+                         % (oi['doppler_groups'], oi['doppler_points'], oi.get('doppler_rms_hz', 0), o.period_min, s['sigma']))
         self.detail.setText(
             '<h3 style="margin:0">%s</h3>'
             '<b>Identified by:</b> %s<br>'
-            '<b>Plane/slot:</b> %s &nbsp; <b>Network ID:</b> %s<br>'
+            '%s<br>'
             '<b>Your position fixes:</b> %d &nbsp; <b>Best signal:</b> %.1f dB<br>'
             '<b>Last heard:</b> %s<hr>'
             '%s<hr>'
@@ -2017,15 +2419,20 @@ class Tracker(QtWidgets.QMainWindow):
             'From you: %s<br>'
             '<b>Next pass:</b> %s'
             % (s['name'], ' and '.join(sorted(i['how'])) or '-',
-               ', '.join('plane %d #%d' % ps for ps in sorted(i['slots'])) or 'unknown',
-               ', '.join('%03d' % x for x in sorted(i['net_ids'])) or 'unknown',
-               i['fixes'], i['best'], fmt_time(i['last']) if i['last'] else '-', self._fixes_html(s['name']), orbit_txt,
+               ('<b>Satellite ID:</b> %s' % fmt_ids(i, 'unknown')) if i['system'] == 'orbcomm' else
+               ('<b>Frames decoded:</b> %d &nbsp; <b>Callsigns:</b> %s' % (i.get('frames', 0), ', '.join(i.get('callsigns', [])) or '-'))
+               if i['system'] == 'ham' else
+               '<b>Plane/slot:</b> %s &nbsp; <b>Network ID:</b> %s' % (
+                   ', '.join('plane %d #%d' % ps for ps in sorted(i['slots'])) or 'unknown', fmt_ids(i, 'unknown')),
+               i['fixes'], i['best'], fmt_time(i['last']) if i['last'] else '-',
+               self._fixes_html(s['name']) if i['system'] != 'ham' else
+               'It sends no position: everything here comes from the Doppler shifts of its frames.', orbit_txt,
                fmt_clock(self.t), s['lat'], s['lon'], s['alt'],
                ('elevation %.0f&deg;, azimuth %.0f&deg;, %.0f km away' % (s['el'], s['az'], s['rng'])) if s['el'] > 0
                else 'below your horizon (%.0f km away)' % s['rng'], nxt))
 
     def _fixes_html(self, name):
-        """the ring-alert positions this satellite sent us, newest pass first"""
+        """the positions this satellite sent us (Iridium ring alerts, Orbcomm ephemeris), newest pass first"""
         fixes = sorted((f for f in self.data.all_fixes() if f['name'] == name), key=lambda f: f['t'])
         passes = []
         for f in fixes:
@@ -2034,8 +2441,9 @@ class Tracker(QtWidgets.QMainWindow):
             else:
                 passes.append([f])
         html = ('<div style="background:#3a1d22; padding:5px"><span style="font-size:13px; color:%s">'
-                '<b>Ring-alert positions received: %d</b></span> &nbsp;(%d pass%s)</div>'
-                % (ALERT, len(fixes), len(passes), '' if len(passes) == 1 else 'es'))
+                '<b>%s positions received: %d</b></span> &nbsp;(%d pass%s)</div>'
+                % (ALERT, 'Ephemeris' if systems.of_name(name) is systems.ORBCOMM else 'Ring-alert',
+                   len(fixes), len(passes), '' if len(passes) == 1 else 'es'))
         html += ('<table cellspacing="0" cellpadding="2" width="100%%"><tr style="color:%s">' % MUTED +
                  '<td>Time</td><td align="right">Lat</td><td align="right">Lon</td>'
                  '<td align="right">Alt</td><td align="right">Signal</td></tr>')
@@ -2094,6 +2502,8 @@ def main():
     app.setStyleSheet(STYLE)
     replay = [a[18:] for a in sys.argv if a.startswith('--test-receiver=')]   # testing without the SDR
     w = Tracker(replay[0] if replay else None)
+    if '--start-receiver' in sys.argv:  # start receiving straight away (with the band chosen in Source)
+        QtCore.QTimer.singleShot(2000, lambda: w.receiver.busy or w.toggle_receiver())
     if '--snapshot' in sys.argv:      # for testing: render a picture of the window and quit
         out = sys.argv[sys.argv.index('--snapshot') + 1]
         at = [a for a in sys.argv if a.startswith('--at=')]

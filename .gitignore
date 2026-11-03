@@ -20,3 +20,6 @@ __pycache__/
 
 # build scratch
 build/_*
+
+# written by pocket_trk while it runs (decoded GNSS orbits cache)
+app/pocketsdr/.pocket_navdata.csv

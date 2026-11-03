@@ -17,6 +17,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QPointF, Qt
 
 import catalog
+import systems
 
 UTC = datetime.timezone.utc
 F_HZ = 1626.1e6                 # the frequency the Doppler shift is worked out for (same as catalog.py)
@@ -40,6 +41,43 @@ LAUNCHES = [
     ('2023', 'Iridium-9', 'May 20, 2023', 'Five ground spares launched years later to top up the in-orbit spares.'),
 ]
 
+# Orbcomm launches by year (the catalog's launch ID starts with the year)
+ORBCOMM_LAUNCHES = {
+    '14': ('OG2 Mission 1', 'Jul 14, 2014', 'SpaceX Falcon 9, Cape Canaveral, Florida',
+           'The first six second-generation (OG2) Orbcomm satellites.'),
+    '15': ('OG2 Mission 2', 'Dec 21, 2015', 'SpaceX Falcon 9, Cape Canaveral, Florida',
+           'Eleven OG2 satellites - and the first time a Falcon 9 booster landed back on Earth, at Cape Canaveral.'),
+}
+ORBCOMM_FACTS = [
+    ('Block', 'Orbcomm Generation 2 (OG2), which joined the remaining first-generation satellites of the 1990s'),
+    ('Builder', 'Sierra Nevada Corporation'),
+    ('What it does', 'Short two-way data messages for machines - trucks, shipping containers, pipelines, buoys, '
+                     'farm equipment: one of the first "Internet of Things" satellite networks'),
+    ('Downlink', '137-138 MHz VHF at 4800 bit/s - the packets you decode, including its own position '
+                 '(ephemeris) every few seconds'),
+    ('Hosted payload', 'AIS receiver: picks up ships\' position broadcasts for worldwide ship tracking'),
+]
+ORBCOMM_OG1_FACTS = [
+    ('Block', 'Orbcomm first generation (OG1), launched 1995-1999 by Orbital Sciences'),
+    ('What it does', 'Short two-way data messages for machines: one of the first "Internet of Things" '
+                     'satellite networks'),
+    ('Downlink', '137-138 MHz VHF'),
+]
+
+ISS_FACTS = [
+    ('What it is', 'The International Space Station: a crewed laboratory about the size of a football field, '
+                   'its first module (Zarya) launched Nov 20, 1998'),
+    ('Ham radio on board', 'ARISS - Amateur Radio on the ISS: an APRS digipeater on 145.825 MHz that repeats '
+                           'packets from hams on the ground, crew voice contacts with schools on 145.800 MHz, '
+                           'and slow-scan TV picture events on 145.800 MHz'),
+    ('Callsigns', 'RS0ISS (Russian segment), NA1SS (US segment), digipeater alias ARISS'),
+]
+HAM_FACTS = [
+    ('What it is', 'An amateur (ham radio) satellite: most are CubeSats built by universities and radio clubs, '
+                   'and their telemetry is sent openly for anyone to receive'),
+    ('Decoding', 'gr-satellites (Daniel Estevez), which knows each satellite\'s modulation and framing'),
+]
+
 BLOCK_FACTS = [
     ('Block', 'Iridium NEXT (second generation), replacing the original 1990s Iridium satellites'),
     ('Builder', 'Thales Alenia Space (prime), with Northrop Grumman (then Orbital ATK) assembling them'),
@@ -57,26 +95,33 @@ DOPPLER_HELP = (
     'in frequency; as it goes away, a little lower. Plotting that shift over a pass gives an S-shaped curve. '
     'It crosses zero at the moment of <b>closest approach</b>. A pass nearly overhead gives a steep S '
     '(the shift flips quickly); a distant, low pass gives a gentle one. At 1626 MHz the shift can reach '
-    'about &plusmn;36 kHz. Every satellite\'s pass over you has its own curve, so matching the measured '
+    'about &plusmn;36 kHz (Iridium); at 137 MHz about &plusmn;3 kHz (Orbcomm). Every satellite\'s pass over you has its own curve, so matching the measured '
     'points to the predicted curves identifies which satellite you heard - and the curves also help fit '
     'our own orbit.')
 
 
 # ---------------------------------------------------------------- public catalog helpers
-def tle_records():
-    """name -> (line 1, line 2) from the public catalog file"""
-    for path in (catalog.TLE_FILE, catalog.SATDUMP_TLES):
+def tle_records(system='iridium'):
+    """name -> (line 1, line 2) from the public catalog file of a system"""
+    prefix = (systems.get(system)['prefix'] or '').strip()
+    for path in (catalog.tle_file(system), catalog.SATDUMP_TLES):
         try:
             lines = open(path).read().splitlines()
         except OSError:
             continue
-        return {lines[i].strip(): (lines[i + 1], lines[i + 2])
-                for i in range(len(lines) - 2) if lines[i].startswith('IRIDIUM') and lines[i + 1].startswith('1 ')}
+        found = {lines[i].strip(): (lines[i + 1], lines[i + 2])
+                 for i in range(len(lines) - 2) if lines[i].startswith(prefix) and lines[i + 1].startswith('1 ')}
+        if found:
+            return found
     return {}
 
 
-def launch_of(records, l1):
-    """(launch name, date, note, piece) for a TLE line 1, from the order of launches in the catalog"""
+def launch_of(records, l1, system='iridium'):
+    """(launch name, date, note, piece, rocket) for a TLE line 1. Iridium: from the order of launches in
+    the catalog; Orbcomm: from the launch year"""
+    if system == 'orbcomm':
+        hit = ORBCOMM_LAUNCHES.get(l1[9:11])
+        return (hit[0], hit[1], hit[3], l1[14:17].strip(), hit[2]) if hit else None
     ids = sorted({(r[0][9:11], r[0][11:14]) for r in records.values()})
     me = (l1[9:11], l1[11:14])
     if me not in ids or len(ids) > len(LAUNCHES):
@@ -84,34 +129,35 @@ def launch_of(records, l1):
     year, name, date, note = LAUNCHES[ids.index(me)]
     if year[2:] != me[0]:
         return None
-    return name, date, note, l1[14:17].strip()
+    return name, date, note, l1[14:17].strip(), 'SpaceX Falcon 9, Vandenberg, California'
 
 
 def utc(t):
     return datetime.datetime.fromtimestamp(t, UTC)
 
 
-def catalog_shift(sat, ts, shift=0.0):
+def catalog_shift(sat, ts, shift=0.0, carrier=F_HZ):
     """predicted Doppler shift (Hz), elevation and range from home for unix times ts"""
     out = [catalog.look(sat, utc(t + shift), *catalog.HOME) for t in ts]
-    return (np.array([-o[3] / catalog.C * F_HZ for o in out]), np.array([o[0] for o in out]),
+    return (np.array([-o[3] / catalog.C * carrier for o in out]), np.array([o[0] for o in out]),
             np.array([o[2] for o in out]))
 
 
-def orbit_shift(orbit, home_xyz, ts):
+def orbit_shift(orbit, home_xyz, ts, carrier=F_HZ):
     ts = np.asarray(ts, float)
     h = np.asarray(home_xyz, float)
     r0 = np.linalg.norm(orbit.ecef(ts) - h, axis=1)
     r1 = np.linalg.norm(orbit.ecef(ts + 1.0) - h, axis=1)
-    return -(r1 - r0) / catalog.C * F_HZ
+    return -(r1 - r0) / catalog.C * carrier
 
 
 def subsample(a, n):
     return a if len(a) <= n else a[np.linspace(0, len(a) - 1, n).round().astype(int)]
 
 
-def analyze_curve(pts, name, sats, orbit, home_xyz):
+def analyze_curve(pts, name, sats, orbit, home_xyz, system=systems.IRIDIUM):
     """everything the Doppler tab shows for one measured curve"""
+    carrier = system['carrier_hz'] or float(np.median([h for _, h in pts]))
     pts = np.array(sorted(pts), float)
     t, hz = pts[:, 0], pts[:, 1]
     res = {'t': t, 'hz': hz, 'y': hz - np.median(hz), 'lines': [], 'tca': None}
@@ -122,40 +168,42 @@ def analyze_curve(pts, name, sats, orbit, home_xyz):
     if sat is not None:
         best = None
         for sh in range(-20, 21, 2):            # the capture clock may be off by a few seconds
-            pred = catalog_shift(sat, sub[:, 0], sh)[0]
+            pred = catalog_shift(sat, sub[:, 0], sh, carrier)[0]
             d = sub[:, 1] - pred
             rms = float(np.sqrt(np.mean((d - d.mean()) ** 2)))
             if best is None or rms < best[0]:
                 best = (rms, sh)
         res['shift'] = best[1]
-        pred_pts = catalog_shift(sat, t, best[1])[0]
+        pred_pts = catalog_shift(sat, t, best[1], carrier)[0]
         off = float(np.mean(hz - pred_pts))
         res['y'] = hz - off
         res['rms'] = float(np.sqrt(np.mean((hz - off - pred_pts) ** 2)))
-        ly, lel, lrng = catalog_shift(sat, line_t, best[1])
+        ly, lel, lrng = catalog_shift(sat, line_t, best[1], carrier)
         up = lel >= -1
-        res['lines'].append((line_t[up], ly[up], C_CATALOG, 'public catalog prediction for %s' % name, True))
+        res['lines'].append((line_t[up], ly[up], C_CATALOG, 'public catalog prediction', True))
         # closest approach: where the predicted shift crosses zero (from + to -)
         cross = np.where((ly[:-1] > 0) & (ly[1:] <= 0))[0]
         if len(cross):
             i = cross[0]
             k = ly[i] / (ly[i] - ly[i + 1])
             tca = line_t[i] + k * (line_t[i + 1] - line_t[i])
-            _, el, rng = catalog_shift(sat, [tca], best[1])
+            _, el, rng = catalog_shift(sat, [tca], best[1], carrier)
             res['tca'] = (tca, float(el[0]), float(rng[0]))
         rate = np.abs(np.diff(ly) / np.diff(line_t))
         res['max_rate'] = float(rate[up[1:]].max()) if up[1:].any() else None
-        # how much better it fits than any other satellite
-        fits = catalog.match_doppler(sats, [(utc(a), b) for a, b in sub], [best[1]])
-        res['ranking'] = fits[:4]
+        # how much better it fits than any other satellite (Iridium satellites are named this way;
+        # Orbcomm ones by the position they report)
+        if system is systems.IRIDIUM:
+            fits = catalog.match_doppler(sats, [(utc(a), b) for a, b in sub], [best[1]])
+            res['ranking'] = fits[:4]
     if orbit is not None:
-        ours = orbit_shift(orbit, home_xyz, t)
+        ours = orbit_shift(orbit, home_xyz, t, carrier)
         off = float(np.mean(hz - ours))
         res['rms_ours'] = float(np.sqrt(np.mean((hz - off - ours) ** 2)))
         if sat is None:
             res['y'] = hz - off
         shown_off = float(np.mean(hz - res['y']))      # the plot shows hz minus this
-        res['lines'].append((line_t, orbit_shift(orbit, home_xyz, line_t) + off - shown_off, C_OURS, 'our own orbit', False))
+        res['lines'].append((line_t, orbit_shift(orbit, home_xyz, line_t, carrier) + off - shown_off, C_OURS, 'our own orbit', False))
     return res
 
 
@@ -256,9 +304,9 @@ class DopplerPlot(QtWidgets.QWidget):
             p.drawEllipse(QPointF(X(a), Y(b / 1e3)), 3.2, 3.2)
         # legend
         items = [(C_MEASURED, 'measured by your receiver', None)] + [(c, lab, d) for _, _, c, lab, d in r['lines']]
-        y0 = T + 6
+        y0 = T + 20
         for col, lab, dashed in items:
-            x0 = L + w - 250
+            x0 = L + w - 210
             if dashed is None:
                 p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 160), 1))
                 p.setBrush(col)
@@ -313,7 +361,7 @@ class SatInfoDialog(QtWidgets.QDialog):
         heard = QtWidgets.QWidget()
         hl = QtWidgets.QVBoxLayout(heard)
         self.heard_table = QtWidgets.QTableWidget(0, 6)
-        self.heard_table.setHorizontalHeaderLabels(['When', 'Length', 'Slot frames', 'Position fixes', 'Best fix signal', 'Highest heard'])
+        self.heard_table.setHorizontalHeaderLabels(['When', 'Length', 'Frames', 'Position fixes', 'Best fix signal', 'Highest heard'])
         self.heard_table.verticalHeader().setVisible(False)
         self.heard_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.heard_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -351,30 +399,43 @@ class SatInfoDialog(QtWidgets.QDialog):
         self.setWindowTitle('%s - satellite info' % name)
         d = self.tracker.data
         self.info = d.info.get(name, {'fixes': 0, 'net_ids': set(), 'slots': set(), 'last': 0, 'best': 0, 'how': set()})
-        self.records = tle_records()
+        self.system = systems.of_name(name)
+        self.records = tle_records(self.system['key'])
         self.tle = self.records.get(name)
-        self.sats = d.tles()
+        self.sats = d.tles(self.system['key'])
         self.orbit = d.orbits.get(name)
         how = ' + '.join(sorted(self.info['how'])) or 'not identified'
         self.title.setText('<span style="font-size:15pt; font-weight:600">%s</span>'
-                           '&nbsp;&nbsp;<span style="color:%s">Iridium NEXT &middot; identified by %s</span>'
-                           % (name, MUTED, how.replace('position', 'position fix')))
+                           '&nbsp;&nbsp;<span style="color:%s">%s &middot; identified by %s</span>'
+                           % (name, MUTED, self.block(), how.replace('position', 'position fix')))
         self._fill_about()
         self._fill_doppler()
         self._fill_heard()
         self._fill_orbit()
 
+    def block(self):
+        if self.system is systems.HAM:
+            return 'International Space Station' if self.name.startswith('ISS') else 'Amateur satellite'
+        if self.system is systems.ORBCOMM:
+            num = int(''.join(ch for ch in self.name if ch.isdigit()) or 0)
+            return 'Orbcomm OG2' if num >= 100 else 'Orbcomm OG1'
+        return 'Iridium NEXT'
+
     def _fill_about(self):
         i, name = self.info, self.name
+        orbcomm = self.system is systems.ORBCOMM
         rows = []
         if self.tle:
             l1, l2 = self.tle
             rows.append(('NORAD number', l1[2:7].strip()))
-            rows.append(('International ID', '%s-%s%s' % (('20' + l1[9:11]), l1[11:14], l1[14:17].strip())))
-            lau = launch_of(self.records, l1)
+            century = '19' if int(l1[9:11]) > 56 else '20'
+            rows.append(('International ID', '%s-%s%s' % ((century + l1[9:11]), l1[11:14], l1[14:17].strip())))
+            lau = launch_of(self.records, l1, self.system['key']) if self.system is not systems.HAM else None
+            if self.system is systems.HAM and not self.name.startswith('ISS'):
+                rows.append(('Launched', 'in %s%s (launch %s of that year)' % (century, l1[9:11], l1[11:14].lstrip('0'))))
             if lau:
-                rows.append(('Launched', '<b>%s</b> on the %s mission (SpaceX Falcon 9, Vandenberg, California) '
-                                         '- piece %s of that launch' % (lau[1], lau[0], lau[3])))
+                rows.append(('Launched', '<b>%s</b> on the %s mission (%s) - piece %s of that launch'
+                             % (lau[1], lau[0], lau[4], lau[3])))
                 rows.append(('', '<span style="color:%s">%s</span>' % (MUTED, lau[2])))
                 try:
                     years = (datetime.date.today() - datetime.datetime.strptime(lau[1], '%b %d, %Y').date()).days / 365.25
@@ -383,24 +444,39 @@ class SatInfoDialog(QtWidgets.QDialog):
                     pass
         else:
             rows.append(('Catalog', 'not in the downloaded public catalog'))
-        rows += BLOCK_FACTS
+        if self.system is systems.HAM:
+            rows += ISS_FACTS if self.name.startswith('ISS') else HAM_FACTS
+        else:
+            rows += (ORBCOMM_FACTS if self.block() == 'Orbcomm OG2' else ORBCOMM_OG1_FACTS) if orbcomm else BLOCK_FACTS
         if self.tle:
             l2 = self.tle[1]
             n = float(l2[52:63])
             a = (catalog.MU / (n * 2 * math.pi / 86400) ** 2) ** (1 / 3)
             rows.append(('Orbit (catalog)', '%.0f km up, inclined %.1f&deg;, once around every %.1f min (%.1f orbits a day)'
                          % (a - 6371.0, float(l2[8:16]), 1440 / n, n)))
-        mine = [('How identified', {'position': 'its ring-alert position fixes matched it',
-                                    'Doppler': 'its Doppler curve matched it'}.get(next(iter(i['how'])), '-')
-                 if len(i['how']) == 1 else 'position fixes and Doppler curve both matched it' if i['how'] else '-'),
-                ('Plane / slot', ', '.join('plane %d, slot %d' % ps for ps in sorted(i['slots'])) or 'not heard yet'),
-                ('Network ID', ', '.join('%03d' % x for x in sorted(i['net_ids'])) or '-'),
+        if self.system is systems.HAM:
+            ids = [('How identified', 'frames decoded with its own decoder (it is the only satellite with that '
+                                      'frequency and signal)' if not name.startswith('ISS') else
+                    'APRS packets the ISS digipeater repeated (RS0ISS / NA1SS in the path)'),
+                   ('Frames decoded', str(i.get('frames', 0))),
+                   ('Callsigns heard', ', '.join(i.get('callsigns', [])) or '-')]
+        elif orbcomm:
+            ids = [('How identified', 'its own position packets (ephemeris) put it where the catalog has this satellite'
+                    if i['fixes'] else '-'),
+                   ('Satellite ID', ', '.join('%02X' % x for x in sorted(i['net_ids'])) or '-')]
+        else:
+            ids = [('How identified', {'position': 'its ring-alert position fixes matched it',
+                                       'Doppler': 'its Doppler curve matched it'}.get(next(iter(i['how'])), '-')
+                    if len(i['how']) == 1 else 'position fixes and Doppler curve both matched it' if i['how'] else '-'),
+                   ('Plane / slot', ', '.join('plane %d, slot %d' % ps for ps in sorted(i['slots'])) or 'not heard yet'),
+                   ('Network ID', ', '.join('%03d' % x for x in sorted(i['net_ids'])) or '-')]
+        mine = ids + [
                 ('Position fixes', str(i['fixes'])),
                 ('Doppler curves', str(len(self.curves_for()))),
                 ('Last heard', self.tracker_fmt(i['last']) if i['last'] else '-'),
                 ('Best signal', '%.0f dB' % i['best'] if i['best'] else '-')]
         self.about.setHtml('<h3>The satellite</h3>%s<h3>In your observations</h3>%s'
-                           '<p style="color:%s">Launch and hardware facts are general Iridium NEXT information; '
+                           '<p style="color:%s">Launch and hardware facts are general information about the block; '
                            'the NORAD number, launch and catalog orbit come from the public CelesTrak list.</p>'
                            % (_facts(rows), _facts(mine), MUTED))
 
@@ -411,6 +487,10 @@ class SatInfoDialog(QtWidgets.QDialog):
     def curves_for(self):
         """[(kind, [(t, Hz)])] measured for this satellite"""
         d, name = self.tracker.data, self.name
+        if self.system is not systems.IRIDIUM:      # Orbcomm packets / ham frames: every one's frequency
+            out = [('packets' if self.system is systems.ORBCOMM else 'frames', list(g))
+                   for g in d.doppler.get(name, []) if len(g) >= 2]
+            return sorted(out, key=lambda c: -max(t for t, _ in c[1]))
         out = [('time & location frames', list(g)) for g in d.doppler.get(name, []) if len(g) >= 2]
         by_cap = {}
         for f in d.all_fixes():
@@ -440,7 +520,8 @@ class SatInfoDialog(QtWidgets.QDialog):
             QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
                 import iridium_tracker as it
-                self.dop_cache[idx] = analyze_curve(self.curves[idx][1], self.name, self.sats, self.orbit, it._HOME_XYZ)
+                self.dop_cache[idx] = analyze_curve(self.curves[idx][1], self.name, self.sats, self.orbit, it._HOME_XYZ,
+                                                    self.system)
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
         r = self.dop_cache[idx]
@@ -473,7 +554,8 @@ class SatInfoDialog(QtWidgets.QDialog):
 
     def _fill_heard(self):
         d, name = self.tracker.data, self.name
-        obs = [(t, 'frame', None) for kind, g in self.curves if kind == 'time & location frames' for t, _ in g]
+        obs = [(t, 'frame', None) for kind, g in self.curves if kind in ('time & location frames', 'packets', 'frames')
+               for t, _ in g]
         fixes = [f for f in d.all_fixes() if f['name'] == name]
         obs += [(f['t'], 'fix', f) for f in fixes]
         obs.sort(key=lambda o: o[0])
@@ -534,7 +616,9 @@ class SatInfoDialog(QtWidgets.QDialog):
                 ('Plane position', '&plusmn;%.0f km' % o.plane_sigma_km),
                 ('Built from', '%d position fixes over %d passes, %d Doppler curves (%d points)'
                  % (oi['fixes'], oi['passes'], oi['doppler_groups'], oi['doppler_points'])),
-                ('Fit quality', 'position fixes agree to %.1f km rms' % oi['fix_rms_km']),
+                ('Fit quality', 'Doppler curves alone (no position fixes), fitted to %.0f Hz rms - accepted only after '
+                                'a confidence check that no other orbit fits nearly as well' % oi.get('doppler_rms_hz', 0)
+                 if oi.get('doppler_only') else 'position fixes agree to %.1f km rms' % oi['fix_rms_km']),
                 ('Observed', '%s to %s' % (it.fmt_time(oi['first_obs']), it.fmt_time(oi['last_obs']))),
                 ('Next pass', 'not within the time our orbit is good for' if np_ is None else
                  'now (up to %.0f&deg;)' % np_[2] if np_[3] else

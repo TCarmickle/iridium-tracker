@@ -1,7 +1,8 @@
-"""Source panel: which SDR the receiver uses and how it is tuned (like SDR++'s Source menu)."""
+"""Source panel: which satellite system to receive, which SDR, and how it is tuned (like SDR++'s Source menu)."""
 from PyQt5 import QtCore, QtWidgets
 
 import sdr_settings as sdr
+import systems
 
 NETWORK = 'rtl_tcp=192.168.1.10:1234'
 TIPS = {
@@ -21,6 +22,11 @@ class _Find(QtCore.QThread):
         self.found.emit(sdr.discover())
 
 
+# device searches still running. A search can outlive its window (closing it doesn't wait for the search),
+# and a running QThread whose Python object is garbage-collected takes the whole app down - so each one is
+# kept here, owned by no window, until it has finished.
+_SEARCHES = set()
+
 class SourceDialog(QtWidgets.QDialog):
     def __init__(self, parent=None, receiving=False):
         super().__init__(parent)
@@ -29,6 +35,23 @@ class SourceDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
         form = QtWidgets.QFormLayout()
         lay.addLayout(form)
+
+        # which system: one SDR listens to one band at a time
+        self.system = QtWidgets.QComboBox()
+        for s in systems.ORDER:
+            lo, hi = s['band_hz']
+            self.system.addItem('%s  (%s)' % (s['label'], '%.1f GHz' % (lo / 1e9) if lo > 1e9 else '%.0f MHz' % (lo / 1e6)),
+                                s['key'])
+        self.system.setCurrentIndex(max(0, self.system.findData(self.s['system'])))
+        self.system.setToolTip('One SDR receives one satellite system at a time. Every system you have received '
+                               'is still shown on the map and in the list.')
+        self.gains = self._gains(self.s)
+        self.shown_system = self.s['system']
+        form.addRow('Receive:', self.system)
+        self.antenna = QtWidgets.QLabel()
+        self.antenna.setWordWrap(True)
+        self.antenna.setStyleSheet('color: #ffb454;')
+        form.addRow('', self.antenna)
 
         # device
         row = QtWidgets.QHBoxLayout()
@@ -68,6 +91,8 @@ class SourceDialog(QtWidgets.QDialog):
         row.addWidget(self.center_auto)
         row.addStretch(1)
         form.addRow('Frequency:', row)
+        self.tuning_rows = [form.labelForField(self.rate), self.rate, form.labelForField(row),
+                            self.center, self.center_auto]      # Iridium's: Orbcomm's are fixed
         self.coverage = QtWidgets.QLabel()
         self.coverage.setStyleSheet('color: #8b93a1;')
         form.addRow('', self.coverage)
@@ -99,8 +124,12 @@ class SourceDialog(QtWidgets.QDialog):
         # options
         self.bias = QtWidgets.QCheckBox('Bias-T (power an active antenna / LNA through the coax)')
         self.bias.setChecked(self.s['bias_t'])
-        self.offset = QtWidgets.QCheckBox('Offset tuning (E4000 tuners)')
+        self.offset = QtWidgets.QCheckBox('Offset tuning (E4000 tuners: moves the spike at the centre frequency off the signal)')
         self.offset.setChecked(self.s['offset_tune'])
+        self.offset.setToolTip('E4000 tuners (like the SMArTee XTR) put a strong spike exactly at the frequency they are tuned to.\n'
+                               'Offset tuning tunes slightly to one side and shifts back digitally, so the spike lands away\n'
+                               'from the signal. Most useful for GNSS, whose signal is centred on that frequency.\n'
+                               'Harmless for the other bands. Applies the next time the receiver starts.')
         self.iq = QtWidgets.QCheckBox('IQ correction (automatic - can create mirror images of bursts; best left off)')
         self.iq.setChecked(self.s['iq_correction'])
         self.dc = QtWidgets.QCheckBox('DC offset correction')
@@ -119,6 +148,7 @@ class SourceDialog(QtWidgets.QDialog):
         self.threshold.setValue(self.s['threshold_db'])
         self.threshold.setToolTip(TIPS['threshold'])
         form.addRow('Burst threshold:', self.threshold)
+        self.threshold_row = (form.labelForField(self.threshold), self.threshold)
 
         self.note = QtWidgets.QLabel('<span style="color:#ffb454">The receiver is running - changes apply the next '
                                      'time you start it.</span>' if receiving else '')
@@ -133,6 +163,8 @@ class SourceDialog(QtWidgets.QDialog):
 
         self.device.addItem('%s  (saved)' % self.s['label'], (self.s['label'], self.s['device']))
         self._add_fixed()
+        self.system.currentIndexChanged.connect(self._system_changed)
+        self._system_changed()
         self._update_center()
         self.find()
         self.resize(560, 0)
@@ -146,11 +178,23 @@ class SourceDialog(QtWidgets.QDialog):
     def find(self):
         self.refresh.setEnabled(False)
         self.refresh.setText('Searching...')
-        self.job = _Find(self)
-        self.job.found.connect(self._found)
-        self.job.start()
+        job = _Find()
+        _SEARCHES.add(job)
+        job.finished.connect(lambda j=job: _SEARCHES.discard(j))
+        job.found.connect(self._found)
+        self.job = job
+        job.start()
+
+    def done(self, result):
+        try:            # a search that finishes after the window is closed has nothing to fill in
+            self.job.found.disconnect(self._found)
+        except (TypeError, RuntimeError):
+            pass
+        super().done(result)
 
     def _found(self, devices):
+        if not self.isVisible():
+            return
         current = self.args.text().strip()
         self.device.clear()
         for label, args in devices:
@@ -175,18 +219,62 @@ class SourceDialog(QtWidgets.QDialog):
             self.args.setFocus()
             self.args.selectAll()
 
+    # ---- which system
+    @staticmethod
+    def _gains(s):
+        """band -> (gain, auto) from saved settings"""
+        return {sy['key']: sdr.gain(dict(s, system=sy['key'])) for sy in systems.ORDER}
+
+    def _system_changed(self, *_):
+        """each band keeps its own gain; every band but Iridium has its rate and frequency set by its decoders"""
+        self.gains[self.shown_system] = (self.gain.value() / 10, self.auto_gain.isChecked())
+        key = self.system.currentData()
+        self.shown_system = key
+        g, auto = self.gains[key]
+        self.gain.setValue(int(g * 10))
+        self.auto_gain.setChecked(auto)
+        fixed = key != 'iridium'
+        for w in self.tuning_rows:
+            if w is not None:
+                w.setVisible(not fixed)
+        if not fixed:
+            self.center.setEnabled(not self.center_auto.isChecked())
+        for w in self.threshold_row:
+            if w is not None:
+                w.setVisible(not fixed)       # the burst threshold is Iridium's decoder only
+        self.antenna.setText('Antenna for %s: %s.' % (systems.get(key)['label'], systems.get(key)['antenna']))
+        self._update_center()
+
     # ---- tuning
     def _values(self):
         label = self.device.currentData()[0] if self.device.currentData() else self.s['label']
-        return dict(self.s, device=self.args.text().strip() or 'rtl=0', label=label or 'SDR',
+        key = self.system.currentData()
+        gains = dict(self.gains)
+        gains[key] = (self.gain.value() / 10, self.auto_gain.isChecked())
+        per_band = {}
+        for k, (g, auto) in gains.items():
+            if k == 'iridium':
+                per_band.update(gain=g, auto_gain=auto)
+            else:
+                per_band.update({k + '_gain': g, k + '_auto_gain': auto})
+        return dict(self.s, system=key, device=self.args.text().strip() or 'rtl=0', label=label or 'SDR',
                     sample_rate=self.rate.currentData(), center_mhz=0.0 if self.center_auto.isChecked() else self.center.value(),
-                    gain=self.gain.value() / 10, auto_gain=self.auto_gain.isChecked(), ppm=self.ppm.value(),
+                    ppm=self.ppm.value(), **per_band,
                     bias_t=self.bias.isChecked(), offset_tune=self.offset.isChecked(), iq_correction=self.iq.isChecked(),
                     dc_correction=self.dc.isChecked(), threshold_db=max(sdr.MIN_THRESHOLD, self.threshold.value()),
                     extra_args=self.extra.text().strip())
 
     def _update_center(self):
         v = self._values()
+        if sdr.fixed_tuning(v):
+            c, half = sdr.center_hz(v) / 1e6, sdr.sample_rate(v) / 2e6
+            what = {'orbcomm': 'every Orbcomm downlink channel (137.2 - 137.8 MHz)',
+                    'ham2m': 'the 2 m satellite subband (145.8 - 146.0 MHz), with the ISS',
+                    'ham70': 'most of the 70 cm satellite subband (435 - 438 MHz)',
+                    'gnss1': 'GPS L1 and Galileo E1 (1575.42 MHz)'}.get(v['system'], '')
+            self.coverage.setText('Receives %.3f - %.3f MHz at %.4f MS/s: %s'
+                                  % (c - half, c + half, sdr.sample_rate(v) / 1e6, what))
+            return
         self.center.setEnabled(not self.center_auto.isChecked())
         if self.center_auto.isChecked():
             self.center.setValue(sdr.center_hz(v) / 1e6)
@@ -198,12 +286,15 @@ class SourceDialog(QtWidgets.QDialog):
                                  '  -  ring-alert channels NOT included'))
 
     def defaults(self):
-        self.s = dict(sdr.DEFAULTS, device=self.args.text().strip() or 'rtl=0', label=self.s['label'])
+        self.s = dict(sdr.DEFAULTS, device=self.args.text().strip() or 'rtl=0', label=self.s['label'],
+                      system=self.system.currentData())
         d = self.s
+        self.gains = self._gains(d)
+        g, auto = self.gains[self.shown_system]
+        self.gain.setValue(int(g * 10))
+        self.auto_gain.setChecked(auto)
         self.rate.setCurrentIndex(self.rate.findData(d['sample_rate']))
         self.center_auto.setChecked(True)
-        self.gain.setValue(int(d['gain'] * 10))
-        self.auto_gain.setChecked(d['auto_gain'])
         self.ppm.setValue(d['ppm'])
         self.bias.setChecked(d['bias_t'])
         self.offset.setChecked(d['offset_tune'])

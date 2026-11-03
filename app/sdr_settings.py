@@ -1,7 +1,8 @@
 """SDR source settings (the device the receiver uses and how it is tuned), saved in settings.json.
 
-The decoder (gr-iridium's iridium-extractor) opens the device through gr-osmosdr, so any device
-gr-osmosdr supports works: RTL-SDR, RTL-TCP over the network, HackRF, Airspy, bladeRF, SoapySDR...
+The decoders open the device through gr-osmosdr, so any device gr-osmosdr supports works: RTL-SDR,
+RTL-TCP over the network, HackRF, Airspy, bladeRF, SoapySDR... One device receives one system at a
+time: 'system' says which (Iridium at 1.6 GHz, or Orbcomm at 137 MHz - each needs its own antenna).
 """
 import json
 import os
@@ -9,8 +10,10 @@ import subprocess
 import sys
 
 import paths
+import systems
 
 DEFAULTS = {
+    'system': 'iridium',        # which satellite system the receiver listens to (systems.py)
     'device': 'rtl=0',          # gr-osmosdr device arguments
     'label': 'RTL-SDR #0',
     'sample_rate': 2000000,
@@ -24,11 +27,22 @@ DEFAULTS = {
     'dc_correction': True,
     'threshold_db': 16.0,       # burst detection, dB over the noise
     'extra_args': '',           # anything else for the device string, e.g. "offset_tune=1"
+    'orbcomm_gain': 35.0,       # each band has its own gain: a different antenna and signals
+    'orbcomm_auto_gain': False,
+    'ham2m_gain': 30.0,
+    'ham2m_auto_gain': False,
+    'ham70_gain': 35.0,
+    'ham70_auto_gain': False,
+    'gnss1_gain': 40.0,         # GNSS: an active antenna's amplifier already lifts the signal
+    'gnss1_auto_gain': False,
 }
 # the decoder needs sample_rate / decimation to be a multiple of 250 kHz
 RATES = [2000000, 2250000, 2500000, 3000000, 4000000, 5000000, 6000000, 8000000, 10000000, 12500000, 20000000]
 MIN_THRESHOLD = 14.0            # lower floods the decoder with false bursts and can run the PC out of memory
 BAND_LO, BAND_HI = 1616.0e6, 1626.5e6       # Iridium downlink
+# Orbcomm: the decoder needs a rate that is a whole multiple of 9600 S/s (2 samples per 4800-baud
+# symbol); 1.2288 MS/s centred on 137.5 MHz covers all the downlink channels (137.2-137.8 MHz)
+ORBCOMM_RATE, ORBCOMM_CENTER = 1228800, 137500000
 FFT_SIZE = 2048
 
 
@@ -59,9 +73,31 @@ def save(s):
     json.dump(allset, open(path, 'w'), indent=1)
 
 
+def is_orbcomm(s):
+    return s.get('system') == 'orbcomm'
+
+
+def fixed_tuning(s):
+    """every band but Iridium has its rate and centre set by its decoders (systems.py)"""
+    return s.get('system', 'iridium') != 'iridium'
+
+
+def sample_rate(s):
+    return systems.get(s['system'])['rate'] if fixed_tuning(s) else s['sample_rate']
+
+
+def gain(s):
+    """(gain dB, automatic?) for the band being received"""
+    key = s.get('system', 'iridium')
+    return (s['gain'], s['auto_gain']) if key == 'iridium' else (s[key + '_gain'], s[key + '_auto_gain'])
+
+
 def center_hz(s):
-    """the tuning frequency: as set, or automatic - the widest slice of the band the rate allows,
-    keeping the top (the ring-alert and messaging channels at 1626.0-1626.5 MHz) inside"""
+    """the tuning frequency. Iridium: as set, or automatic - the widest slice of the band the rate
+    allows, keeping the top (the ring-alert and messaging channels at 1626.0-1626.5 MHz) inside.
+    Other bands: fixed (Orbcomm 137.5 MHz, the middle of its channels; the ham bands, see systems.py)."""
+    if fixed_tuning(s):
+        return systems.get(s['system'])['center_hz']
     if s['center_mhz'] > 0:
         return int(round(s['center_mhz'] * 1e6))
     half = s['sample_rate'] / 2

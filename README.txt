@@ -6,6 +6,10 @@ ring alerts (each one carries the satellite's own position) and their Doppler sh
 the tracker fits every orbit from those observations alone - no downloaded orbit data is
 used for positions. Satellites appear once they have sent you a position fix.
 
+It also receives ORBCOMM satellites (137 MHz), which send their own position too, and the
+ISS and amateur (ham) CubeSats on 2 m and 70 cm (see "SYSTEMS" below). The map, list, globe and sky plot show every system together, with a
+Systems filter to show just one.
+
 Everything is in this folder: the decoder (gr-iridium + iridium-toolkit), Python, and the app.
 Nothing is installed on the computer.
 
@@ -17,6 +21,10 @@ WHAT YOU NEED
   R820T/R828D "V3/V4" dongles also reach 1626 MHz.
 - An antenna for L-band (1.6 GHz) with a clear view of the sky. Even a small patch or a
   short telescopic whip outdoors decodes ring alerts.
+- For Orbcomm: an antenna for 137 MHz - a telescopic whip at about 52 cm, or a V-dipole with
+  two arms of about 53 cm opened to 120 degrees (the classic 137 MHz satellite antenna).
+- For the ISS / ham satellites: a whip of about 49 cm (19 1/4 in) for 2 m or 16.5 cm (6 1/2 in)
+  for 70 cm, or a 2 m / 70 cm dual-band whip.
 
 
 ONE-TIME SETUP: THE USB DRIVER (needs administrator rights)
@@ -104,6 +112,45 @@ overhead, the edge is the horizon, north is up and east is right. Big dots are p
 areas are directions or heights your antenna can't hear - a house or roof in the way, or the
 antenna's blind spot (a vertical whip hears little straight up). Move the antenna and watch the
 empty areas fill in; "Show" picks this run, the last hour, the last day or everything.
+
+
+SYSTEMS: IRIDIUM, ORBCOMM, ISS AND HAM SATELLITES
+--------------------------------------------------
+One SDR listens to one band at a time, so pick what to receive - in the box next to Start
+receiver, or in Source:
+  Iridium        (1.6 GHz)  antenna about 4.6 cm, or a patch antenna facing up
+  Orbcomm        (137 MHz)  antenna about 52 cm (whip), or a V-dipole of 2 x 53 cm at 120 degrees
+  ISS & ham 2 m  (145 MHz)  antenna about 49 cm (19 1/4 in)
+  Ham 70 cm      (436 MHz)  antenna about 16.5 cm (6 1/2 in)
+Change the antenna to match, then press Start. Each band keeps its own gain. Every band but
+Iridium has a fixed sample rate and frequency, set for its decoders.
+
+Orbcomm satellites send an "ephemeris" packet every few seconds with their own position and
+velocity. The receiver decodes all eight downlink channels at once, names each satellite by
+where it says it is, and fits its orbit from those positions (and the Doppler shift of every
+packet), just like Iridium. On the map Orbcomm satellites have orange-edged solar panels and
+"OC" labels; Iridium ones are "IR".
+
+ISS and ham satellites: the receiver watches the whole 2 m or 70 cm slice. When a signal appears
+it measures the signal's exact frequency (its Doppler shift) and tries the gr-satellites decoders
+of the satellites that transmit near there (about 400 satellites are known). A frame that passes
+its checksum names the satellite:
+  - the ISS: only APRS packets the ISS itself repeated (RS0ISS / NA1SS in the path) - people on
+    the ground use the same frequency, and those packets are ignored
+  - a CubeSat: only if no other satellite uses the same frequency and signal; frames from shared
+    frequencies are shown in the log as "could be ..." but not credited to any satellite
+Frame contents are never saved - only that a frame was heard, when, at what frequency and from
+which callsign. These satellites don't send their own position, so they appear in the list
+(with their Doppler curves) but not on the map until their orbit can be worked out from Doppler
+alone.
+
+Everything you have received is always shown; the Systems box under the map (Systems: all /
+Iridium only / Orbcomm only / ISS & ham sats only) filters the map, list, globe and sky plot.
+Iridium's orbital-plane rings are Iridium only.
+
+Sound: the Audio menu (next to the spectrum) has a Mode (NFM, WFM, AM, USB, LSB, CW) and a
+Bandwidth for the tuned sound; each band starts on its own default (ham: NFM). To hear the ISS's
+voice contacts or SSTV events, tune to 145.800 MHz on NFM.
 
 
 ACTIVITY LIGHTS
@@ -207,5 +254,11 @@ This package contains open-source software; see the LICENSES folder.
   license texts in LICENSES\third-party
 - Map data (c) OpenStreetMap contributors, https://www.openstreetmap.org/copyright
 - Satellite names: CelesTrak, https://celestrak.org
-The tracker itself (the files in app\ other than iridium-toolkit) is free software under the
+- gr-satellites (ham decoders)   GPL-3.0     https://github.com/daniestevez/gr-satellites
+- PocketSDR (GNSS, app\pocketsdr) BSD-2-Clause, (c) T. Takasu   https://github.com/tomojitakasu/PocketSDR
+                                  (license in app\pocketsdr\LICENSE.txt)
+- Orbcomm decoder (app\orbcomm)   MIT, adapted from ORBCOMM-receiver by Frank Bieberly,
+                                  https://github.com/fbieberly/ORBCOMM-receiver (its RRC filter
+                                  is from CommPy, BSD-3-Clause; notices in app\orbcomm)
+The tracker itself (the files in app\ other than iridium-toolkit and orbcomm) is free software under the
 GNU General Public License v3 (LICENSES\GPL-3.0.txt). The source code is the .py files in app\.

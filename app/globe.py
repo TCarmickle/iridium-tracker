@@ -19,6 +19,8 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QPointF, Qt
 
+import systems
+
 R_EARTH = 6371.0
 TEX_W, TEX_H = 2048, 1024       # equirectangular Earth texture
 TILE_Z = 3                      # map tiles used for it (8 x 8 tiles = 2048 px)
@@ -95,8 +97,27 @@ class GlobeView(QtWidgets.QWidget):
         QtCore.QMetaObject.invokeMethod(self, 'update', Qt.QueuedConnection)
 
     def set_scene(self, scene):
+        first = self.scene is None
         self.scene = scene
+        sats = (scene or {}).get('sats', [])
+        if first and not self.ground and sats and min(s['alt'] for s in sats) > 2000:   # GPS only: whole shell
+            self.show_preset(TOP_VIEW)
         self.update()
+
+    def _top_alt(self):
+        """height (km) of the highest satellite shown"""
+        return max([s['alt'] for s in (self.scene or {}).get('sats', [])] + [781.0])
+
+    def show_preset(self, preset):
+        """Top / Side view, pulled back far enough for the highest satellite shown (Iridium 781 km, GPS 20,200 km)"""
+        r = (R_EARTH + self._top_alt()) / R_EARTH
+        if r <= ORBIT_R + 0.2:
+            dist, target_r = preset['dist'], preset['target_r']
+        elif preset is TOP_VIEW:
+            dist, target_r = min(DIST_MAX, 1.15 * r / math.tan(math.radians(FOV_DEG / 2)) - 1), 1.0
+        else:
+            dist, target_r = min(DIST_MAX, preset['dist'] * r / ORBIT_R), r
+        self.set_view(dist, preset['tilt'], self.heading, target_r)
 
     def set_view(self, dist, tilt, heading, target_r=1.0):
         self.ground = False
@@ -118,7 +139,14 @@ class GlobeView(QtWidgets.QWidget):
 
     # ---- the camera
     def _camera(self):
-        """(position, right, up, forward, focal length in pixels)"""
+        """(position, right, up, forward, focal length in pixels) - worked out once per view and remembered"""
+        key = (self.ground, self.lat0, self.lon0, self.home, self.heading, self.tilt, self.dist, self.target_r,
+               self.pitch, self.fov, self.width(), self.height())
+        if key != getattr(self, '_cam_key', None):
+            self._cam_key, self._cam = key, self._camera_now()
+        return self._cam
+
+    def _camera_now(self):
         la, lo = math.radians(self.home[0] if self.ground else self.lat0), math.radians(self.home[1] if self.ground else self.lon0)
         U = np.array([math.cos(la) * math.cos(lo), math.cos(la) * math.sin(lo), math.sin(la)])   # up, at the target
         E = np.array([-math.sin(lo), math.cos(lo), 0.0])                                        # east
@@ -172,7 +200,7 @@ class GlobeView(QtWidgets.QWidget):
     def _render_earth(self, fast):
         """the Earth (and its glow) as an image the size of the window - half resolution while moving"""
         w, h = self.width(), self.height()
-        k = 2 if fast else 1
+        k = 3 if fast else 1             # moving: a third of the resolution, sharp again once it stops
         W, H = max(1, w // k), max(1, h // k)
         sun = self.scene['sun'] if self.scene else (0.0, 0.0)
         night = bool(self.scene and self.scene.get('night'))
@@ -309,19 +337,39 @@ class GlobeView(QtWidgets.QWidget):
             return
         sx, sy, front, inview = self.project(np.asarray(xyz))
         for vis, alpha, wd in ((False, faint_alpha, 1.0), (True, colour.alpha(), width)):
+            if alpha <= 0:
+                continue
             c = QtGui.QColor(colour)
             c.setAlpha(alpha)
             p.setPen(QtGui.QPen(c, wd))
             p.setBrush(Qt.NoBrush)          # a line, not a filled shape
-            path = QtGui.QPainterPath()
-            last = -2
-            for i in range(1, len(sx)):
-                if (front[i] == vis and front[i - 1] == vis and inview[i] and inview[i - 1]):
-                    if last != i - 1:
-                        path.moveTo(sx[i - 1], sy[i - 1])
-                    path.lineTo(sx[i], sy[i])
-                    last = i
-            p.drawPath(path)
+            # each stretch of segments wholly in front (or wholly behind) becomes one polyline
+            seg = (front[1:] == vis) & (front[:-1] == vis) & inview[1:] & inview[:-1]
+            if not seg.any():
+                continue
+            d = np.diff(np.concatenate([[0], seg.astype(np.int8), [0]]))
+            for a, b in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
+                p.drawPolyline(QtGui.QPolygonF([QPointF(x, y) for x, y in zip(sx[a:b + 1].tolist(), sy[a:b + 1].tolist())]))
+
+    def _sprite(self, p, x, y, colour, scale, system):
+        """a satellite icon, drawn once per look (colour, size, system) and then just stamped - dozens of
+        satellites are drawn every frame"""
+        import iridium_tracker as it
+        key = (colour.rgba(), scale, system)
+        cache = self.__dict__.setdefault('_sprites', {})
+        if key not in cache:
+            dpr = self.devicePixelRatioF()
+            size = int(32 * scale) + 4
+            pm = QtGui.QPixmap(int(size * dpr), int(size * dpr))
+            pm.setDevicePixelRatio(dpr)
+            pm.fill(Qt.transparent)
+            q = QtGui.QPainter(pm)
+            q.setRenderHint(QtGui.QPainter.Antialiasing)
+            it.draw_satellite(q, size / 2, size / 2, colour, scale, system)
+            q.end()
+            cache[key] = (pm, size / 2)
+        pm, half = cache[key]
+        p.drawPixmap(QPointF(x - half, y - half), pm)
 
     def _sky_points(self, az, el):
         """points in the sky seen from your location (degrees), far enough out to project"""
@@ -378,18 +426,24 @@ class GlobeView(QtWidgets.QWidget):
                 self._line(p, to_xyz(np.array([r[0] for r in ring]), np.array([r[1] for r in ring]), 781.0),
                            col, 2.5 if pl['selected'] else 1.6)
             for tr in sc.get('tracks', []):
-                for pts, col in ((tr['past'], it.C_PAST), (tr['future'], it.C_FUTURE)):
+                for pts, col in ((tr.get('space_past', tr['past']), it.C_PAST),
+                                 (tr.get('space_future', tr['future']), it.C_FUTURE)):
                     for seg in _segments(pts):
-                        self._line(p, to_xyz(seg[:, 0], seg[:, 1], 781.0), QtGui.QColor(col), 2.5 if tr['selected'] else 1.8)
-            # measured positions (the satellite's own report), at their real height
-            for fx in sc.get('fixes', []):
-                x, y, front, _ = self.project(to_xyz(fx['lat'], fx['lon'], fx['alt_km']))
-                if front[0]:
-                    c = QtGui.QColor(it.C_FIX)
-                    c.setAlpha(int(255 * fx['alpha']))
-                    p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, int(200 * fx['alpha'])), 1))
-                    p.setBrush(c)
-                    p.drawEllipse(QPointF(x[0], y[0]), 3.5, 3.5)
+                        self._line(p, to_xyz(seg[:, 0], seg[:, 1], tr.get('alt_km', 781.0)), QtGui.QColor(col),
+                                   2.5 if tr['selected'] else 1.8)
+            # measured positions (the satellite's own report), at their real height - all projected at once
+            fixes = sc.get('fixes', [])
+            if fixes:
+                fxs, fys, ffront, _ = self.project(to_xyz(np.array([fx['lat'] for fx in fixes]),
+                                                          np.array([fx['lon'] for fx in fixes]),
+                                                          np.array([fx['alt_km'] for fx in fixes], float)))
+                for fx, x, y, front in zip(fixes, fxs, fys, ffront):
+                    if front:
+                        c = QtGui.QColor(it.C_FIX)
+                        c.setAlpha(int(255 * fx['alpha']))
+                        p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, int(200 * fx['alpha'])), 1))
+                        p.setBrush(c)
+                        p.drawEllipse(QPointF(x, y), 3.5, 3.5)
             # you
             hx, hy, hf, _ = self.project(to_xyz(self.home[0], self.home[1], 2.0))
             if hf[0] and not self.ground:
@@ -402,19 +456,24 @@ class GlobeView(QtWidgets.QWidget):
             font = p.font()
             font.setPointSize(8)
             p.setFont(font)
-            for st in sorted(sc.get('sats', []), key=lambda st: st['selected']):
-                x, y, front, inview = self.project(to_xyz(st['lat'], st['lon'], st['alt']))
-                if not inview[0]:
+            sats = sorted(sc.get('sats', []), key=lambda st: st['selected'])
+            if sats:        # all projected at once
+                sxs, sys_, sfront, sview = self.project(to_xyz(np.array([st['lat'] for st in sats]),
+                                                               np.array([st['lon'] for st in sats]),
+                                                               np.array([st['alt'] for st in sats], float)))
+            for k, st in enumerate(sats):
+                x, y, front, inview = sxs[k], sys_[k], sfront[k], sview[k]
+                if not inview:
                     continue
                 col = QtGui.QColor(230, 50, 60) if st['selected'] else (QtGui.QColor(40, 190, 90) if st['el'] > 0
                                                                        else QtGui.QColor(150, 156, 168))
-                p.setOpacity(1.0 if front[0] else 0.12)       # behind the Earth: just a hint
-                it.draw_satellite(p, x[0], y[0], col, 1.2 if st['selected'] else 0.85)
-                if front[0] and (st['selected'] or st['el'] > 0):
+                p.setOpacity(1.0 if front else 0.12)       # behind the Earth: just a hint
+                self._sprite(p, x, y, col, 1.2 if st['selected'] else 0.85, st.get('system', 'iridium'))
+                if front and (st['selected'] or st['el'] > 0):
                     p.setPen(QtGui.QColor(it.TEXT))
-                    p.drawText(QPointF(x[0] + 12, y[0] - 8), st['name'].replace('IRIDIUM ', 'IR '))
-                if front[0]:
-                    self.hits.append((x[0], y[0], st['name'], '<b>%s</b><br>%s<br>altitude %.0f km<br>%s' % (
+                    p.drawText(QPointF(x + 12, y - 8), systems.short_name(st['name']))
+                if front:
+                    self.hits.append((x, y, st['name'], '<b>%s</b><br>%s<br>altitude %.0f km<br>%s' % (
                         st['name'], st['ident'], st['alt'],
                         '%.0f&deg; above your horizon' % st['el'] if st['el'] > 0 else 'below your horizon')))
             p.setOpacity(1.0)
@@ -452,7 +511,7 @@ class GlobeWindow(QtWidgets.QDialog):
                                                  'passing above it', SIDE_VIEW)):
             b = QtWidgets.QPushButton(label)
             b.setToolTip(tip)
-            b.clicked.connect(lambda _, v=preset: self.view.set_view(v['dist'], v['tilt'], self.view.heading, v['target_r']))
+            b.clicked.connect(lambda _, v=preset: self.view.show_preset(v))
             bar.addWidget(b)
         stand = QtWidgets.QPushButton('🧍  Stand here')
         stand.setToolTip('See the sky as if you were standing at your location: the satellites passing overhead,\n'

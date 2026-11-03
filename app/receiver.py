@@ -23,12 +23,17 @@ import catalog
 import paths
 import sdr_settings
 import storage
+import systems
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RC = os.path.dirname(sys.executable)          # the radioconda (or packaged) Python running us
 PY = os.path.join(RC, 'python.exe')
 EXTRACTOR = os.path.join(RC, 'Library', 'bin', 'iridium-extractor.py')   # gr-iridium's decoder
 SOURCE = os.path.join(HERE, 'sdr_source.py')    # runs it with our device options and the spectrum tap
+ORBCOMM_RX = os.path.join(HERE, 'orbcomm_rx.py')  # Orbcomm: receiver + decoder in one process
+HAM_RX = os.path.join(HERE, 'ham_rx.py')          # ISS and ham CubeSats (2 m or 70 cm): the same
+GNSS_RX = os.path.join(HERE, 'gnss_rx.py')        # GPS / Galileo / BeiDou: records chunks for PocketSDR
+DAMAGED = ('RAW', 'ERR', 'OBAD', 'HSIG')        # frame kinds that were heard but could not be decoded
 LIMIT_GB = 2
 STATUS_EVERY = 10   # the decoder prints its totals every second; the log keeps one line in this many
 NO_WINDOW = 0x08000000   # CREATE_NO_WINDOW
@@ -103,8 +108,11 @@ class Receiver(QtCore.QObject):
             self.status.emit('Not starting: less than %.1f GB free on the disk holding %s' % (need, paths.DATA))
             return
         self.stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
+        self.sdr = sdr_settings.load()
+        self.system = systems.get('iridium' if self.replay else self.sdr['system'])
+        self.capname = self.system['capture_prefix'] + self.stamp
         os.makedirs(paths.CAPTURES, exist_ok=True)
-        stem = os.path.join(paths.CAPTURES, 'output-' + self.stamp)
+        stem = os.path.join(paths.CAPTURES, self.capname)
         self.log_path = stem + '.log'
         self.bits_path, self.live_path, self.start_path = stem + '.bits', stem + '.live', stem + '.start'
         self.stream_start = None
@@ -112,6 +120,8 @@ class Receiver(QtCore.QObject):
         self.t_start = time.time()
         self.stop_reason = ''
         self.last_status = ''
+        if self.system is not systems.IRIDIUM:
+            return self._start_orbcomm()
 
         self.parser = self._proc()                       # decoded frames, as they arrive
         self.parser.readyReadStandardOutput.connect(self._parser_output)
@@ -143,13 +153,43 @@ class Receiver(QtCore.QObject):
             self.status.emit('Could not start iridium-extractor: %s' % self.extractor.errorString())
             self.parser.kill()
             return
+        self._started()
+
+    def _start_orbcomm(self):
+        """Orbcomm and the ham bands: one process tunes the SDR, decodes and prints one line per packet/frame"""
+        s = self.sdr
+        self.parser = None
+        self.extractor = self._proc()
+        self.extractor.readyReadStandardOutput.connect(self._orbcomm_output)
+        self.extractor.readyReadStandardError.connect(self._extractor_err)
+        self.extractor.finished.connect(self._extractor_finished)
+        self.err_rest, self.status_lines = '', 0
+        g, auto = sdr_settings.gain(s)
+        prog = ([ORBCOMM_RX] if self.system is systems.ORBCOMM else [GNSS_RX] if self.system is systems.GNSS_BAND
+                else [HAM_RX, '--band', self.system['key']])
+        args = prog + ['--device', sdr_settings.device_args(s), '--rate', str(sdr_settings.sample_rate(s)),
+                '--center', str(sdr_settings.center_hz(s)), '--gain', '%g' % g, '--ppm', '%g' % s['ppm'],
+                '--start-file', self.start_path]
+        if self.spectrum_port:
+            args += ['--spectrum-port', str(self.spectrum_port)]
+        if self.audio_port:
+            args += ['--audio-port', str(self.audio_port)]
+        args += ['--auto-gain'] * auto + ['--no-dc'] * (not s['dc_correction']) + ['--parent-pid', str(os.getpid())]
+        self.extractor.start(PY, args)
+        if not self.extractor.waitForStarted(5000):
+            self.status.emit('Could not start the %s receiver: %s' % (self.system['label'], self.extractor.errorString()))
+            return
+        self._started()
+
+    def _started(self):
         self.bits_pos = 0
         self.disk_check = time.time()
         self.bits_rest = self.out_rest = ''
         self.state = 'running'
         self.timer.start(250)
         self.running.emit(True)
-        self.status.emit('Starting %s...' % ('the replay' if self.replay else self.sdr['label']))
+        self.status.emit('Starting %s...' % ('the replay' if self.replay else
+                                             '%s on %s' % (self.system['label'], self.sdr['label'])))
 
     # ---- while running
     def _tick(self):
@@ -163,12 +203,13 @@ class Receiver(QtCore.QObject):
             if storage.free_gb() < need:
                 self.stop('less than %.1f GB of disk space left' % need)
                 return
-        if not self.replay and private_bytes(self.extractor.processId()) > LIMIT_GB * 2 ** 30:
+        if not self.replay and self.system is systems.IRIDIUM and \
+                private_bytes(self.extractor.processId()) > LIMIT_GB * 2 ** 30:
             self.stop('decoder used over %d GB of memory (too many false bursts) - raise the threshold' % LIMIT_GB)
             return
         e = int(time.time() - self.t_start)
-        self.status.emit('Receiving %d:%02d:%02d  ·  %d decoded  ·  %d damaged  ·  %d positions%s'
-                         % (e // 3600, e // 60 % 60, e % 60, self.decoded_n, self.heard, self.fixes,
+        self.status.emit('Receiving %s %d:%02d:%02d  ·  %d decoded  ·  %d damaged  ·  %d positions%s'
+                         % (self.system['label'], e // 3600, e // 60 % 60, e % 60, self.decoded_n, self.heard, self.fixes,
                             '  ·  ' + self.last_status if self.last_status else ''))
 
     def _feed_bits(self, now):
@@ -238,6 +279,28 @@ class Receiver(QtCore.QObject):
                 if kind == 'IRA' and m and int(m.group(1)) > 100:     # a real position, not a beam on the ground
                     self.fixes += 1
 
+    def _orbcomm_output(self):
+        """Orbcomm packets: OEP (ephemeris = a position), OSY (sync), OPK (other packet), OBAD (failed checksum);
+        ham frames: HFR (decoded frame), HSIG (a signal heard but not decoded)"""
+        data = bytes(self.extractor.readAllStandardOutput()).decode(errors='replace')
+        if not data:
+            return
+        lines = (self.out_rest + data.replace('\r\n', '\n')).split('\n')
+        self.out_rest = lines.pop()
+        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS): ', l)]
+        if not lines:
+            return
+        with open(self.live_path, 'a', newline='') as f:
+            f.write(''.join(l + '\r\n' for l in lines))
+        for line in lines:
+            kind = line.split(':', 1)[0]
+            self.frame.emit(kind, line)
+            if kind in DAMAGED:
+                self.heard += 1
+            else:
+                self.decoded_n += 1
+                self.fixes += kind in ('OEP', 'GPOS')
+
     # ---- stop
     def stop(self, reason=''):
         if self.state != 'running':
@@ -264,14 +327,19 @@ class Receiver(QtCore.QObject):
         if self.state != 'stopping':
             return
         self.timer.stop()
+        if self.parser is None:         # Orbcomm: nothing to wait for
+            self._orbcomm_output()
+            return self._parser_finished()
         self._feed_bits(datetime.datetime.now(datetime.timezone.utc))
         self.parser.finished.connect(self._parser_finished)
         self.parser.closeWriteChannel()       # let the parser finish what it was given
         QtCore.QTimer.singleShot(15000, lambda p=self.parser: p.state() != QtCore.QProcess.NotRunning and p.kill())
 
     def _parser_finished(self, *_):
-        self._parser_output()
-        size = os.path.getsize(self.bits_path) if os.path.exists(self.bits_path) else 0
+        if self.parser is not None:
+            self._parser_output()
+        got = self.bits_path if self.parser is not None else self.live_path
+        size = os.path.getsize(got) if os.path.exists(got) else 0
         if size < 200:      # nothing was received: don't leave empty files behind
             self._remove_capture()
             self.state = 'idle'
@@ -284,14 +352,14 @@ class Receiver(QtCore.QObject):
         self.decoder.finished.connect(self._decoder_finished)
         self.decoder.setStandardOutputFile(QtCore.QProcess.nullDevice())
         self.decoder.setStandardErrorFile(QtCore.QProcess.nullDevice())
-        self.decoder.start(PY, [os.path.join(HERE, 'catalog.py'), '--ready=output-' + self.stamp])
+        self.decoder.start(PY, [os.path.join(HERE, 'catalog.py'), '--ready=' + self.capname])
 
     def _decoder_finished(self, *_):
         self.state = 'idle'
         self.running.emit(False)
         ok = self.decoder.exitCode() == 0
-        self.status.emit('Capture output-%s %s (%d decoded, %d positions)%s'
-                         % (self.stamp, 'added to the catalog' if ok else 'could not be decoded - run 2-decode.bat',
+        self.status.emit('Capture %s %s (%d decoded, %d positions)%s'
+                         % (self.capname, 'added to the catalog' if ok else 'could not be decoded - run 2-decode.bat',
                             self.decoded_n, self.fixes, ' - stopped: ' + self.stop_reason if self.stop_reason else ''))
         if ok:
             self.decoded.emit()
@@ -302,20 +370,23 @@ class Receiver(QtCore.QObject):
             subprocess.run(['taskkill', '/PID', str(self.extractor.processId()), '/T', '/F'],
                            capture_output=True, creationflags=NO_WINDOW)
             self.timer.stop()
-            self._feed_bits(datetime.datetime.now(datetime.timezone.utc))
-            self.parser.closeWriteChannel()
-            self.parser.waitForFinished(15000)
-            self._parser_output()
-            self.parser.kill()
-            if os.path.exists(self.bits_path) and os.path.getsize(self.bits_path) >= 200:
-                subprocess.Popen([PY, os.path.join(HERE, 'catalog.py'), '--ready=output-' + self.stamp],
+            if self.parser is not None:
+                self._feed_bits(datetime.datetime.now(datetime.timezone.utc))
+                self.parser.closeWriteChannel()
+                self.parser.waitForFinished(15000)
+                self._parser_output()
+                self.parser.kill()
+            got = self.bits_path if self.parser is not None else self.live_path
+            if os.path.exists(got) and os.path.getsize(got) >= 200:
+                subprocess.Popen([PY, os.path.join(HERE, 'catalog.py'), '--ready=' + self.capname],
                                  cwd=HERE, creationflags=NO_WINDOW)
             else:
                 self._remove_capture()
 
     def _remove_capture(self):
-        """delete the files of a run that received nothing"""
-        for ext in ('.bits', '.live', '.log', '.start'):
+        """delete the files of a run that received nothing - except its log, which says what the receiver
+        heard (e.g. Orbcomm's per-channel levels), for working out why (storage removes it with other old files)"""
+        for ext in ('.bits', '.live', '.start'):
             try:
                 os.remove(self.bits_path[:-5] + ext)
             except OSError:

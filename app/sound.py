@@ -4,24 +4,50 @@ The decoder process (sdr_source.py) makes the audio from the same samples it dec
 over a local UDP socket; this plays it and tells the decoder which sound to make:
   off    nothing
   wide   every burst in the received slice
-  tuned  one channel (click the spectrum to choose it), AM-demodulated like SDR++
+  tuned  one channel (click the spectrum to choose it), demodulated like SDR++: NFM, WFM, AM, USB, LSB or
+         CW, with a bandwidth; each band starts in its system's mode, and the last choice per system is kept
 Audio that arrives faster than the speakers play is dropped here, never in the decoder.
 Optional low-pass / high-pass filters and a squelch are applied here too (settings.json 'audio').
 """
 import json
 import os
+import time
 
 import numpy as np
 from PyQt5 import QtCore, QtMultimedia, QtNetwork
 from scipy import signal
 
 import paths
+import systems
 
 RATE = 48000
 LOW_PASS = [0, 2000, 3000, 4000, 6000, 8000]       # Hz, 0 = off
 HIGH_PASS = [0, 100, 300, 600, 1000]
 SQUELCH_OPEN_S, SQUELCH_CLOSE_S = 0.002, 0.15      # fade in fast, fade out gently (no clicks)
 SQUELCH_STEP = RATE // 200                         # the squelch decides every 5 ms
+DEMODS = ['nfm', 'wfm', 'am', 'usb', 'lsb', 'cw']    # the tuned sound's modes (sdr_taps.DEMODS)
+MODE_BW = {'nfm': 12.5e3, 'wfm': 180e3, 'am': 10e3, 'usb': 2.8e3, 'lsb': 2.8e3, 'cw': 500.0}  # a mode's own width
+
+
+def demod_name(demod):
+    """a system's 'demod' key -> one of DEMODS ('fm' is narrow FM)"""
+    d = (demod or 'am').lower()
+    return 'nfm' if d == 'fm' else d if d in DEMODS else 'am'
+
+
+def band_default(system):
+    """the tuned sound a system starts with: (demod, bandwidth Hz)"""
+    demod = demod_name(system.get('demod'))
+    return demod, float(system.get('channel_hz') or MODE_BW[demod])
+
+
+def passband(demod, bandwidth):
+    """the frequencies heard, relative to the tuned frequency (Hz): one side of it for USB / LSB"""
+    if demod == 'usb':
+        return 0.0, bandwidth
+    if demod == 'lsb':
+        return -bandwidth, 0.0
+    return -bandwidth / 2, bandwidth / 2
 
 
 def load_audio():
@@ -30,7 +56,9 @@ def load_audio():
     except (OSError, ValueError, AttributeError):
         a = {}
     return {'low_pass': int(a.get('low_pass', 0)), 'high_pass': int(a.get('high_pass', 0)),
-            'squelch_db': float(a.get('squelch_db', 0)), 'volume': float(a.get('volume', 0.6))}
+            'squelch_db': float(a.get('squelch_db', 0)), 'volume': float(a.get('volume', 0.6)),
+            'modes': {k: v for k, v in (a.get('modes') or {}).items()   # system key -> {'demod', 'bandwidth'}
+                      if isinstance(v, dict) and v.get('demod') in DEMODS}}
 
 
 def save_audio(a):
@@ -45,6 +73,8 @@ def save_audio(a):
 
 
 class SoundPlayer(QtCore.QObject):
+    demodChanged = QtCore.pyqtSignal()      # the tuned sound's mode or bandwidth changed
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.sock = QtNetwork.QUdpSocket(self)
@@ -55,6 +85,9 @@ class SoundPlayer(QtCore.QObject):
         self.mode = 'off'
         self.listen_hz = 1626.2708e6    # the ring-alert channel
         self.center = None              # the receiver's centre frequency (from the spectrum)
+        self.system = None              # the receive band's system key (from the centre frequency)
+        self.demod, self.bandwidth = band_default(systems.IRIDIUM)
+        self.changed = 0.0              # when the mode or bandwidth was last chosen
         fmt = QtMultimedia.QAudioFormat()
         fmt.setSampleRate(RATE)
         fmt.setChannelCount(1)
@@ -92,6 +125,44 @@ class SoundPlayer(QtCore.QObject):
         elif self.io is None:
             self.io = self.out.start()
             self.out.setVolume(self.volume)
+        self._command()
+
+    def set_band(self, center):
+        """the receiver is on a (new) band: use its system's last mode, or its own default"""
+        self._use_system(systems.of_frequency(center))
+
+    def _use_system(self, s):
+        self.changed = time.time()
+        self.system = s['key']
+        saved = self.settings['modes'].get(self.system)
+        if saved:
+            self.demod, self.bandwidth = saved['demod'], float(saved.get('bandwidth') or MODE_BW[saved['demod']])
+        else:
+            self.demod, self.bandwidth = band_default(s)
+        self.demodChanged.emit()
+
+    def set_demod(self, demod=None, bandwidth=None):
+        """choose the tuned sound's mode and/or bandwidth (a new mode without a bandwidth gets the band's own
+        width if it is the band's mode, else the mode's usual one); remembered for the band's system"""
+        self.changed = time.time()
+        if demod is not None and demod != self.demod:
+            own = band_default(systems.get(self.system)) if self.system else None
+            self.demod = demod
+            self.bandwidth = own[1] if own and own[0] == demod else MODE_BW[demod]
+        if bandwidth is not None:
+            self.bandwidth = float(bandwidth)
+        if self.system:
+            self.settings['modes'][self.system] = {'demod': self.demod, 'bandwidth': self.bandwidth}
+            save_audio(self.settings)
+        self.demodChanged.emit()
+        self._command()
+
+    def reset_demod(self):
+        """back to the band's own mode and width (forgets the remembered choice)"""
+        if self.system:
+            self.settings['modes'].pop(self.system, None)
+            save_audio(self.settings)
+            self._use_system(systems.get(self.system))
         self._command()
 
     def set_volume(self, v):
@@ -148,7 +219,8 @@ class SoundPlayer(QtCore.QObject):
         if self.decoder is None:
             return
         offset = self.listen_hz - self.center if (self.center and self.mode == 'tuned') else 0.0
-        self.sock.writeDatagram(b'CTRL %s %d' % (self.mode.encode(), int(round(offset))), *self.decoder)
+        self.sock.writeDatagram(b'CTRL %s %d %s %d' % (self.mode.encode(), int(round(offset)), self.demod.encode(),
+                                                       int(round(self.bandwidth))), *self.decoder)
 
     def _read(self):
         while self.sock.hasPendingDatagrams():
@@ -156,7 +228,17 @@ class SoundPlayer(QtCore.QObject):
             data = bytes(dg.data())
             if data.startswith(b'IRAH'):        # the decoder saying hello (once a second): keep it in step
                 self.decoder = (dg.senderAddress(), dg.senderPort())
-                if data[5:].decode(errors='replace') != self.mode or self.mode == 'tuned':
+                f = data[5:].decode(errors='replace').split()       # mode [demod bandwidth]
+                if len(f) == 3 and f[1] == self.demod:
+                    try:
+                        bw = float(f[2])
+                    except ValueError:
+                        bw = self.bandwidth
+                    # the receiver can't go that wide/narrow: show what it uses (not a hello sent before our change)
+                    if abs(bw - self.bandwidth) > 1 and time.time() - self.changed > 2:
+                        self.bandwidth = bw
+                        self.demodChanged.emit()
+                if not f or f[0] != self.mode or self.mode == 'tuned':
                     self._command()
             elif data.startswith(b'IRAU') and self.io is not None:
                 self.queue += self._process(data[4:])

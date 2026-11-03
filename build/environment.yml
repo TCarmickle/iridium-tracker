@@ -7,6 +7,7 @@ dependencies:
   - gnuradio-core=3.10.12.0      # GNU Radio
   - gnuradio-iridium=1!1.0.0     # gr-iridium: iridium-extractor (burst detector)
   - gnuradio-osmosdr=0.2.6       # SDR access (RTL-SDR and others)
+  - gnuradio-satellites=5.9.0    # gr-satellites: ISS / ham CubeSat demodulators and deframers
   - pyqt=5.15.9                  # the app window
   - numpy=2.2.3
   - scipy=1.15.2                 # orbit fitting

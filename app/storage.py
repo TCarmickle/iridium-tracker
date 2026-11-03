@@ -19,11 +19,12 @@ import shutil
 import time
 
 import paths
+import systems
 
 DEFAULTS = {'keep_raw_days': 7, 'max_raw_mb': 1024, 'max_tiles_mb': 200, 'min_free_gb': 1.0}
 RAW_EXT = ('.bits', '.parsed', '.live', '.log')
 REDUCED = '.frames.gz'
-KEEP_KINDS = ('IRA:', 'ITL:')
+KEEP_KINDS = systems.keep_kinds()     # every system's position / pass frames
 HEADER = '#iridium-tracker-frames '
 
 
@@ -77,8 +78,9 @@ def _size(files):
 def captures():
     """capture name -> its files"""
     caps = {}
-    for f in glob.glob(os.path.join(paths.CAPTURES, 'output-*')):
-        name = re.match(r'(output-\d{8}-\d{6})', os.path.basename(f))
+    for f in glob.glob(os.path.join(paths.CAPTURES, '*-*')):
+        name = re.match(r'((?:%s)\d{8}-\d{6})' % '|'.join(map(re.escape, systems.capture_prefixes())),
+                        os.path.basename(f))
         if name:
             caps.setdefault(name.group(1), []).append(f)
     return caps

@@ -10,14 +10,15 @@ import numpy as np
 from PyQt5 import QtCore, QtGui, QtNetwork, QtWidgets
 from PyQt5.QtCore import QPointF, Qt
 
+import systems
+
 BG, PANEL, GRID, TEXT, MUTED = '#0e1116', '#14171c', '#262b35', '#e6e9ef', '#8b93a1'
 ROWS = 500          # waterfall history (about 30 s at 15 frames/s)
 DECAY_DB = 3.0      # the peak line falls this much per frame after a burst (fast rise, slow fall)
 TUNE_STEP_HZ = 1000  # the mouse wheel over the trace moves the tuned frequency in these steps
 
-# where things are in the Iridium band (MHz)
-BANDS = [(1616.0, 1626.0, 'duplex channels (phones, data)', QtGui.QColor(76, 154, 255, 28)),
-         (1626.0, 1626.5, 'ring alerts & messaging', QtGui.QColor(76, 208, 125, 40))]
+# where things are in each system's band (MHz)
+BANDS = [(lo, hi, name, QtGui.QColor(*rgba)) for s in systems.ORDER for lo, hi, name, rgba in s['bands']]
 
 
 def colormap():
@@ -59,6 +60,7 @@ class SpectrumView(QtWidgets.QWidget):
         self.drag = None
         self.mouse = None
         self.listen_hz = None       # tuned sound: the channel being listened to (Hz), drawn as a marker
+        self.passband = None        # ...and what is heard around it: (low, high) Hz from listen_hz
         self.dirty = False
         t = QtCore.QTimer(self)
         t.timeout.connect(self._repaint)
@@ -296,8 +298,12 @@ class SpectrumView(QtWidgets.QWidget):
         p.drawLine(QPointF(cx, 0), QPointF(cx, top_h))
         if self.listen_hz is not None:        # the tuned channel being listened to
             lx = self.x_of(self.listen_hz, w)
-            half = max(2.0, self.x_of(self.listen_hz + 18e3, w) - lx)
-            p.fillRect(QtCore.QRectF(lx - half, 0, 2 * half, top_h), QtGui.QColor(255, 210, 60, 45))
+            lo, hi = self.passband or (-systems.of_frequency(self.center)['channel_hz'] / 2,
+                                       systems.of_frequency(self.center)['channel_hz'] / 2)
+            x0, x1 = self.x_of(self.listen_hz + lo, w), self.x_of(self.listen_hz + hi, w)
+            if x1 - x0 < 4:             # always visible, even zoomed out
+                x0, x1 = (x0 + x1) / 2 - 2, (x0 + x1) / 2 + 2
+            p.fillRect(QtCore.QRectF(x0, 0, x1 - x0, top_h), QtGui.QColor(255, 210, 60, 45))
             p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 60), 1.5))
             p.drawLine(QPointF(lx, 0), QPointF(lx, h))
             p.drawText(QPointF(min(lx + 6, w - 150), top_h - 6), '\U0001F50A %.4f MHz' % (self.listen_hz / 1e6))
@@ -380,7 +386,8 @@ class SpectrumPanel(QtWidgets.QWidget):
         self.volume.setToolTip('Volume')
         self.audio_btn = QtWidgets.QToolButton()
         self.audio_btn.setText('Audio \u25be')
-        self.audio_btn.setToolTip('Low-pass and high-pass filters, and squelch, for the sound')
+        self.audio_btn.setToolTip('The tuned sound\'s mode (NFM, WFM, AM, USB, LSB, CW) and bandwidth;\n'
+                                  'low-pass and high-pass filters, and squelch, for the sound')
         self.audio_btn.setPopupMode(QtWidgets.QToolButton.InstantPopup)
         self.player = None
         self.pause = QtWidgets.QPushButton('Pause')
@@ -406,19 +413,46 @@ class SpectrumPanel(QtWidgets.QWidget):
         self.volume.valueChanged.connect(lambda v: player.set_volume(v / 100))
         self.view.listenPicked.connect(lambda hz: player.set_mode('tuned', hz))
         self.audio_btn.setMenu(self._audio_menu(player))
-        # every start: sound on, tuned to the ring-alert channel, at half volume
-        self.volume.setValue(50)
-        player.set_volume(0.5)
+        player.demodChanged.connect(self._show_demod)
+        self._show_demod()
+        # every start: sound on (tuned) but the volume at zero - turn it up to listen
+        self.volume.setValue(0)
+        player.set_volume(0.0)
         self.sound.setCurrentIndex(2)
 
     def _audio_menu(self, player):
-        """the Audio menu: low-pass, high-pass and squelch (applied in the tracker, remembered)"""
+        """the Audio menu: the tuned sound's mode and bandwidth (made in the receiver, remembered per system);
+        low-pass, high-pass and squelch (applied in the tracker, remembered)"""
         import sound
         menu = QtWidgets.QMenu(self)
         box = QtWidgets.QWidget()
         form = QtWidgets.QFormLayout(box)
         form.setContentsMargins(12, 10, 12, 10)
         a = player.settings
+        self.demod = QtWidgets.QComboBox()
+        for d in sound.DEMODS:
+            self.demod.addItem(d.upper(), d)
+        self.demod.setToolTip('How the tuned channel is demodulated, like SDR++:\n'
+                              'NFM narrow FM (voice, APRS, data warble), WFM broadcast FM, AM (also the bursts\' '
+                              'envelope),\nUSB / LSB one sideband, CW Morse (a carrier heard as a 700 Hz tone).\n'
+                              'Each band starts in its own mode; your last choice is kept per system.')
+        self.demod.currentIndexChanged.connect(lambda i: player.set_demod(demod=self.demod.itemData(i)))
+        self.bw = QtWidgets.QDoubleSpinBox()
+        self.bw.setRange(0.1, 250)
+        self.bw.setDecimals(2)
+        self.bw.setSuffix(' kHz')
+        self.bw.setStepType(QtWidgets.QAbstractSpinBox.AdaptiveDecimalStepType)
+        self.bw.setKeyboardTracking(False)
+        self.bw.setToolTip('How wide the tuned channel is (the yellow band on the spectrum)')
+        self.bw.valueChanged.connect(lambda v: player.set_demod(bandwidth=v * 1e3))
+        default = QtWidgets.QPushButton('Band default')
+        default.setToolTip('Back to this band\'s own mode and bandwidth')
+        default.clicked.connect(player.reset_demod)
+        row_bw = QtWidgets.QHBoxLayout()
+        row_bw.addWidget(self.bw, 1)
+        row_bw.addWidget(default)
+        form.addRow('Mode:', self.demod)
+        form.addRow('Bandwidth:', row_bw)
         lp = QtWidgets.QComboBox()
         for hz in sound.LOW_PASS:
             lp.addItem('Off' if not hz else '%g kHz' % (hz / 1000), hz)
@@ -453,6 +487,19 @@ class SpectrumPanel(QtWidgets.QWidget):
         menu.addAction(act)
         return menu
 
+    def _show_demod(self):
+        """the player's tuned mode and width: in the Audio menu, and on the spectrum marker"""
+        import sound
+        p = self.player
+        for wdg, set_value in ((self.demod, lambda: self.demod.setCurrentIndex(self.demod.findData(p.demod))),
+                               (self.bw, lambda: self.bw.setValue(p.bandwidth / 1e3))):
+            wdg.blockSignals(True)
+            set_value()
+            wdg.blockSignals(False)
+        self.audio_btn.setText('Audio %s ▾' % p.demod.upper())
+        self.view.passband = sound.passband(p.demod, p.bandwidth)
+        self.view.dirty = True
+
     def _sound_mode(self, i):
         mode = ('off', 'wide', 'tuned')[i]
         if mode == 'tuned':
@@ -482,6 +529,12 @@ class SpectrumPanel(QtWidgets.QWidget):
         v = self.view
         if self.player is not None and v.n and self.player.center != v.center:
             self.player.center = v.center
+            if systems.of_frequency(v.center)['key'] != self.player.system:      # another band: its own mode
+                self.player.set_band(v.center)
+            if abs(self.player.listen_hz - v.center) > v.rate / 2:      # a different band: its own channel
+                self.player.listen_hz = systems.of_frequency(v.center)['listen_hz']
+                if v.listen_hz is not None:
+                    v.listen_hz = self.player.listen_hz
             self.player.set_mode(self.player.mode)
         if v.auto:      # show the range auto picked, ready for switching to manual
             for sb, val in ((self.lo, v.db_lo), (self.hi, v.db_hi)):

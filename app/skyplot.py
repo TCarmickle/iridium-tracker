@@ -29,10 +29,12 @@ def snr_colour(snr):
     return QtGui.QColor(*stops[-1][1])
 
 
-def sky_points(data, from_home, since=0.0):
-    """(fixes [(el, az, snr, t)], frames [(el, az, t)]) heard since `since` (unix time)"""
+def sky_points(data, from_home, since=0.0, shows=None):
+    """(fixes [(el, az, snr, t)], frames [(el, az, t)]) heard since `since` (unix time);
+    shows(name, capture) -> bool limits it to the systems being shown"""
+    shows = shows or (lambda name, cap=None: True)
     fixes = []
-    fx = [f for f in data.all_fixes() if f.get('xyz_km') and f['t'] >= since]
+    fx = [f for f in data.all_fixes() if f.get('xyz_km') and f['t'] >= since and shows(f['name'], f['cap'])]
     if fx:
         X, Y, Z = np.array([f['xyz_km'] for f in fx], float).T
         el, az, _ = from_home(X, Y, Z)
@@ -40,7 +42,7 @@ def sky_points(data, from_home, since=0.0):
     frames = []
     for name, groups in data.doppler.items():
         orbit = data.orbits.get(name)
-        if orbit is None:
+        if orbit is None or not shows(name):
             continue
         ts = np.array([t for g in groups for t, _ in g if t >= since], float)
         if not len(ts):
@@ -147,11 +149,11 @@ class SkyDialog(QtWidgets.QDialog):
     """the Sky window: the plot, a period to show, and a summary; refreshes while open"""
     PERIODS = [('This run', None), ('Last hour', 3600), ('Last 24 hours', 86400), ('Everything', 0)]
 
-    def __init__(self, parent, data, from_home, current_run_start):
+    def __init__(self, parent, data, from_home, current_run_start, shows=None):
         super().__init__(None)      # its own window: taskbar button, minimize/maximize (closed with the main window)
         self.setWindowFlags(Qt.Window | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
         self.setWindowTitle('Sky plot - where your antenna hears satellites')
-        self.data, self.from_home, self.run_start = data, from_home, current_run_start
+        self.data, self.from_home, self.run_start, self.shows = data, from_home, current_run_start, shows
         self.plot = SkyPlot()
         self.period = QtWidgets.QComboBox()
         for label, _ in self.PERIODS:
@@ -186,6 +188,6 @@ class SkyDialog(QtWidgets.QDialog):
             since = self.run_start() or time.time()
         else:
             since = time.time() - span if span else 0.0
-        fixes, frames = sky_points(self.data, self.from_home, since)
+        fixes, frames = sky_points(self.data, self.from_home, since, self.shows)
         self.plot.set_points(fixes, frames)
         self.text.setText(summary(fixes, frames))

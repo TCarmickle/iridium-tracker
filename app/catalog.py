@@ -1,4 +1,4 @@
-"""Running catalog of every Iridium satellite heard across all captures.
+"""Running catalog of every satellite heard across all captures (Iridium and Orbcomm).
 
 Usage: python catalog.py            (adds any new captures, then writes catalog.txt)
        python catalog.py --redo     (re-analyzes every capture from scratch)
@@ -8,6 +8,8 @@ later when the satellite orbit data (TLEs) gets older or is refreshed.
 Satellites are named two ways:
   position  - a ring alert reported its position; the satellite overhead there is named
   Doppler   - the frequency curve of a plane/slot's ITL frames matches one satellite's orbit
+Orbcomm satellites send their own position (ephemeris packets); the satellite at that spot is named,
+and that name sticks to the satellite ID in its other packets.
 """
 import collections
 import datetime
@@ -25,6 +27,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import paths  # noqa: E402  (where the data lives)
 import storage  # noqa: E402
+import systems  # noqa: E402
 # iridium-toolkit: inside this folder (a packaged copy) or next to it
 TOOLKIT = next((d for d in (os.path.join(HERE, 'iridium-toolkit'), os.path.join(HERE, '..', 'iridium-toolkit'))
                 if os.path.exists(os.path.join(d, 'iridium-parser.py'))), os.path.join(HERE, 'iridium-toolkit'))
@@ -32,7 +35,15 @@ PARSER = os.path.join(TOOLKIT, 'iridium-parser.py')
 # public orbit list, used only to put names on satellites (positions always come from our own fixes);
 # kept fresh from CelesTrak, with SatDump's copy as a fallback
 TLE_FILE = os.path.join(paths.DATA, 'iridium-names.tle')
-TLE_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=iridium-NEXT&FORMAT=tle'
+TLE_URL = 'https://celestrak.org/NORAD/elements/gp.php?GROUP=%s&FORMAT=tle'
+
+
+def tle_file(system='iridium'):
+    """the name list of a system (both ham bands share the ham one)"""
+    s = systems.get(system)
+    return os.path.join(paths.DATA, '%s-names.tle' % s.get('system', s['key']))
+
+
 SATDUMP_TLES = os.path.join(os.environ.get('APPDATA', ''), 'satdump', 'satdump_tles.txt')
 DATA = os.path.join(paths.DATA, 'catalog-data.json')
 REPORT = os.path.join(paths.DATA, 'catalog.txt')
@@ -115,26 +126,37 @@ def look(sat, t, lat, lon, h=0.0):
     return math.degrees(math.asin(Z / rng)), (math.degrees(math.atan2(Ea, -S)) + 360) % 360, rng, rng2 - rng
 
 
-def refresh_tles(max_age_days=2):
+def refresh_tles(max_age_days=2, system='iridium'):
     """download a fresh name list now and then (CelesTrak asks for no more than one fetch every couple of hours)"""
-    if os.path.exists(TLE_FILE) and time.time() - os.path.getmtime(TLE_FILE) < max_age_days * 86400:
+    s = systems.get(system)
+    path = tle_file(system)
+    if os.path.exists(path) and time.time() - os.path.getmtime(path) < max_age_days * 86400:
         return
     try:
         import requests
-        r = requests.get(TLE_URL, timeout=15, headers={'User-Agent': 'IridiumTracker/1.0'})
-        if r.ok and 'IRIDIUM' in r.text:
-            open(TLE_FILE, 'w', newline='\n').write(r.text.replace('\r\n', '\n'))
+        text = ''
+        for group in s.get('tle_groups') or (s['tle_group'],):
+            r = requests.get(TLE_URL % group, timeout=15, headers={'User-Agent': 'IridiumTracker/1.0'})
+            if not (r.ok and '\n1 ' in r.text and (not s['prefix'] or s['prefix'].strip() in r.text)):
+                return          # a group failed: keep the old list rather than half of a new one
+            text += r.text.replace('\r\n', '\n').rstrip('\n') + '\n'
+        open(path, 'w', newline='\n').write(text)
     except Exception:
         pass        # offline: keep using what we have
 
 
-def load_tles():
-    refresh_tles()
-    for path in (TLE_FILE, SATDUMP_TLES):
+def load_tles(system='iridium'):
+    """the public catalog's satellites of one system (for names only)"""
+    refresh_tles(system=system)
+    prefix = (systems.get(system)['prefix'] or '').strip()
+    for path in (tle_file(system), SATDUMP_TLES):
         if os.path.exists(path):
             lines = open(path).read().splitlines()
-            return [Sat(lines[i].strip(), lines[i + 1], lines[i + 2])
-                    for i in range(len(lines) - 2) if lines[i].startswith('IRIDIUM')]
+            sats = [Sat(lines[i].strip(), lines[i + 1], lines[i + 2])
+                    for i in range(len(lines) - 2) if lines[i].startswith(prefix) and lines[i + 1].startswith('1 ')
+                    and lines[i + 2].startswith('2 ') and not lines[i].startswith(('1 ', '2 '))]
+            if sats:
+                return sats
     return []
 
 
@@ -201,6 +223,276 @@ def match_doppler(sats, pts, shifts):
     return fits
 
 
+def match_ecef(sats, t, xyz_km, max_km=300.0):
+    """(name, km off) of the catalog satellite nearest an Earth-fixed position the satellite reported
+    itself, or (None, km) if none is within max_km"""
+    best = None
+    for s in sats:
+        p = s.ecef(t)
+        d = math.sqrt(sum((a - b) ** 2 for a, b in zip(p, xyz_km)))
+        if best is None or d < best[1]:
+            best = (s.name, d)
+    if best is None or best[1] > max_km:
+        return None, best[1] if best else None
+    return best
+
+
+def ecef_to_lla(x, y, z):
+    """Earth-fixed km -> latitude, longitude (degrees), height (km) on WGS84"""
+    f = 1 / 298.257223563
+    e2 = f * (2 - f)
+    lon = math.atan2(y, x)
+    p = math.hypot(x, y)
+    lat = math.atan2(z, p * (1 - e2))
+    for _ in range(5):
+        N = RE / math.sqrt(1 - e2 * math.sin(lat) ** 2)
+        h = p / math.cos(lat) - N
+        lat = math.atan2(z, p * (1 - e2 * N / (N + h)))
+    N = RE / math.sqrt(1 - e2 * math.sin(lat) ** 2)
+    return math.degrees(lat), math.degrees(lon), p / math.cos(lat) - N
+
+
+def read_orbcomm(lines):
+    """Orbcomm receiver lines -> [(kind, unix t, Hz, sat id or None, snr, rest)]
+       OEP: t Hz satid snr x y z vx vy vz   ephemeris: the satellite's own position (km) and velocity (km/s)
+       OSY: t Hz satid snr                  sync packet
+       OPK: t Hz satid snr type             any other packet
+       OBAD: t Hz - snr                     heard, but failed its checksum"""
+    out = []
+    for line in lines:
+        f = line.split()
+        if len(f) < 5 or not f[0].endswith(':') or not f[0].startswith('O'):
+            continue
+        try:
+            sid = None if f[3] == '-' else int(f[3], 16)
+            out.append((f[0][:-1], float(f[1]), float(f[2]), sid, float(f[4]), f[5:]))
+        except ValueError:
+            continue
+    return out
+
+
+def analyze_orbcomm(stem, sats):
+    """an Orbcomm capture: every position fix (named by matching it to the catalog) and, per satellite and
+    pass, the measured carrier frequency of all its packets (its Doppler curve)"""
+    start, how = capture_start(stem)
+    src = frames_source(stem)
+    if src.endswith(storage.REDUCED):
+        meta, lines = storage.read_reduced(src)
+    else:
+        meta, lines = {}, open(src, errors='replace').read().splitlines()
+    pk = read_orbcomm(lines)
+    iso = lambda t: datetime.datetime.fromtimestamp(t, UTC).isoformat(timespec='seconds')
+    heard = [p[1] for p in pk if p[0] != 'OEP'] or [p[1] for p in pk]     # reception times (ephemeris times are the satellite's)
+    span = (max(heard) - min(heard)) / 3600 if heard else 0
+    cap = {'capture': os.path.basename(stem), 'system': 'orbcomm', 'start_utc': iso(start.timestamp()), 'clock': how,
+           'hours': meta.get('hours', round(span, 3)), 'counts': meta.get('counts', dict(collections.Counter(p[0] for p in pk))),
+           'slots': [], 'positions': [], 'passes': []}
+    ids = collections.defaultdict(collections.Counter)      # satellite ID -> names its positions matched
+    for kind, t, hz, sid, snr, rest in pk:
+        if kind != 'OEP' or len(rest) < 6:
+            continue
+        xyz = [float(v) for v in rest[:3]]
+        vel = [float(v) for v in rest[3:6]]
+        name, off = match_ecef(sats, datetime.datetime.fromtimestamp(t, UTC), xyz)
+        if name:
+            ids[sid][name] += 1
+        lat, lon, alt = ecef_to_lla(*xyz)
+        cap['positions'].append({'time': iso(t), 't': round(t, 3), 'net_id': sid, 'beam': None, 'lat': round(lat, 4),
+                                 'lon': round(lon, 4), 'alt_km': round(alt), 'snr': snr, 'name': name, 'hz': hz,
+                                 'catalog_off_km': round(off, 1) if off is not None else None,
+                                 'xyz_km': [round(v, 3) for v in xyz], 'vel_kms': [round(v, 4) for v in vel]})
+    id_name = {sid: c.most_common(1)[0][0] for sid, c in ids.items()}
+    for p in cap['positions']:          # a position that matched nothing still belongs to its satellite ID
+        p['name'] = p['name'] or id_name.get(p['net_id'])
+    by_sat = collections.defaultdict(list)
+    for kind, t, hz, sid, snr, rest in pk:
+        if kind != 'OBAD' and sid in id_name:
+            by_sat[id_name[sid], sid].append((t, hz, snr))
+    for (name, sid), hits in sorted(by_sat.items()):
+        hits.sort()
+        groups, cur = [], [hits[0]]
+        for h in hits[1:]:      # separate passes at gaps over 15 minutes
+            if h[0] - cur[-1][0] > 900:
+                groups.append(cur)
+                cur = []
+            cur.append(h)
+        groups.append(cur)
+        for g in groups:
+            cap['passes'].append({'name': name, 'sat_id': sid, 'first': iso(g[0][0]), 'last': iso(g[-1][0]),
+                                  'frames': len(g), 'best_snr': max(h[2] for h in g),
+                                  'doppler': [[round(h[0], 3), h[1]] for h in g]})
+    return cap
+
+
+def norad_names(system='ham'):
+    """NORAD number -> name in the public catalog's list (ham satellites are named the catalog's way,
+    e.g. gr-satellites' 'AO-73' -> 'FUNCUBE-1 (AO-73)', so the info window can find them)"""
+    out = {}
+    try:
+        lines = open(tle_file(system)).read().splitlines()
+    except OSError:
+        return out
+    for i in range(len(lines) - 2):
+        if lines[i + 1].startswith('1 ') and lines[i + 2].startswith('2 ') and not lines[i].startswith(('1 ', '2 ')):
+            try:
+                out[int(lines[i + 1][2:7])] = lines[i].strip()
+            except ValueError:
+                pass
+    return out
+
+
+def read_ham(lines):
+    """ham receiver lines -> [(kind, unix t, Hz, norad, name or None, snr, callsign, candidates)]
+       HFR: t Hz norad name snr bytes callsign candidates   a decoded frame (name '?' = which satellite is unknown)
+       HSIG: t Hz - snr seconds                             a signal heard but not decoded"""
+    out = []
+    for line in lines:
+        f = line.split()
+        if len(f) < 5 or f[0] not in ('HFR:', 'HSIG:'):
+            continue
+        try:
+            if f[0] == 'HFR:' and len(f) >= 8:
+                name = None if f[4] == '?' else f[4].replace('_', ' ')
+                out.append(('HFR', float(f[1]), float(f[2]), int(f[3]), name, float(f[5]), f[7],
+                            f[8].replace('_', ' ').split('|') if len(f) > 8 else []))
+            elif f[0] == 'HSIG:':
+                out.append(('HSIG', float(f[1]), float(f[2]), 0, None, float(f[4]), '-', []))
+        except ValueError:
+            continue
+    return out
+
+
+def ham_name(norad, name, names):
+    """the catalog's name for a decoded satellite (falls back to gr-satellites' name)"""
+    return names.get(norad) or name
+
+
+def analyze_ham(stem, names):
+    """a 2 m / 70 cm capture: per identified satellite and pass, its frames' measured frequencies (its Doppler
+    curve) and callsigns; frames that can't be tied to one satellite are only counted"""
+    start, how = capture_start(stem)
+    src = frames_source(stem)
+    if src.endswith(storage.REDUCED):
+        meta, lines = storage.read_reduced(src)
+    else:
+        meta, lines = {}, open(src, errors='replace').read().splitlines()
+    fr = read_ham(lines)
+    iso = lambda t: datetime.datetime.fromtimestamp(t, UTC).isoformat(timespec='seconds')
+    span = (max(f[1] for f in fr) - min(f[1] for f in fr)) / 3600 if fr else 0
+    key = 'ham70' if os.path.basename(stem).startswith('ham70') else 'ham2m'
+    cap = {'capture': os.path.basename(stem), 'system': key, 'start_utc': iso(start.timestamp()), 'clock': how,
+           'hours': meta.get('hours', round(span, 3)),
+           'counts': meta.get('counts', dict(collections.Counter(f[0] for f in fr))),
+           'slots': [], 'positions': [], 'passes': [],
+           'unidentified': sum(1 for f in fr if f[0] == 'HFR' and not f[4])}
+    by_sat = collections.defaultdict(list)
+    for kind, t, hz, norad, name, snr, call, _ in fr:
+        if kind == 'HFR' and name:
+            by_sat[ham_name(norad, name, names), norad].append((t, hz, snr, call))
+    for (name, norad), hits in sorted(by_sat.items()):
+        hits.sort()
+        groups, cur = [], [hits[0]]
+        for h in hits[1:]:      # separate passes at gaps over 15 minutes
+            if h[0] - cur[-1][0] > 900:
+                groups.append(cur)
+                cur = []
+            cur.append(h)
+        groups.append(cur)
+        for g in groups:
+            cap['passes'].append({'name': name, 'norad': norad, 'first': iso(g[0][0]), 'last': iso(g[-1][0]),
+                                  'frames': len(g), 'best_snr': max(h[2] for h in g),
+                                  'callsigns': sorted({h[3] for h in g if h[3] != '-'}),
+                                  'doppler': [[round(h[0], 3), h[1]] for h in g]})
+    return cap
+
+
+GNSS_NAMES = {'G': 'GPS', 'E': 'Galileo', 'C': 'BeiDou', 'J': 'QZSS'}
+
+
+def gnss_name(sat):
+    """'G05' -> 'GPS G05', 'E11' -> 'Galileo E11', 'C23' -> 'BeiDou C23'"""
+    return '%s %s' % (GNSS_NAMES.get(sat[:1], 'GNSS'), sat)
+
+
+def gnss_catalog_names():
+    """'G22' / 'C06' -> the public catalog's name ('GPS BIIR-5  (PRN 22)', 'BEIDOU-2 IGSO-1 (C06)'), for the info
+    window. (Galileo's catalog names don't carry the PRN; those are matched by position instead.)"""
+    out = {}
+    try:
+        lines = open(tle_file('gnss')).read().splitlines()
+    except OSError:
+        return out
+    for i in range(len(lines) - 2):
+        n = lines[i].strip()
+        if not lines[i + 1].startswith('1 ') or '(' not in n:
+            continue
+        tag = n[n.rindex('(') + 1:].rstrip(')').strip()
+        if tag.startswith('PRN '):
+            out['G%02d' % int(tag[4:])] = n
+        elif tag[:1] == 'C' and tag[1:].isdigit():
+            out['C%02d' % int(tag[1:])] = n
+    return out
+
+
+def read_gnss(lines):
+    """GNSS receiver lines -> [(kind, unix t, fields)]
+       GCH: t sat sig cn0 doppler_hz lock_s    GEPH: t sat <$EPH fields>    GPOS: t lat lon height nsat"""
+    out = []
+    for line in lines:
+        f = line.split(None, 3)
+        if len(f) < 3 or f[0] not in ('GCH:', 'GEPH:', 'GPOS:'):
+            continue
+        try:
+            out.append((f[0][:-1], float(f[1]), line.split()[2:]))
+        except ValueError:
+            continue
+    return out
+
+
+def analyze_gnss(stem):
+    """a GNSS capture: per satellite and pass its Doppler curve and signal level, the newest broadcast
+    ephemeris of each satellite, and the position fixes"""
+    start, how = capture_start(stem)
+    src = frames_source(stem)
+    if src.endswith(storage.REDUCED):
+        meta, lines = storage.read_reduced(src)
+    else:
+        meta, lines = {}, open(src, errors='replace').read().splitlines()
+    rows = read_gnss(lines)
+    iso = lambda t: datetime.datetime.fromtimestamp(t, UTC).isoformat(timespec='seconds')
+    ts = [t for _, t, _ in rows]
+    cap = {'capture': os.path.basename(stem), 'system': 'gnss1', 'start_utc': iso(start.timestamp()), 'clock': how,
+           'hours': meta.get('hours', round((max(ts) - min(ts)) / 3600, 3) if ts else 0),
+           'counts': meta.get('counts', dict(collections.Counter(k for k, _, _ in rows))),
+           'slots': [], 'positions': [], 'passes': [], 'ephemerides': {}, 'gnss_fixes': []}
+    by_sat = collections.defaultdict(list)
+    for kind, t, f in rows:
+        if kind == 'GCH' and len(f) >= 4:
+            by_sat[f[0]].append((t, GNSS_L1 + float(f[3]), float(f[2])))
+        elif kind == 'GEPH' and len(f) >= 2:
+            cap['ephemerides'][f[0]] = [round(t, 3), ' '.join(f[1:])]
+        elif kind == 'GPOS' and len(f) >= 4:
+            cap['gnss_fixes'].append({'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
+                                      'nsat': int(f[3])})
+    for sat, hits in sorted(by_sat.items()):
+        hits.sort()
+        groups, cur = [], [hits[0]]
+        for h in hits[1:]:
+            if h[0] - cur[-1][0] > 900:
+                groups.append(cur)
+                cur = []
+            cur.append(h)
+        groups.append(cur)
+        for g in groups:
+            cap['passes'].append({'name': gnss_name(sat), 'sat': sat, 'first': iso(g[0][0]), 'last': iso(g[-1][0]),
+                                  'frames': len(g), 'best_snr': max(h[2] for h in g),
+                                  'doppler': [[round(h[0], 3), round(h[1], 1)] for h in g]})
+    return cap
+
+
+GNSS_L1 = 1575.42e6
+
+
 def frames_source(stem):
     """the decoded frames of a capture: full (.parsed / .live) or the reduced .frames.gz"""
     for ext in ('.parsed', '.live', storage.REDUCED):
@@ -219,7 +511,7 @@ def analyze(stem, sats):
     frames = read_frames(lines)
     at = lambda ms: start + datetime.timedelta(milliseconds=ms)
     iso = lambda t: t.isoformat(timespec='seconds')
-    cap = {'capture': os.path.basename(stem), 'start_utc': iso(start), 'clock': how,
+    cap = {'capture': os.path.basename(stem), 'system': 'iridium', 'start_utc': iso(start), 'clock': how,
            'hours': meta.get('hours', round(max([f[1] for f in frames] or [0]) / 3.6e6, 2)),
            'counts': meta.get('counts', dict(collections.Counter(f[0] for f in frames))), 'slots': [], 'positions': []}
     clock_errs = []
@@ -376,7 +668,7 @@ def main():
     data = json.load(open(DATA)) if os.path.exists(DATA) else {}
     if redo and data:     # captures whose files are gone keep their old results
         shutil.copy(DATA, DATA[:-5] + '.backup.json')
-    sats = load_tles()
+    sats = {s['key']: None for s in systems.ORDER}     # loaded when first needed
     recording = set()
     for name, files in sorted(storage.captures().items()):
         stem = os.path.join(paths.CAPTURES, name)
@@ -386,19 +678,34 @@ def main():
             continue
         if name in data and not redo:
             continue
+        live = stem + '.live'
+        if systems.of_capture(name) is not systems.IRIDIUM and name not in ready and os.path.exists(live) \
+                and time.time() - os.path.getmtime(live) < 20:
+            recording.add(name)
+            continue
         if not frames_source(stem) and os.path.exists(bits) and os.path.getsize(bits) >= 200:
             subprocess.run([sys.executable, PARSER, '--no-stats', bits], cwd=paths.CAPTURES, capture_output=True)
         src = frames_source(stem)
         if not src:
             continue
         print('analyzing %s ...' % name)
-        cap = analyze(stem, sats)
+        key = systems.of_capture(name)['key']
+        if systems.get(key).get('system') == 'ham':
+            load_tles(key)                  # refresh the name list
+            cap = analyze_ham(stem, norad_names())
+        elif systems.get(key).get('system') == 'gnss':
+            load_tles(key)
+            cap = analyze_gnss(stem)
+        else:
+            if sats[key] is None:
+                sats[key] = load_tles(key)
+            cap = analyze_orbcomm(stem, sats[key]) if key == 'orbcomm' else analyze(stem, sats[key])
         if not src.endswith(storage.REDUCED):
             storage.write_reduced(stem, src, cap['counts'], cap['hours'])
         data[name] = cap
     json.dump(data, open(DATA, 'w'), separators=(',', ':'))
-    caps = [c for _, c in sorted(data.items()) if sum(c['counts'].values())]
-    open(REPORT, 'w').write(build_report(caps))
+    caps = [c for _, c in sorted(data.items()) if sum(c['counts'].values()) and c.get('system', 'iridium') == 'iridium']
+    open(REPORT, 'w').write(build_report(caps))     # the text report covers Iridium
     print('catalog written to %s' % REPORT)
     n, freed = storage.enforce(set(data), protect=recording)
     if n:

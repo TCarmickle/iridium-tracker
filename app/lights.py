@@ -108,7 +108,7 @@ class SatelliteLightDelegate(QtWidgets.QStyledItemDelegate):
         style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, bg, p, option.widget)
         p.restore()
         super().paint(p, text_opt, index)
-        c, k = led_colour(GREEN, self.lights.last.get(index.data()), time.time())
+        c, k = led_colour(GREEN, self.lights.last.get(index.data(QtCore.Qt.UserRole) or index.data()), time.time())
         paint_led(p, led, c, k)
 
     def sizeHint(self, option, index):
