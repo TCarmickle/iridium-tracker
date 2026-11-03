@@ -3,8 +3,9 @@
 Centre = straight overhead, edge = the horizon, north at the top, east to the right (like a map).
   satellites  the ones above your horizon now (from our own orbits), named; a green ring = heard in the last
               minute, blue brackets = the one selected, whose pass across your sky is drawn as a path
-  big dots    position fixes (ring alerts), coloured by signal strength
-  small dots  other frames from identified satellites, placed with our own orbit for that satellite
+  big dots    positions the satellites reported (Iridium ring alerts, Orbcomm ephemeris), coloured by signal
+  small dots  everything else heard from identified satellites (frames, packets, GNSS tracking), placed with
+              our own orbit for that satellite
 Empty parts of the circle are directions or heights your antenna isn't hearing - blocked, or in its
 pattern's blind spot (a vertical whip, for instance, hears little straight up).
 """
@@ -159,12 +160,13 @@ class SkyPlot(QtWidgets.QWidget):
                 p.setPen(QtGui.QColor(TEXT))
                 p.drawText(QPointF(q.x() + 13, q.y() - 7), s['label'])
                 self.hits.append((q.x(), q.y(), s['name']))
-        # colour scale
-        x0, y0 = 12, h - 22
-        for i in range(100):
-            p.fillRect(QtCore.QRectF(x0 + i, y0, 1.2, 8), snr_colour(SNR_LO + (SNR_HI - SNR_LO) * i / 99))
-        p.setPen(QtGui.QColor(MUTED))
-        p.drawText(QPointF(x0, y0 - 4), 'fix signal  %.0f - %.0f dB' % (SNR_LO, SNR_HI))
+        # colour scale (for the reported positions, when there are any)
+        if self.show_heard and self.fixes:
+            x0, y0 = 12, h - 22
+            for i in range(100):
+                p.fillRect(QtCore.QRectF(x0 + i, y0, 1.2, 8), snr_colour(SNR_LO + (SNR_HI - SNR_LO) * i / 99))
+            p.setPen(QtGui.QColor(MUTED))
+            p.drawText(QPointF(x0, y0 - 4), 'reported position signal  %.0f - %.0f dB' % (SNR_LO, SNR_HI))
 
 
 def summary(fixes, frames):
@@ -179,7 +181,8 @@ def summary(fixes, frames):
     dead = [s for s in SECTORS if counts[s] < 0.02 * total]
     bands = [('overhead (60-90°)', els >= 60), ('high (30-60°)', (els >= 30) & (els < 60)),
              ('low (0-30°)', els < 30)]
-    lines = ['<b>%d position fixes</b> and <b>%d other frames</b> from identified satellites.' % (len(fixes), len(frames)),
+    lines = ['<b>%d reported positions</b> and <b>%d other receptions</b> from identified satellites.'
+             % (len(fixes), len(frames)),
              'By height: ' + ', '.join('%s %d%%' % (n, round(100 * m.mean())) for n, m in bands) + '.',
              'By direction: ' + ', '.join('%s %d%%' % (s, round(100 * counts[s] / total)) for s in SECTORS) + '.']
     if dead:
@@ -233,8 +236,9 @@ class SkyDialog(QtWidgets.QDialog):
         top.addStretch(1)
         note = QtWidgets.QLabel('<span style="color:%s">Centre = straight overhead, edge = horizon, north up, east right. '
                                 'Satellites: up now (click one to select it; green ring = heard in the last minute). '
-                                'Big dots: position fixes (colour = signal). Small dots: other frames from identified '
-                                'satellites. Move the antenna and watch the empty areas fill in.</span>' % MUTED)
+                                'Big dots: positions the satellites reported (colour = signal). Small dots: everything '
+                                'else heard from identified satellites. Move the antenna and watch the empty areas '
+                                'fill in.</span>' % MUTED)
         note.setWordWrap(True)
         self.up = QtWidgets.QTableWidget(0, 4)          # the satellites up now
         self.up.setHorizontalHeaderLabels(['Up now', 'Height', 'Direction', 'Heard'])
@@ -245,6 +249,8 @@ class SkyDialog(QtWidgets.QDialog):
         self.up.horizontalHeader().setStretchLastSection(True)
         self.up.setMinimumWidth(270)
         self.up.cellClicked.connect(lambda r, c: parent.select(self.up.item(r, 0).data(Qt.UserRole)))
+        self.up.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)    # (the selected satellite is coloured)
+        self.up.setFocusPolicy(Qt.NoFocus)
         mid = QtWidgets.QHBoxLayout()
         mid.addWidget(self.plot, 1)
         mid.addWidget(self.up)
@@ -275,6 +281,7 @@ class SkyDialog(QtWidgets.QDialog):
         tr = self.tracker
         sc = getattr(tr.map, 'scene', None) or {}
         import systems
+        import iridium_tracker as it
         sats = [dict(el=s['el'], az=s['az'], name=s['name'], selected=s['selected'], live=s['live'],
                      system=s['system'], label=systems.short_name(s['name']))
                 for s in sc.get('sats', []) if s['el'] > 0]
@@ -302,4 +309,7 @@ class SkyDialog(QtWidgets.QDialog):
                 f = item.font()
                 f.setBold(s['selected'])
                 item.setFont(f)
+                if s['selected']:           # the main list's selection colour
+                    item.setBackground(it.C_SELECTED_NAME)
+                    item.setForeground(QtGui.QColor('#ffffff'))
                 self.up.setItem(r, c, item)

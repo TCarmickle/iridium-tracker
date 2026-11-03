@@ -37,6 +37,7 @@ import data_dialog  # noqa: E402
 import lights  # noqa: E402
 import sdr_settings  # noqa: E402
 import source_dialog  # noqa: E402
+import settings_dialog  # noqa: E402  (location, data and storage)
 import spectrum  # noqa: E402
 import skyplot  # noqa: E402
 import globe  # noqa: E402
@@ -109,6 +110,11 @@ QSplitter::handle { background: %(BG)s; }
 QStatusBar { background: %(STATUS)s; color: %(MUTED)s; }
 QStatusBar QLabel { background: transparent; color: %(MUTED)s; }
 QToolTip { background: %(SURFACE)s; color: %(TEXT)s; border: 1px solid %(BORDER)s; padding: 4px; }
+QTabWidget::pane { border: 1px solid %(BORDER)s; border-radius: 6px; top: -1px; }
+QTabBar::tab { background: %(SURFACE)s; color: %(MUTED)s; border: 1px solid %(BORDER)s; padding: 6px 14px;
+               border-top-left-radius: 6px; border-top-right-radius: 6px; margin-right: 2px; }
+QTabBar::tab:selected { background: %(PANEL)s; color: %(TEXT)s; border-bottom: 2px solid %(ACCENT)s; }
+QTabBar::tab:hover:!selected { color: %(TEXT)s; }
 """
 
 
@@ -1021,7 +1027,7 @@ class MapView(QtWidgets.QWidget):
         self.hits = []
         self.drag = None
         self.picking = False
-        self.legend_open = True     # the map key; click it to fold / unfold
+        self.legend_open = bool(theme.load_ui().get('key_open', False))   # the map key: a chip, or open
         self.legend_rect = QtCore.QRectF()
 
     def set_picking(self, on):
@@ -1093,6 +1099,7 @@ class MapView(QtWidgets.QWidget):
     def mousePressEvent(self, e):
         if self.legend_rect.contains(QPointF(e.pos())):
             self.legend_open = not self.legend_open
+            theme.save_ui(key_open=self.legend_open)
             self.drag = None
             self.update()
             return
@@ -1352,21 +1359,23 @@ class MapView(QtWidgets.QWidget):
                 p.fillRect(QtCore.QRectF(x, y, step, y_bot - y), shade)
 
     def _draw_legend(self, p):
-        items = [('fix', 'Measured: position decoded by your antenna'),
-                 ('past', 'Predicted track, past (our own orbit fit)'),
-                 ('future', 'Predicted track, future'),
-                 ('sat', 'Predicted position (faded + dotted ring = uncertain)'),
-                 ('view', 'green body = above your horizon now'),
-                 ('live', 'green ring = your receiver heard it in the last minute'),
-                 ('select', 'blue brackets = the satellite you selected'),
-                 ('orbcomm', 'orange-edged = Orbcomm, green-edged = ISS / ham (others: Iridium)'),
-                 ('plane', 'Orbital plane (Iridium, our orbits), arrows = direction')]
+        items = [('fix', 'Position it reported'),
+                 ('past', 'Track: past'),
+                 ('future', 'Track: future'),
+                 ('plane', 'Orbital plane (Iridium)'),
+                 ('orbcomm', 'Panel edge: orange Orbcomm, green ham'),
+                 ('sat', 'Predicted (faded = uncertain)'),
+                 ('view', 'Green = above your horizon'),
+                 ('live', 'Ring = heard in the last minute'),
+                 ('select', 'Brackets = selected')]
         font = p.font()
         font.setPointSize(8)
         p.setFont(font)
         ink = theme.MAP_INK[self.map_theme]
         fm = p.fontMetrics()
-        h = 24 * len(items) + 12
+        rows = (len(items) + 1) // 2            # two columns
+        row_h = 20
+        h = row_h * rows + 30
         open_ = self.legend_open and self.height() > h + 90      # folds itself on a short map
         if not open_:
             r = QtCore.QRectF(10, self.height() - 52, fm.width('Key \u25b8') + 20, 24)
@@ -1377,17 +1386,18 @@ class MapView(QtWidgets.QWidget):
             p.setPen(QtGui.QColor(ink['text']))
             p.drawText(r, Qt.AlignCenter, 'Key \u25b8')
         else:
-            width = max(fm.width(t) for _, t in items) + 70
-            r = QtCore.QRectF(10, self.height() - h - 24, width, h)
+            col_w = max(fm.width(t) for _, t in items) + 44
+            r = QtCore.QRectF(10, self.height() - h - 24, 2 * col_w + 12, h)
             self.legend_rect = r
             p.setPen(QtGui.QPen(QtGui.QColor(*ink['box_edge'])))
             p.setBrush(QtGui.QColor(*ink['box']))
             p.drawRoundedRect(r, 8, 8)
             p.setPen(QtGui.QColor(ink['muted']))
-            p.drawText(QtCore.QRectF(r.right() - 22, r.top() + 2, 18, 14), Qt.AlignCenter, '\u2715')
+            p.drawText(QPointF(r.left() + 12, r.top() + 15), 'KEY')
+            p.drawText(QtCore.QRectF(r.right() - 22, r.top() + 2, 18, 16), Qt.AlignCenter, '\u2715')
         for k, (kind, text) in enumerate(items if open_ else []):
-            y = r.top() + 18 + 24 * k
-            x = r.left() + 20
+            y = r.top() + 32 + row_h * (k % rows)
+            x = r.left() + 22 + (k // rows) * (col_w + 6)
             if kind == 'fix':
                 p.setPen(QtGui.QPen(Qt.white, 1.5))
                 p.setBrush(C_FIX)
@@ -1396,24 +1406,24 @@ class MapView(QtWidgets.QWidget):
                 p.setPen(QtGui.QPen(C_PAST if kind == 'past' else C_FUTURE, 3))
                 p.drawLine(QPointF(x - 9, y), QPointF(x + 9, y))
             elif kind == 'sat':
-                draw_satellite(p, x, y, QtGui.QColor(120, 126, 138), 0.8)
+                draw_satellite(p, x, y, QtGui.QColor(120, 126, 138), 0.65)
             elif kind == 'orbcomm':
-                draw_satellite(p, x, y, QtGui.QColor(120, 126, 138), 0.8, 'orbcomm')
+                draw_satellite(p, x, y, QtGui.QColor(120, 126, 138), 0.65, 'orbcomm')
             elif kind == 'plane':
                 p.setPen(QtGui.QPen(QtGui.QColor(*PLANE_COLORS[1]), 2.5))
                 p.drawLine(QPointF(x - 9, y), QPointF(x + 9, y))
             elif kind == 'select':
-                draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.6)
-                draw_selection(p, x, y, 8.5)
+                draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.5)
+                draw_selection(p, x, y, 7.5)
             elif kind == 'live':
-                p.setPen(QtGui.QPen(QtGui.QColor(0, 200, 0), 2))
+                p.setPen(QtGui.QPen(QtGui.QColor(0, 200, 0), 1.6))
                 p.setBrush(Qt.NoBrush)
-                p.drawEllipse(QPointF(x, y), 8, 8)
-                draw_satellite(p, x, y, QtGui.QColor(120, 126, 138), 0.6)
+                p.drawEllipse(QPointF(x, y), 7.5, 7.5)
+                draw_satellite(p, x, y, QtGui.QColor(120, 126, 138), 0.5)
             else:
-                draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.8)
+                draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.65)
             p.setPen(QtGui.QColor(ink['text']))
-            p.drawText(QPointF(x + 24, y + 4), text)
+            p.drawText(QPointF(x + 16, y + 4), text)
         p.setPen(QtGui.QColor(ink['muted']))
         credit = '© OpenStreetMap contributors'
         p.drawText(QPointF(self.width() - p.fontMetrics().width(credit) - 8, self.height() - 6), credit)
@@ -1560,7 +1570,7 @@ class Timeline(QtWidgets.QWidget):
         # key
         x = 12
         for color, text, kind in ((QtGui.QColor(46, 160, 95), 'receiver running', 'bar'),
-                                  (QtGui.QColor(ALERT), 'position fix', 'tick'),
+                                  (QtGui.QColor(ALERT), 'reported position', 'tick'),
                                   (QtGui.QColor(ACCENT), 'now', 'tick')):
             y = h - 12
             if kind == 'bar':
@@ -1694,7 +1704,9 @@ class Tracker(QtWidgets.QMainWindow):
         self.fp_box = QtWidgets.QComboBox()
         self.fp_box.addItems(['Footprint: selected', 'Footprints: all in view', 'Footprints: none'])
         self.fix_box = QtWidgets.QComboBox()
-        self.fix_box.addItems(['My fixes: last hour (replay)', 'My fixes: all', 'My fixes: none'])
+        self.fix_box.addItems(['Reported positions: last hour', 'Reported positions: all', 'Reported positions: none'])
+        self.fix_box.setToolTip('Positions the satellites reported themselves and your antenna decoded\n'
+                                '(Iridium ring alerts, Orbcomm ephemeris packets) - red dots on the map')
         self.planes_box = QtWidgets.QComboBox()
         self.planes_box.addItems(['Planes: all', "Planes: selected satellite's", 'Planes: none'])
         self.night_chk = QtWidgets.QCheckBox('Day/night', self)      # (driven by the switch on the map)
@@ -1738,7 +1750,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.rx_system.setCurrentIndex(max(0, self.rx_system.findData(sdr_settings.load()['system'])))
         self.rx_system.currentIndexChanged.connect(self._rx_system_changed)
         self._rx_system_tip()
-        self.src_btn = QtWidgets.QPushButton('\u2699  Source')
+        self.src_btn = QtWidgets.QPushButton('\U0001F4E1  Source')
         self.src_btn.setToolTip('Choose the SDR and how it is tuned: sample rate, frequency, gain, PPM, bias-T...')
         self.src_btn.clicked.connect(self.show_source)
         self.spec_btn = QtWidgets.QPushButton('Spectrum')
@@ -1763,33 +1775,32 @@ class Tracker(QtWidgets.QMainWindow):
         theme.style(header, 'QFrame#hdr { background: %(PANEL)s; border: 1px solid %(BORDER)s; border-radius: 8px; }'
                             ' QFrame#hdr QLabel { background: transparent; }')
         header.setObjectName('hdr')
+        # the name on the left and every button together on the right; under them, the receiver's lights and
+        # status across the whole width
         hv = QtWidgets.QVBoxLayout(header)
         hv.setContentsMargins(12, 6, 8, 6)
         hv.setSpacing(4)
         hl = QtWidgets.QHBoxLayout()
         hv.addLayout(hl)
-        status_row = QtWidgets.QHBoxLayout()       # lights and the receiver's status, the full width
+        status_row = QtWidgets.QHBoxLayout()
         hv.addLayout(status_row)
         hl.addWidget(title)
-        hl.addSpacing(16)
+        hl.addStretch(1)
         hl.addWidget(self.rx_btn)
         hl.addWidget(self.rx_system)
         hl.addWidget(self.src_btn)
         hl.addWidget(self.spec_btn)
         hl.addWidget(self.sky_btn)
         hl.addWidget(self.globe_btn)
-        hl.addStretch(1)
+        hl.addSpacing(8)
         status_row.addWidget(self.rx_dot)
         status_row.addWidget(self.activity)
         status_row.addWidget(self.rx_status, 1)
-        self.loc_btn = QtWidgets.QPushButton()
-        self.loc_btn.setToolTip('Change or detect your antenna location')
-        self.loc_btn.clicked.connect(self.start_pick)
-        hl.addWidget(self.loc_btn)
-        self.data_btn = QtWidgets.QPushButton()
-        self.data_btn.setToolTip('How much space your data uses, storage limits and clean-up')
-        self.data_btn.clicked.connect(self.show_data)
-        hl.addWidget(self.data_btn)
+        # location and storage live in Settings now (these keep their texts for its tooltip)
+        self.loc_btn = QtWidgets.QPushButton(self)
+        self.loc_btn.hide()
+        self.data_btn = QtWidgets.QPushButton(self)
+        self.data_btn.hide()
         self.chime = sound.Chime(self)
         self.known_sats = None          # every satellite ever listed (set at the first poll): new ones chime
         self.chime_btn = QtWidgets.QPushButton('\U0001F514')
@@ -1806,6 +1817,10 @@ class Tracker(QtWidgets.QMainWindow):
         self.theme_btn.clicked.connect(lambda: self.set_app_theme('light' if theme.name == 'dark' else 'dark'))
         self._theme_btn_text()
         hl.addWidget(self.theme_btn)
+        self.settings_btn = QtWidgets.QPushButton('\u2699')
+        self.settings_btn.setStyleSheet('font-size: 15px; padding: 3px 10px;')
+        self.settings_btn.clicked.connect(lambda: self.show_settings(0))
+        hl.addWidget(self.settings_btn)
         self._show_location()
         self._receiver_running(False)
 
@@ -2200,6 +2215,12 @@ class Tracker(QtWidgets.QMainWindow):
     # ---- data
     def _show_data_size(self):
         self.data_btn.setText('\U0001F4BE  %s' % storage.fmt_bytes(storage.usage()['total']))
+        self._settings_tip()
+
+    def _settings_tip(self):
+        if hasattr(self, 'settings_btn'):
+            self.settings_btn.setToolTip('Settings\n  Location: %s\n  Data and storage: %s'
+                                         % (self.loc_btn.text()[2:].strip(), self.data_btn.text()[2:].strip()))
 
     def _housekeeping(self):
         """apply the storage limits at startup (raw recordings past their time, map cache size)"""
@@ -2212,8 +2233,13 @@ class Tracker(QtWidgets.QMainWindow):
         self._show_data_size()
 
     def show_data(self):
+        self.show_settings(1)
+
+    def show_settings(self, page=0):
+        """the Settings window: location (page 0), data and storage (page 1)"""
         protect = {'output-%s' % self.receiver.stamp} if self.receiver.busy else set()
-        data_dialog.DataDialog(self, protect).exec_()
+        home = (HOME_LAT, HOME_LON, HOME_H) if catalog.HOME else None
+        settings_dialog.SettingsDialog(self, home, protect, page).exec_()
         self._show_data_size()
 
     # ---- location
@@ -2222,6 +2248,7 @@ class Tracker(QtWidgets.QMainWindow):
             self.loc_btn.setText('\U0001F4CD  Set your location')
         else:
             self.loc_btn.setText('\U0001F4CD  %.4f, %.4f  \u00b7  %.0f m' % (HOME_LAT, HOME_LON, HOME_H * 1000))
+        self._settings_tip()
 
     def start_pick(self):
         """the next click on the map sets the antenna location"""
@@ -2478,7 +2505,7 @@ class Tracker(QtWidgets.QMainWindow):
                                                        '(old first-generation ones included)' % c[1]),
                      (orbit, 'with our own orbit', boxes[1][2]),
                      (heard, 'heard, no orbit yet', boxes[2][2]),
-                     (len(fixes), 'position fixes', 'positions from their ephemeris packets')]
+                     (len(fixes), 'reported positions', 'positions from their ephemeris packets')]
         elif want == 'ham':
             c = self._constellation('ham')['ham']
             boxes = [('%d/%d' % c, 'satellites heard', 'ISS and CubeSats identified by their decoded frames, of the '
@@ -2487,8 +2514,8 @@ class Tracker(QtWidgets.QMainWindow):
                      (heard, 'waiting for passes', 'need passes on more than one orbit'),
                      (sum(d.info[x].get('frames', 0) for x in names), 'frames decoded', 'frames that named their satellite')]
         else:
-            boxes.append((len(fixes), 'position fixes', 'positions the satellites reported (Iridium ring alerts, '
-                                                      'Orbcomm ephemeris)'))
+            boxes.append((len(fixes), 'reported positions', 'positions the satellites reported (Iridium ring alerts, '
+                                                          'Orbcomm ephemeris)'))
         for box, (v, cap, tip) in zip(self.stats, boxes):
             box.set(v, cap, tip)
         waiting = sorted(n for n, why in d.no_orbit.items() if 'direction' in why and self.shows(n))

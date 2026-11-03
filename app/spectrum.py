@@ -376,7 +376,7 @@ class SpectrumPanel(QtWidgets.QWidget):
         self.peak.toggled.connect(self._peak)
         self.sound = QtWidgets.QComboBox()
         self.sound.addItems(['\U0001F507 Sound off', '\U0001F50A Whole band', '\U0001F50A Tuned (click to tune)'])
-        self.sound.setToolTip('Hear the radio like SDR++: static, with a click or "zzt" for each burst.\n'
+        self.sound.setToolTip('Hear the radio like SDR++: static, with a click or "zzt" for each burst or packet.\n'
                               'Whole band: every burst the receiver hears. Tuned: one channel - click the spectrum '
                               'to choose it.\nNothing is decoded into speech.')
         self.volume = QtWidgets.QSlider(Qt.Horizontal)

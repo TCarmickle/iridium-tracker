@@ -54,10 +54,10 @@ class DataDialog(QtWidgets.QDialog):
         form.addRow('Map picture cache up to:', self.max_tiles)
         form.addRow('Stop receiving below:', self.min_free)
         note = QtWidgets.QLabel(
-            '<span style="color:#8b93a1">Raw recordings hold every burst the receiver heard, including other '
-            'people\'s voice and message bursts (never decoded). Once a capture is in the catalog only a small '
-            'file of ring alerts and time &amp; location frames is needed - it is always kept, so your catalog '
-            'can be rebuilt. The catalog itself is never deleted.</span>')
+            '<span style="color:#8b93a1">Raw recordings hold everything the receiver heard - for Iridium every '
+            'burst, including other people\'s voice and message bursts (never decoded). Once a capture is in the '
+            'catalog only a small file of what the tracker uses (positions, Doppler, orbits) is needed - it is '
+            'always kept, so your catalog can be rebuilt. The catalog itself is never deleted.</span>')
         note.setWordWrap(True)
         form.addRow(note)
         lay.addWidget(box)
@@ -83,7 +83,7 @@ class DataDialog(QtWidgets.QDialog):
         u = storage.usage()
         f = storage.fmt_bytes
         rows = [('Raw recordings', '%s (%d captures)' % (f(u['raw']), u['raw_captures'])),
-                ('Kept frames (ring alerts, time &amp; location)', f(u['reduced'])),
+                ('Kept lines (positions, Doppler, orbits)', f(u['reduced'])),
                 ('Catalog and settings', f(u['catalog'])),
                 ('Map picture cache', f(u['tiles'])),
                 ('<b>Total</b>', '<b>%s</b>' % f(u['total'])),

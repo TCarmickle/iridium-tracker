@@ -388,7 +388,8 @@ class SatInfoDialog(QtWidgets.QDialog):
         heard = QtWidgets.QWidget()
         hl = QtWidgets.QVBoxLayout(heard)
         self.heard_table = QtWidgets.QTableWidget(0, 6)
-        self.heard_table.setHorizontalHeaderLabels(['When', 'Length', 'Frames', 'Position fixes', 'Best fix signal', 'Highest heard'])
+        self.heard_table.setHorizontalHeaderLabels(['When', 'Length', 'Received', 'Reported positions',
+                                                    'Best position signal', 'Highest heard'])
         self.heard_table.verticalHeader().setVisible(False)
         self.heard_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         self.heard_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
@@ -662,8 +663,8 @@ class SatInfoDialog(QtWidgets.QDialog):
         if o is None:
             why = self.tracker.data.no_orbit.get(self.name, '')
             self.orbit_text.setHtml('<h3>No orbit of our own yet</h3><p>%s</p><p style="color:%s">Our orbits come only '
-                                    'from your own observations: position fixes from its ring alerts, and Doppler '
-                                    'curves. One more position fix usually does it.</p>'
+                                    'from your own observations: positions it reported (Iridium ring alerts, Orbcomm '
+                                    'ephemeris), its own broadcast orbit (GPS / Galileo), and Doppler curves.</p>'
                                     % ('Reason: %s.' % why if why else '', MUTED))
             return
         node, inc = o.plane_at(now)
