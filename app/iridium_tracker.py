@@ -1735,6 +1735,16 @@ class Tracker(QtWidgets.QMainWindow):
         self.data_btn.setToolTip('How much space your data uses, storage limits and clean-up')
         self.data_btn.clicked.connect(self.show_data)
         hl.addWidget(self.data_btn)
+        self.chime = sound.Chime(self)
+        self.known_sats = None          # every satellite ever listed (set at the first poll): new ones chime
+        self.chime_btn = QtWidgets.QPushButton('\U0001F514')
+        self.chime_btn.setCheckable(True)
+        self.chime_btn.setChecked(theme.load_ui().get('chime', True))
+        self.chime_btn.setToolTip('Chime when a satellite you have never heard before shows up\n'
+                                  '(it is also noted in the log under the list). Click to turn it off or on.')
+        self.chime_btn.toggled.connect(self._chime_toggled)
+        self._chime_toggled(self.chime_btn.isChecked(), save=False)
+        hl.addWidget(self.chime_btn)
         self.theme_btn = QtWidgets.QPushButton()      # the whole window: light or dark
         self.theme_btn.setToolTip('Switch the whole window between dark and light\n'
                                   '(the map has its own setting under it; plots stay dark like an instrument)')
@@ -1919,6 +1929,26 @@ class Tracker(QtWidgets.QMainWindow):
     def _globe_tile(self, z, x, y):
         """a map tile for the globe's Earth, in the map's theme"""
         return load_tile_rgb(z, x, y, self.map.map_theme)
+
+    # ---- the new-satellite chime
+    def _chime_toggled(self, on, save=True):
+        self.chime_btn.setText('🔔' if on else '🔕')
+        if save:
+            theme.save_ui(chime=on)
+
+    def _check_new_satellites(self):
+        """a satellite listed for the first time ever (not in the catalog when the tracker started, nor in the
+        capture it was receiving then): note it in the log and chime"""
+        listed = set(self.data.tracked + self.data.doppler_only)
+        if self.known_sats is None:         # the first look: everything there now was heard before
+            self.known_sats = listed
+            return
+        new = sorted(listed - self.known_sats)
+        self.known_sats |= listed
+        for n in new:
+            self.events.insertItem(0, '%s  NEW SATELLITE  %s - heard for the first time' % (fmt_clock(time.time()), n))
+        if new and self.chime_btn.isChecked():
+            self.chime.play()
 
     # ---- light / dark
     def _theme_btn_text(self):
@@ -2386,6 +2416,7 @@ class Tracker(QtWidgets.QMainWindow):
         before = (len(self.data.all_fixes()), len(self.data.info), self.data.cat_mtime, self.data.links_version)
         for ev in self.data.poll():
             self.events.insertItem(0, ev)
+        self._check_new_satellites()
         queue, self.data.frame_queue = self.data.frame_queue, []
         if queue and not self.receiver.busy:
             # another program is receiving (e.g. the Iridium Console): its frames arrive here in batches,

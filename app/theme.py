@@ -59,21 +59,31 @@ def _path():
     return os.path.join(paths.DATA, 'settings.json')
 
 
-def load():
-    """(window theme, map theme) saved last time - dark by default"""
+def load_ui():
+    """the window settings saved in settings.json ('ui': theme, map theme, chime...)"""
     try:
         ui = json.load(open(_path())).get('ui', {})
     except (OSError, ValueError, AttributeError):
         ui = {}
+    return ui if isinstance(ui, dict) else {}
+
+
+def save_ui(**values):
+    try:
+        allset = json.load(open(_path()))
+    except (OSError, ValueError):
+        allset = {}
+    allset['ui'] = dict(allset.get('ui', {}), **values)
+    os.makedirs(paths.DATA, exist_ok=True)
+    json.dump(allset, open(_path(), 'w'), indent=1)
+
+
+def load():
+    """(window theme, map theme) saved last time - dark by default"""
+    ui = load_ui()
     pick = lambda v: v if v in PALETTES else 'dark'     # noqa: E731
     return pick(ui.get('theme')), pick(ui.get('map_theme'))
 
 
 def save(theme, map_theme):
-    try:
-        allset = json.load(open(_path()))
-    except (OSError, ValueError):
-        allset = {}
-    allset['ui'] = dict(allset.get('ui', {}), theme=theme, map_theme=map_theme)
-    os.makedirs(paths.DATA, exist_ok=True)
-    json.dump(allset, open(_path(), 'w'), indent=1)
+    save_ui(theme=theme, map_theme=map_theme)

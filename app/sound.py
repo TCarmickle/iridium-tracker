@@ -260,3 +260,42 @@ class SoundPlayer(QtCore.QObject):
             del self.queue[:n]
         if not self.queue and self.out.bytesFree() >= self.out.bufferSize():
             self.primed = False                  # the speakers ran dry: build up a little again first
+
+
+# ---------------------------------------------------------------- the new-satellite chime
+CHIME_NOTES = ((880.0, 0.0), (1318.5, 0.13))     # A5 then E6 (a rising fifth), start times in s
+
+
+def make_chime(path):
+    """write the chime: two soft bell notes, a rising fifth (16-bit mono WAV)"""
+    import wave
+    n = int(RATE * 0.9)
+    t = np.arange(n) / RATE
+    x = np.zeros(n)
+    for f, t0 in CHIME_NOTES:
+        tt = np.clip(t - t0, 0, None)
+        env = np.where(t >= t0, (1 - np.exp(-tt / 0.004)) * np.exp(-tt / 0.22), 0.0)   # quick attack, ring out
+        x += env * (np.sin(2 * np.pi * f * tt) + 0.25 * np.sin(2 * np.pi * 2 * f * tt))
+    x *= 0.45 / np.abs(x).max()
+    with wave.open(path, 'wb') as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes((x * 32767).astype('<i2').tobytes())
+
+
+class Chime(QtCore.QObject):
+    """plays the chime (made once, kept in the data folder)"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        path = os.path.join(paths.DATA, 'new-satellite.wav')
+        if not os.path.exists(path):
+            os.makedirs(paths.DATA, exist_ok=True)
+            make_chime(path)
+        self.effect = QtMultimedia.QSoundEffect(self)
+        self.effect.setSource(QtCore.QUrl.fromLocalFile(path))
+        self.effect.setVolume(0.8)
+
+    def play(self):
+        self.effect.play()
