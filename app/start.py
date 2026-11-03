@@ -1,4 +1,4 @@
-"""Iridium Tracker entry point. On the first run the tracker opens in "click your location" mode."""
+"""Satellite Tracker entry point. On the first run the tracker opens in "click your location" mode."""
 import os
 import sys
 

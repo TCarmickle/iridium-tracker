@@ -1,17 +1,18 @@
-IRIDIUM TRACKER
-===============
+SATELLITE TRACKER
+=================
 
-A map of the Iridium satellites YOUR antenna hears. The receiver decodes the satellites'
-ring alerts (each one carries the satellite's own position) and their Doppler shifts, and
-the tracker fits every orbit from those observations alone - no downloaded orbit data is
-used for positions. Satellites appear once they have sent you a position fix.
+A map of the satellites YOUR antenna hears, with an RTL-SDR: Iridium (1.6 GHz), ORBCOMM
+(137 MHz), the ISS and amateur (ham) CubeSats on 2 m and 70 cm, and the GPS and Galileo
+navigation satellites with a GPS antenna (see "SYSTEMS" and "GNSS" below). Every position and
+orbit comes from what you receive - no downloaded orbit data is used for positions.
 
-It also receives ORBCOMM satellites (137 MHz), which send their own position too, the
-ISS and amateur (ham) CubeSats on 2 m and 70 cm, and the GPS and Galileo navigation satellites
-with a GPS antenna (see "SYSTEMS" and "GNSS" below). The map, list, globe and sky plot show
-every system together, with a Systems filter to show just one.
+Iridium satellites send ring alerts that carry their own position; with their Doppler shifts
+the tracker fits every orbit from those observations alone. Orbcomm satellites send their
+position too, and GPS / Galileo satellites broadcast their own orbit. The map, list, globe and
+sky plot show every system together, with a Systems filter to show just one.
 
-Everything is in this folder: the decoder (gr-iridium + iridium-toolkit), Python, and the app.
+Everything is in this folder: the decoders (gr-iridium, iridium-toolkit, gr-satellites,
+PocketSDR), Python, and the app.
 Nothing is installed on the computer.
 
 
@@ -45,7 +46,7 @@ STARTING
 --------
 1. Keep this whole folder somewhere you can write to (Desktop, Documents...),
    NOT in "Program Files". Captures and the catalog are saved inside it.
-2. Double-click "Iridium Tracker.bat".
+2. Double-click "Satellite Tracker.bat".
 3. The first time, the map asks you to CLICK YOUR ANTENNA'S LOCATION. Zoom in with the mouse
    wheel (drag to move) and click your house; the height there is looked up automatically
    (the point is sent to open-meteo.com). "Type coordinates..." lets you enter it instead.

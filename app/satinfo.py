@@ -90,12 +90,39 @@ BLOCK_FACTS = [
     ('Constellation', '66 working satellites in 6 polar planes of 11, plus in-orbit spares'),
 ]
 
+GPS_FACTS = [
+    ('What it does', 'Navigation: it broadcasts its own precise time and orbit, so a receiver that hears four or more '
+                     'satellites can work out where it is'),
+    ('Signal you receive', 'L1 C/A at 1575.42 MHz, about 20 dB under the noise - found by correlating with this '
+                           'satellite\'s own code (its PRN number). Its broadcast orbit (ephemeris) comes every 30 s'),
+    ('Constellation', 'about 31 working satellites in 6 orbital planes at 20,200 km, inclined 55 degrees, '
+                      'once around every 11 h 58 min (twice a day): the same ground track every day'),
+    ('Operator', 'US Space Force'),
+]
+GPS_BLOCKS = {
+    'BIIR': 'Block IIR (launched 1997-2004, built by Lockheed Martin)',
+    'BIIRM': 'Block IIR-M (launched 2005-2009, Lockheed Martin) - added the civil L2C signal',
+    'BIIF': 'Block IIF (launched 2010-2016, built by Boeing) - added the L5 signal',
+    'BIII': 'GPS III (launched from 2018, built by Lockheed Martin) - adds the L1C signal shared with Galileo',
+}
+GALILEO_FACTS = [
+    ('What it does', 'Europe\'s navigation system: like GPS it broadcasts its own time and orbit, and receivers use '
+                     'both together'),
+    ('Signal you receive', 'E1 at 1575.42 MHz - the same frequency as GPS L1, with its own code per satellite '
+                           '(E1-B). Its broadcast orbit (I/NAV) comes every 30 s'),
+    ('Constellation', 'about 27 working satellites in 3 orbital planes at 23,200 km, inclined 56 degrees, once '
+                      'around every 14 h 05 min'),
+    ('Builder', 'OHB System (most), with Surrey Satellite Technology; the first four by Airbus / Thales Alenia'),
+    ('Operator', 'European Union (EUSPA)'),
+]
+
 DOPPLER_HELP = (
     '<b>What is a Doppler curve?</b> As the satellite comes towards you its signal arrives a little higher '
     'in frequency; as it goes away, a little lower. Plotting that shift over a pass gives an S-shaped curve. '
     'It crosses zero at the moment of <b>closest approach</b>. A pass nearly overhead gives a steep S '
     '(the shift flips quickly); a distant, low pass gives a gentle one. At 1626 MHz the shift can reach '
-    'about &plusmn;36 kHz (Iridium); at 137 MHz about &plusmn;3 kHz (Orbcomm). Every satellite\'s pass over you has its own curve, so matching the measured '
+    'about &plusmn;36 kHz (Iridium); at 137 MHz about &plusmn;3 kHz (Orbcomm); GPS and Galileo, much higher and '
+    'slower, only about &plusmn;4-5 kHz at 1575 MHz, over hours. Every satellite\'s pass over you has its own curve, so matching the measured '
     'points to the predicted curves identifies which satellite you heard - and the curves also help fit '
     'our own orbit.')
 
@@ -167,7 +194,7 @@ def analyze_curve(pts, name, sats, orbit, home_xyz, system=systems.IRIDIUM):
     line_t = np.linspace(t0 - 60, t1 + 60, 160)
     if sat is not None:
         best = None
-        for sh in range(-20, 21, 2):            # the capture clock may be off by a few seconds
+        for sh in ([0] if system is systems.GNSS else range(-20, 21, 2)):   # the capture clock may be off a few s
             pred = catalog_shift(sat, sub[:, 0], sh, carrier)[0]
             d = sub[:, 1] - pred
             rms = float(np.sqrt(np.mean((d - d.mean()) ** 2)))
@@ -401,25 +428,37 @@ class SatInfoDialog(QtWidgets.QDialog):
         self.info = d.info.get(name, {'fixes': 0, 'net_ids': set(), 'slots': set(), 'last': 0, 'best': 0, 'how': set()})
         self.system = systems.of_name(name)
         self.records = tle_records(self.system['key'])
-        self.tle = self.records.get(name)
+        self.orbit = d.orbits.get(name)
+        # GNSS: our name ('GPS G06') is not the catalog's ('GPS BIIF-6  (PRN 06)')
+        self.cat_name = (d.gnss_catalog_name(name) if self.system is systems.GNSS else name) or name
+        self.tle = self.records.get(self.cat_name)
         self.sats = d.tles(self.system['key'])
         self.orbit = d.orbits.get(name)
         how = ' + '.join(sorted(self.info['how'])) or 'not identified'
         self.title.setText('<span style="font-size:15pt; font-weight:600">%s</span>'
                            '&nbsp;&nbsp;<span style="color:%s">%s &middot; identified by %s</span>'
-                           % (name, MUTED, self.block(), how.replace('position', 'position fix')))
+                           % (name, MUTED, self.block(), how.replace('position', 'position fix')
+                              .replace('tracked', 'its own ranging code')))
         self._fill_about()
         self._fill_doppler()
         self._fill_heard()
         self._fill_orbit()
 
     def block(self):
+        if self.system is systems.GNSS:
+            if self.name.startswith('Galileo'):
+                return 'Galileo'
+            return 'GPS ' + GPS_BLOCKS.get(self._gps_block(), 'satellite').split(' (')[0]
         if self.system is systems.HAM:
             return 'International Space Station' if self.name.startswith('ISS') else 'Amateur satellite'
         if self.system is systems.ORBCOMM:
             num = int(''.join(ch for ch in self.name if ch.isdigit()) or 0)
             return 'Orbcomm OG2' if num >= 100 else 'Orbcomm OG1'
         return 'Iridium NEXT'
+
+    def _gps_block(self):
+        """'BIIF' from the catalog name 'GPS BIIF-6  (PRN 06)'"""
+        return self.cat_name.split()[1].split('-')[0] if self.cat_name.startswith('GPS ') else ''
 
     def _fill_about(self):
         i, name = self.info, self.name
@@ -430,8 +469,9 @@ class SatInfoDialog(QtWidgets.QDialog):
             rows.append(('NORAD number', l1[2:7].strip()))
             century = '19' if int(l1[9:11]) > 56 else '20'
             rows.append(('International ID', '%s-%s%s' % ((century + l1[9:11]), l1[11:14], l1[14:17].strip())))
-            lau = launch_of(self.records, l1, self.system['key']) if self.system is not systems.HAM else None
-            if self.system is systems.HAM and not self.name.startswith('ISS'):
+            lau = launch_of(self.records, l1, self.system['key']) \
+                if self.system not in (systems.HAM, systems.GNSS) else None
+            if (self.system is systems.HAM and not self.name.startswith('ISS')) or self.system is systems.GNSS:
                 rows.append(('Launched', 'in %s%s (launch %s of that year)' % (century, l1[9:11], l1[11:14].lstrip('0'))))
             if lau:
                 rows.append(('Launched', '<b>%s</b> on the %s mission (%s) - piece %s of that launch'
@@ -446,6 +486,15 @@ class SatInfoDialog(QtWidgets.QDialog):
             rows.append(('Catalog', 'not in the downloaded public catalog'))
         if self.system is systems.HAM:
             rows += ISS_FACTS if self.name.startswith('ISS') else HAM_FACTS
+        elif self.system is systems.GNSS:
+            if self.name.startswith('Galileo'):
+                rows += GALILEO_FACTS
+            else:
+                if self._gps_block() in GPS_BLOCKS:
+                    rows.append(('Block', GPS_BLOCKS[self._gps_block()]))
+                rows += GPS_FACTS
+            if self.tle:
+                rows.insert(0, ('Catalog name', self.cat_name))
         else:
             rows += (ORBCOMM_FACTS if self.block() == 'Orbcomm OG2' else ORBCOMM_OG1_FACTS) if orbcomm else BLOCK_FACTS
         if self.tle:
@@ -454,7 +503,17 @@ class SatInfoDialog(QtWidgets.QDialog):
             a = (catalog.MU / (n * 2 * math.pi / 86400) ** 2) ** (1 / 3)
             rows.append(('Orbit (catalog)', '%.0f km up, inclined %.1f&deg;, once around every %.1f min (%.1f orbits a day)'
                          % (a - 6371.0, float(l2[8:16]), 1440 / n, n)))
-        if self.system is systems.HAM:
+        if self.system is systems.GNSS:
+            oi = self.orbit.info if self.orbit is not None else {}
+            mine = [('How identified', 'tracked on its own ranging code - the code is the satellite\'s PRN number, '
+                                       'so the name is certain'),
+                    ('Seconds tracked', str(i.get('frames', 0))),
+                    ('Broadcast orbit', 'decoded (reference time %s)' % self.tracker_fmt(oi['toe']) if oi.get('toe')
+                     else 'not decoded yet - needs about 30 s of steady tracking'),
+                    ('Doppler curves', str(len(self.curves_for()))),
+                    ('Last heard', self.tracker_fmt(i['last']) if i['last'] else '-'),
+                    ('Best signal', '%.1f dB-Hz' % i['best'] if i['best'] else '-')]
+        elif self.system is systems.HAM:
             ids = [('How identified', 'frames decoded with its own decoder (it is the only satellite with that '
                                       'frequency and signal)' if not name.startswith('ISS') else
                     'APRS packets the ISS digipeater repeated (RS0ISS / NA1SS in the path)'),
@@ -470,7 +529,8 @@ class SatInfoDialog(QtWidgets.QDialog):
                     if len(i['how']) == 1 else 'position fixes and Doppler curve both matched it' if i['how'] else '-'),
                    ('Plane / slot', ', '.join('plane %d, slot %d' % ps for ps in sorted(i['slots'])) or 'not heard yet'),
                    ('Network ID', ', '.join('%03d' % x for x in sorted(i['net_ids'])) or '-')]
-        mine = ids + [
+        if self.system is not systems.GNSS:
+            mine = ids + [
                 ('Position fixes', str(i['fixes'])),
                 ('Doppler curves', str(len(self.curves_for()))),
                 ('Last heard', self.tracker_fmt(i['last']) if i['last'] else '-'),
@@ -488,7 +548,8 @@ class SatInfoDialog(QtWidgets.QDialog):
         """[(kind, [(t, Hz)])] measured for this satellite"""
         d, name = self.tracker.data, self.name
         if self.system is not systems.IRIDIUM:      # Orbcomm packets / ham frames: every one's frequency
-            out = [('packets' if self.system is systems.ORBCOMM else 'frames', list(g))
+            kind = {'orbcomm': 'packets', 'gnss': 'tracking'}.get(self.system['key'], 'frames')
+            out = [(kind, list(g))
                    for g in d.doppler.get(name, []) if len(g) >= 2]
             return sorted(out, key=lambda c: -max(t for t, _ in c[1]))
         out = [('time & location frames', list(g)) for g in d.doppler.get(name, []) if len(g) >= 2]
@@ -520,7 +581,7 @@ class SatInfoDialog(QtWidgets.QDialog):
             QtWidgets.QApplication.setOverrideCursor(Qt.WaitCursor)
             try:
                 import iridium_tracker as it
-                self.dop_cache[idx] = analyze_curve(self.curves[idx][1], self.name, self.sats, self.orbit, it._HOME_XYZ,
+                self.dop_cache[idx] = analyze_curve(self.curves[idx][1], self.cat_name, self.sats, self.orbit, it._HOME_XYZ,
                                                     self.system)
             finally:
                 QtWidgets.QApplication.restoreOverrideCursor()
@@ -540,8 +601,8 @@ class SatInfoDialog(QtWidgets.QDialog):
                          '(any curve fits 2 points).</span>' % (MUTED, len(y)))
         elif 'rms' in r:
             rank = r.get('ranking') or []
-            others = [(rms, n) for rms, n in rank if n != self.name]
-            txt = 'Matches the public catalog\'s curve for %s to within <b>%.0f Hz</b> rms' % (self.name, r['rms'])
+            others = [(rms, n) for rms, n in rank if n != self.cat_name]
+            txt = 'Matches the public catalog\'s curve for %s to within <b>%.0f Hz</b> rms' % (self.cat_name, r['rms'])
             if others:
                 txt += ' - the next-best satellite, %s, is off by %.0f Hz (%.1f&times; worse)' % (
                     others[0][1], others[0][0], others[0][0] / max(r['rms'], 1))
@@ -554,7 +615,7 @@ class SatInfoDialog(QtWidgets.QDialog):
 
     def _fill_heard(self):
         d, name = self.tracker.data, self.name
-        obs = [(t, 'frame', None) for kind, g in self.curves if kind in ('time & location frames', 'packets', 'frames')
+        obs = [(t, 'frame', None) for kind, g in self.curves if kind in ('time & location frames', 'packets', 'frames', 'tracking')
                for t, _ in g]
         fixes = [f for f in d.all_fixes() if f['name'] == name]
         obs += [(f['t'], 'fix', f) for f in fixes]
@@ -609,6 +670,9 @@ class SatInfoDialog(QtWidgets.QDialog):
         a = o.p[4]
         oi = o.info
         np_ = self.tracker.next_pass(self.name)
+        if oi.get('ephemeris'):
+            self._fill_orbit_gnss(o, now, inc, a, np_)
+            return
         rows = [('Height', '%.0f km' % (a - 6371.0)),
                 ('Inclination', '%.2f&deg;' % math.degrees(inc)),
                 ('Period', '%.2f min' % o.period_min),
@@ -624,7 +688,7 @@ class SatInfoDialog(QtWidgets.QDialog):
                  'now (up to %.0f&deg;)' % np_[2] if np_[3] else
                  '%s, up to %.0f&deg;' % (it.fmt_time(np_[0]), np_[2]))]
         comp = []
-        sat = next((s for s in self.sats if s.name == self.name), None)
+        sat = next((s for s in self.sats if s.name == self.cat_name), None)
         if sat is not None:
             X = np.array(sat.ecef(utc(now)))
             diff = float(np.linalg.norm(o.ecef(now)[0] - X))
@@ -638,6 +702,35 @@ class SatInfoDialog(QtWidgets.QDialog):
                                 '<p style="color:%s">A circular orbit with the Earth\'s flattening (J2) taken into '
                                 'account, fitted to your fixes and Doppler curves. The catalog is only used here as a '
                                 'check.</p>' % (_facts(rows), _facts(comp) if comp else '<p>Not in the catalog.</p>', MUTED))
+
+    def _fill_orbit_gnss(self, o, now, inc, a, np_):
+        """a GNSS satellite's orbit: its own broadcast ephemeris, checked against the public catalog"""
+        import iridium_tracker as it
+        oi, e = o.info, o.eph
+        rows = [('Source', 'its own broadcast orbit (ephemeris), decoded from its signal by PocketSDR'),
+                ('Height', '%.0f km' % (a - 6371.0)),
+                ('Inclination', '%.2f&deg;' % math.degrees(inc)),
+                ('Eccentricity', '%.4f' % e['e']),
+                ('Period', '%.2f min' % o.period_min),
+                ('Reference time', '%s (good to a few metres for about 2 hours either side)' % it.fmt_time(oi['toe'])),
+                ('Received', it.fmt_time(oi['last_obs'])),
+                ('Health', 'OK' if not oi.get('health') else 'marked unhealthy by the satellite'),
+                ('Uncertainty now', '%s (at %s)' % (it.fmt_sigma(float(o.sigma_km(now)[0])), it.fmt_time(now))),
+                ('Next pass', 'not within the time our orbit is good for' if np_ is None else
+                 'now (up to %.0f&deg;)' % np_[2] if np_[3] else '%s, up to %.0f&deg;' % (it.fmt_time(np_[0]), np_[2]))]
+        comp = []
+        sat = next((s for s in self.sats if s.name == self.cat_name), None)
+        if sat is not None:
+            diff = float(np.linalg.norm(o.ecef(now)[0] - np.array(sat.ecef(utc(now)))))
+            comp = [('Where it is now', 'its broadcast orbit and the public catalog differ by <b>%.1f km</b> - the '
+                                        'catalog\'s own error at this height is typically a few to tens of km' % diff),
+                    ('Catalog inclination', '%.2f&deg;' % math.degrees(sat.i)),
+                    ('Catalog period', '%.2f min' % (2 * math.pi / sat.n / 60))]
+        self.orbit_text.setHtml('<h3>Its orbit (as the satellite itself broadcasts it)</h3>%s'
+                                '<h3>Compared with the public catalog</h3>%s'
+                                '<p style="color:%s">The broadcast orbit is what every GPS / Galileo receiver uses '
+                                'to work out its position. The catalog is only used here as a check.</p>'
+                                % (_facts(rows), _facts(comp) if comp else '<p>Not matched to the catalog.</p>', MUTED))
 
 
 def _dur(s):

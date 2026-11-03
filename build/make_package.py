@@ -1,4 +1,4 @@
-"""Make the shareable zip: dist\\IridiumTracker.zip (everything needed to run, no personal data).
+"""Make the shareable zip: dist\\SatelliteTracker.zip (everything needed to run, no personal data).
 
 Usage:  python build\\make_package.py
 Needs the python folder (build_runtime.py) and LICENSES\\third-party (collect_licenses.py).
@@ -9,8 +9,8 @@ import sys
 import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUT = os.path.join(ROOT, 'dist', 'IridiumTracker.zip')
-INCLUDE = ['Iridium Tracker.bat', 'Iridium Console.bat', 'README.txt', 'LICENSES', 'app', 'python']
+OUT = os.path.join(ROOT, 'dist', 'SatelliteTracker.zip')
+INCLUDE = ['Satellite Tracker.bat', 'Iridium Console.bat', 'README.txt', 'LICENSES', 'app', 'python']
 # never shipped: your location, captures, catalog, map cache, logs
 EXCLUDE = ['app/settings.json', 'app/output*', 'app/catalog-data*.json', 'app/catalog.txt',
            'app/iridium-names.tle', 'app/tiles/*', 'app/tracker-error.log', 'app/pocketsdr/.pocket_navdata.csv', '*/__pycache__/*', '*.pyc']
@@ -35,7 +35,7 @@ def main():
             for f in files:
                 rel = os.path.relpath(f, ROOT)
                 if not excluded(rel):
-                    z.write(f, 'IridiumTracker/' + rel.replace(os.sep, '/'))
+                    z.write(f, 'SatelliteTracker/' + rel.replace(os.sep, '/'))
                     n += 1
     print('%s: %d files, %.0f MB' % (OUT, n, os.path.getsize(OUT) / 2 ** 20))
 

@@ -1,4 +1,4 @@
-# Iridium Tracker
+# Satellite Tracker
 
 A Windows app that maps the Iridium, Orbcomm, GPS and Galileo satellites **your own antenna** hears - and
 logs the ISS and ham CubeSats it hears - using an RTL-SDR.
@@ -60,9 +60,9 @@ everything received is shown together, with a **Systems** filter.
 - The WinUSB driver for the SDR, installed once with [Zadig](https://zadig.akeo.ie)
 
 ## Getting started
-1. Build the package (see [BUILDING.md](BUILDING.md)) or get `IridiumTracker.zip` from someone who did,
+1. Build the package (see [BUILDING.md](BUILDING.md)) or get `SatelliteTracker.zip` from someone who did,
    and unzip it somewhere you can write to (not *Program Files*).
-2. Double-click **`Iridium Tracker.bat`**.
+2. Double-click **`Satellite Tracker.bat`**.
 3. Click your antenna's location on the map (zoom in first for a precise spot).
 4. Press **Start receiver**. Give it 30-60 minutes outdoors; press **Stop receiver** when done.
 

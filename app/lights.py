@@ -34,8 +34,8 @@ class ActivityLights(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setFixedSize(84, 30)
-        self.setToolTip('Flashes for every burst the receiver hears:\n'
-                        'green (top) = message decoded\nred (bottom) = damaged burst, could not be decoded')
+        self.setToolTip('Flashes for everything the receiver hears (Iridium bursts, Orbcomm packets, ham frames,\n'
+                        'GNSS tracking results):\ngreen (top) = decoded\nred (bottom) = damaged, could not be decoded')
         self.last = {'ok': 0.0, 'bad': 0.0}
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._tick)

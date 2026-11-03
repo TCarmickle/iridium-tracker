@@ -1,4 +1,4 @@
-r"""Where Iridium Tracker keeps your data: a data folder next to the app folder, so updating or
+r"""Where Satellite Tracker keeps your data: a data folder next to the app folder, so updating or
 replacing the program never touches it.
 
   data\settings.json        antenna location and storage limits

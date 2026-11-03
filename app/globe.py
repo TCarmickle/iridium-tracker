@@ -25,7 +25,7 @@ R_EARTH = 6371.0
 TEX_W, TEX_H = 2048, 1024       # equirectangular Earth texture
 TILE_Z = 3                      # map tiles used for it (8 x 8 tiles = 2048 px)
 FOV_DEG = 40.0                  # camera field of view across the window's shorter side
-DIST_MIN, DIST_MAX = 0.12, 12.0  # camera distance from the point it looks at, Earth radii
+DIST_MIN, DIST_MAX = 0.12, 30.0  # camera distance from the point it looks at, Earth radii (30: GPS shell small in view)
 TILT_MAX = 85.0
 ORBIT_R = (R_EARTH + 781.0) / R_EARTH
 # dist/tilt/heading of the camera, and how high the point it looks at is (Earth radii from the centre)

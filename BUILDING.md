@@ -1,4 +1,4 @@
-# Building Iridium Tracker
+# Building Satellite Tracker
 
 The repository holds the source. The ~550 MB Python runtime (`python\`) and the zip are built,
 not committed. You need conda or mamba ([radioconda](https://github.com/ryanvolz/radioconda) or
@@ -27,11 +27,11 @@ Copies each bundled package's license texts from conda's package cache into
 ```bat
 python build\make_package.py
 ```
-Writes `dist\IridiumTracker.zip` (~200 MB). It never includes the `data` folder (your
+Writes `dist\SatelliteTracker.zip` (~200 MB). It never includes the `data` folder (your
 location, captures, catalog, map cache).
 
 ## Running from source
-`Iridium Tracker.bat` runs `app\start.py` with the runtime in `python\`. To develop with another
+`Satellite Tracker.bat` runs `app\start.py` with the runtime in `python\`. To develop with another
 conda environment that has the packages in `environment.yml`: `python app\start.py`.
 
 ## Layout

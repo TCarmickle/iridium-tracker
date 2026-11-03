@@ -1,4 +1,4 @@
-"""The "Data" panel: how much space Iridium Tracker uses, the limits, and clean-up."""
+"""The "Data" panel: how much space Satellite Tracker uses, the limits, and clean-up."""
 import json
 import os
 

@@ -1,4 +1,4 @@
-"""Keeping Iridium Tracker's data small.
+"""Keeping Satellite Tracker's data small.
 
 Each receiver run makes a set of capture files in data\\captures:
   output-<stamp>.bits        raw bursts from the decoder (every burst, including voice and messaging)
