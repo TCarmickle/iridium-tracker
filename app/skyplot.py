@@ -81,8 +81,7 @@ class SkyPlot(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, e):
         best = min(((abs(x - e.x()) + abs(y - e.y()), n) for x, y, n in self.hits), default=None)
-        if best and best[0] < 18:
-            self.satelliteClicked.emit(best[1])
+        self.satelliteClicked.emit(best[1] if best and best[0] < 18 else '')     # ('': empty space - deselect)
 
     def _xy(self, el, az, cx, cy, R):
         r = (90 - max(0.0, el)) / 90 * R

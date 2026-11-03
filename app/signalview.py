@@ -35,6 +35,7 @@ class SignalBars(QtWidgets.QWidget):
             if rect.contains(QPointF(e.pos())):
                 self.satelliteClicked.emit(name)
                 return
+        self.satelliteClicked.emit('')          # empty space: deselect
 
     def paintEvent(self, _):
         import iridium_tracker as it

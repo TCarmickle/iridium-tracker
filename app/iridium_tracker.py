@@ -1210,10 +1210,9 @@ class MapView(QtWidgets.QWidget):
         if self.drag and not self.drag[3] and self.picking and e.button() == Qt.LeftButton:
             lon, lat = self.lonlat_at(e.pos())
             self.locationPicked.emit(lat, lon)
-        elif self.drag and not self.drag[3]:
+        elif self.drag and not self.drag[3] and not self.legend_rect.contains(QPointF(e.pos())):
             hit = self._hit(e.pos())
-            if hit and hit[0]:
-                self.satelliteClicked.emit(hit[0])
+            self.satelliteClicked.emit(hit[0] if hit and hit[0] else '')    # ('': empty space - deselect)
         self.drag = None
 
     def _hit(self, pos):
@@ -2020,8 +2019,10 @@ class Tracker(QtWidgets.QMainWindow):
         b1.clicked.connect(self.center_selected)
         b2 = QtWidgets.QPushButton('Jump to next pass')
         b2.clicked.connect(self.jump_next_pass)
-        b3 = QtWidgets.QPushButton('Clear')
+        b3 = QtWidgets.QPushButton('Deselect')
+        b3.setToolTip('Deselect the satellite (or click empty space on the map, globe or sky, or press Esc)')
         b3.clicked.connect(lambda: self.select(None))
+        QtWidgets.QShortcut(QtGui.QKeySequence(Qt.Key_Escape), self, activated=lambda: self.select(None))
         for b in (b1, b2, b3):
             btns.addWidget(b)
         self.events = QtWidgets.QListWidget()
@@ -2128,8 +2129,17 @@ class Tracker(QtWidgets.QMainWindow):
             mt.setText('\u2600  Light map' if self.map_theme_box.currentData() == 'dark' else '\u263e  Dark map')
         label()
         self.map_theme_box.currentIndexChanged.connect(label)
+        cov = QtWidgets.QPushButton('\u25ce  Coverage')
+        cov.setCheckable(True)
+        cov.setToolTip('Show or hide the coverage area - the ground that can see the satellite\n'
+                       '(the selected one, or every one in view: the Footprint box above the map)')
+        cov.setChecked(self.fp_box.currentIndex() != 2)
+        cov.toggled.connect(self._coverage_switch)
+        self.fp_box.currentIndexChanged.connect(lambda i: (cov.blockSignals(True), cov.setChecked(i != 2),
+                                                           cov.blockSignals(False)))
         lay.addWidget(mt)
         lay.addWidget(dn)
+        lay.addWidget(cov)
         box.adjustSize()
         return box, mt, dn
 
@@ -2182,6 +2192,15 @@ class Tracker(QtWidgets.QMainWindow):
         self.signal_win.show()
         self.signal_win.raise_()
         self.signal_win.refresh()
+
+    def _coverage_switch(self, on):
+        """coverage areas on (as they were: the selected satellite's, or all in view) or off"""
+        if on:
+            self.fp_box.setCurrentIndex(getattr(self, '_fp_was', 0))
+        else:
+            if self.fp_box.currentIndex() != 2:
+                self._fp_was = self.fp_box.currentIndex()
+            self.fp_box.setCurrentIndex(2)
 
     def _globe_tile(self, z, x, y):
         """a map tile for the globe's Earth, in the map's theme"""
@@ -2734,6 +2753,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.sat_info.raise_()
 
     def select(self, name, from_table=False):
+        name = name or None             # (a click on empty space: nothing selected)
         self.selected = name
         if not from_table:
             self.table.blockSignals(True)

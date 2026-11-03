@@ -359,8 +359,7 @@ class GlobeView(QtWidgets.QWidget):
     def mouseReleaseEvent(self, e):
         if self.drag and not self.drag[6] and self.drag[1] == Qt.LeftButton:
             hit = self._hit(e.pos())
-            if hit and hit[0]:
-                self.satelliteClicked.emit(hit[0])
+            self.satelliteClicked.emit(hit[0] if hit and hit[0] else '')    # ('': empty space - deselect)
         self.drag = None
 
     def center_home(self):
