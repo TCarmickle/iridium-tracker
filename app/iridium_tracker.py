@@ -2428,7 +2428,7 @@ class Tracker(QtWidgets.QMainWindow):
             self.reload_lists()
         d, now = self.data, time.time()
         # what the receiver hears, in the system's own terms: Iridium bursts, Orbcomm packets, ham frames,
-        # and GNSS results (PocketSDR reports every 3 minutes)
+        # and GNSS tracking results (PocketSDR, live)
         unit = {'iridium': 'burst', 'orbcomm': 'packet', 'ham': 'frame', 'gnss': 'tracking update'}.get(
             systems.of_capture(d.live_cap or '')['system'], 'signal')
         burst = ('last %s %s ago' % (unit, fmt_age(now - d.last_burst))) if d.last_burst else 'no %ss yet' % unit

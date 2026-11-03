@@ -170,9 +170,10 @@ straight into the SDR and turn on Bias-T in Source (some SDRs, like the SMArTee 
 antenna all the time). It needs open sky: outdoors, or at least in a window. A metal plate under
 a puck antenna (10 cm or more across) helps - it blocks signals bouncing off the ground.
 
-Pick "GNSS L1 (GPS)" next to Start receiver and press Start. The receiver records 3 minutes at a
-time and hands each piece to PocketSDR, so satellites show up a few minutes after Start, then
-every 3 minutes. Leave it running at least 10-15 minutes.
+Pick "GNSS L1 (GPS)" next to Start receiver and press Start. The receiver streams the signal
+straight into PocketSDR, which tracks the satellites live: they show up as they lock on (usually
+within a minute or two) and stay locked, and their updates arrive every second or two. Leave it
+running at least 10-15 minutes.
   - Satellites it tracks appear in the list ("GPS G06", "Galileo E18") with their Doppler
     curves, as "Doppler only, no orbit" at first.
   - Once a satellite has been tracked long enough (about 30 seconds of strong, unbroken signal)
@@ -183,8 +184,9 @@ every 3 minutes. Leave it running at least 10-15 minutes.
     "GNSS FIX lat, lon, height (N satellites)". It should land near the location you set
     (within a kilometre or so) - a good check of the whole chain.
 A broadcast orbit is accurate to a few metres for about 4 hours and slowly gets less certain
-after that; the next run refreshes it. BeiDou is not received (its signals at this frequency
-need more processing than one 3-minute piece allows). A GPS orbit takes 12 hours, so its track
+after that; the next run refreshes it (each satellite sends a fresh one every couple of hours).
+BeiDou is not received (PocketSDR decodes no BeiDou orbit at this frequency, and searching its
+codes would slow the GPS and Galileo search). A GPS orbit takes 12 hours, so its track
 on the flat map sweeps from about 55 degrees south to 55 north and back across half the world;
 on the globe it is a ring around the Earth.
 

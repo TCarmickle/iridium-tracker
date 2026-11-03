@@ -132,3 +132,22 @@ def ephemerides(buf, now=None):
         if got:
             out.append(got)
     return out
+
+
+def split(buf):
+    """(checksum-good payloads, bytes left over) of a growing RTCM 3 stream: the leftover is a frame still
+    being written - prepend it to the next bytes read"""
+    out, i = [], 0
+    while i + 6 <= len(buf):
+        if buf[i] != 0xD3:
+            i += 1
+            continue
+        n = ((buf[i + 1] & 0x03) << 8) | buf[i + 2]
+        if i + 6 + n > len(buf):
+            break
+        if _crc24q(buf[i:i + 3 + n]) == int.from_bytes(buf[i + 3 + n:i + 6 + n], 'big'):
+            out.append(buf[i + 3:i + 3 + n])
+            i += 6 + n
+        else:
+            i += 1
+    return out, buf[i:]
