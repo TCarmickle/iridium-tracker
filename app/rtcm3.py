@@ -108,6 +108,8 @@ def decode(payload, now=None):
         else:
             svh = (b.u(2) << 4) | (b.u(1) << 3)       # E5a health / validity
         sat, sig, week = 'E%02d' % prn, 'E1B' if msg == 1046 else 'E5A', week + 1024     # GST week -> GPS week
+    elif msg == 1020:
+        return decode_glonass(payload, now)
     else:
         return None
     toe_gpst = _gpst(week, toes)
@@ -151,3 +153,41 @@ def split(buf):
         else:
             i += 1
     return out, buf[i:]
+
+
+def _sm(b, n):
+    """a sign-magnitude field (GLONASS)"""
+    x = b.u(n)
+    mag = x & ((1 << (n - 1)) - 1)
+    return -mag if x >> (n - 1) else mag
+
+
+def decode_glonass(payload, now=None):
+    """RTCM 1020 (GLONASS ephemeris; RTCM 10403.3, as RTKLIB's rtcm3.c decodes it) -> ('R16', 'G1CA', fields)
+    with gnss.GLO_FIELDS (m, m/s, m/s2; toe = unix time of tb), or None"""
+    now = now or time.time()
+    b = _Bits(payload)
+    if b.u(12) != 1020:
+        return None
+    slot = b.u(6)
+    fcn = b.u(5) - 7
+    b.u(2 + 2)                              # almanac health (+ its availability), P1
+    b.u(5 + 6 + 1)                          # tk (h, min, 30 s)
+    bn = b.u(1)
+    b.u(1)                                  # P2
+    tb = b.u(7) * 900.0                     # minutes of the Moscow day (UTC + 3 h), 15-min steps
+    vx, x, ax = _sm(b, 24) * 2 ** -20 * 1e3, _sm(b, 27) * 2 ** -11 * 1e3, _sm(b, 5) * 2 ** -30 * 1e3
+    vy, y, ay = _sm(b, 24) * 2 ** -20 * 1e3, _sm(b, 27) * 2 ** -11 * 1e3, _sm(b, 5) * 2 ** -30 * 1e3
+    vz, z, az = _sm(b, 24) * 2 ** -20 * 1e3, _sm(b, 27) * 2 ** -11 * 1e3, _sm(b, 5) * 2 ** -30 * 1e3
+    b.u(1)                                  # P3
+    gamn = _sm(b, 11) * 2 ** -40
+    b.u(2 + 1)                              # P, ln
+    taun = _sm(b, 22) * 2 ** -30
+    # tb is a time of the Moscow day: the one nearest `now`
+    msk = now + 3 * 3600.0
+    day = math.floor(msk / 86400) * 86400
+    toe = day + tb - 3 * 3600.0
+    toe += 86400 * round((now - toe) / 86400)
+    fields = {'toe': toe, 'x': x, 'y': y, 'z': z, 'vx': vx, 'vy': vy, 'vz': vz, 'ax': ax, 'ay': ay, 'az': az,
+              'taun': taun, 'gamn': gamn, 'fcn': fcn, 'slot': slot, 'glo': True, 'health': bn}
+    return 'R%02d' % slot, 'G1CA', fields

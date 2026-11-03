@@ -190,6 +190,20 @@ codes would slow the GPS and Galileo search). A GPS orbit takes 12 hours, so its
 on the flat map sweeps from about 55 degrees south to 55 north and back across half the world;
 on the globe it is a ring around the Earth.
 
+WAAS (in the same band, at the same time): the FAA's GPS-correction satellites are geostationary
+(35,786 km up, over the equator, south of you) and send a GPS-like signal on 1575.42 MHz. The
+receiver tracks the North American ones too (WAAS 131, 133, 135) and decodes the position each
+one broadcasts every couple of minutes, so they appear as "WAAS 131" and so on, standing still
+in your southern sky.
+
+GLONASS (its own band - pick "GNSS L1 (GLONASS)" next to Start): Russia's navigation satellites
+send on about 1602 MHz, each satellite on its own frequency channel. The SDR's slice covers the
+middle channels (about 5 of 14), so several GLONASS satellites at a time, not all. Each one's
+broadcast orbit (position and velocity every 30 minutes) is integrated forward, as GLONASS
+receivers do; it agrees with the public catalog to tens of km over hours. Your antenna has to
+cover 1602 MHz - most GPS pucks do. GLONASS can't be received at the same time as GPS: one SDR
+hears one band at a time.
+
 Offset tuning (Source, on by default for the E4000 tuner) keeps the SDR's own spike at the
 centre frequency off the signal. If nothing is tracked after 10 minutes: check the antenna has
 sky, Bias-T is on, and try a higher gain in Source.

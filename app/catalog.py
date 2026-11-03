@@ -130,17 +130,23 @@ def refresh_tles(max_age_days=2, system='iridium'):
     """download a fresh name list now and then (CelesTrak asks for no more than one fetch every couple of hours)"""
     s = systems.get(system)
     path = tle_file(system)
-    if os.path.exists(path) and time.time() - os.path.getmtime(path) < max_age_days * 86400:
+    groups = s.get('tle_groups') or (s['tle_group'],)
+    try:            # (the groups the list was made from: a list missing a newly added group is fetched again)
+        same = open(path + '.groups').read().split() == list(groups)
+    except OSError:
+        same = len(groups) == 1
+    if same and os.path.exists(path) and time.time() - os.path.getmtime(path) < max_age_days * 86400:
         return
     try:
         import requests
         text = ''
-        for group in s.get('tle_groups') or (s['tle_group'],):
+        for group in groups:
             r = requests.get(TLE_URL % group, timeout=15, headers={'User-Agent': 'IridiumTracker/1.0'})
             if not (r.ok and '\n1 ' in r.text and (not s['prefix'] or s['prefix'].strip() in r.text)):
                 return          # a group failed: keep the old list rather than half of a new one
             text += r.text.replace('\r\n', '\n').rstrip('\n') + '\n'
         open(path, 'w', newline='\n').write(text)
+        open(path + '.groups', 'w').write(' '.join(groups))
     except Exception:
         pass        # offline: keep using what we have
 
@@ -406,11 +412,13 @@ def analyze_ham(stem, names):
     return cap
 
 
-GNSS_NAMES = {'G': 'GPS', 'E': 'Galileo', 'C': 'BeiDou', 'J': 'QZSS'}
+GNSS_NAMES = {'G': 'GPS', 'E': 'Galileo', 'C': 'BeiDou', 'J': 'QZSS', 'R': 'GLONASS'}
 
 
 def gnss_name(sat):
-    """'G05' -> 'GPS G05', 'E11' -> 'Galileo E11', 'C23' -> 'BeiDou C23'"""
+    """'G05' -> 'GPS G05', 'E11' -> 'Galileo E11', 'C23' -> 'BeiDou C23', 'S31' -> 'WAAS 131'"""
+    if sat[:1] == 'S':
+        return 'WAAS %d' % (100 + int(sat[1:]))
     return '%s %s' % (GNSS_NAMES.get(sat[:1], 'GNSS'), sat)
 
 
@@ -427,8 +435,10 @@ def gnss_catalog_names():
         if not lines[i + 1].startswith('1 ') or '(' not in n:
             continue
         tag = n[n.rindex('(') + 1:].rstrip(')').strip()
-        if tag.startswith('PRN '):
+        if tag.startswith('PRN ') and n.startswith('GPS '):
             out['G%02d' % int(tag[4:])] = n
+        elif '/PRN ' in tag and 120 <= int(tag.split('/PRN ')[1]) <= 158:     # SBAS: 'SES-15 (WAAS/PRN 133)' -> S33
+            out['S%02d' % (int(tag.split('/PRN ')[1]) - 100)] = n
         elif tag[:1] == 'C' and tag[1:].isdigit():
             out['C%02d' % int(tag[1:])] = n
     return out
@@ -461,7 +471,8 @@ def analyze_gnss(stem):
     rows = read_gnss(lines)
     iso = lambda t: datetime.datetime.fromtimestamp(t, UTC).isoformat(timespec='seconds')
     ts = [t for _, t, _ in rows]
-    cap = {'capture': os.path.basename(stem), 'system': 'gnss1', 'start_utc': iso(start.timestamp()), 'clock': how,
+    cap = {'capture': os.path.basename(stem), 'system': systems.of_capture(os.path.basename(stem))['key'],
+           'start_utc': iso(start.timestamp()), 'clock': how,
            'hours': meta.get('hours', round((max(ts) - min(ts)) / 3600, 3) if ts else 0),
            'counts': meta.get('counts', dict(collections.Counter(k for k, _, _ in rows))),
            'slots': [], 'positions': [], 'passes': [], 'ephemerides': {}, 'gnss_fixes': []}

@@ -35,6 +35,8 @@ DEFAULTS = {
     'ham70_auto_gain': False,
     'gnss1_gain': 40.0,         # GNSS: an active antenna's amplifier already lifts the signal
     'gnss1_auto_gain': False,
+    'glo1_gain': 40.0,
+    'glo1_auto_gain': False,
 }
 # the decoder needs sample_rate / decimation to be a multiple of 250 kHz
 RATES = [2000000, 2250000, 2500000, 3000000, 4000000, 5000000, 6000000, 8000000, 10000000, 12500000, 20000000]

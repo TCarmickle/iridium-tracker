@@ -166,6 +166,7 @@ class Receiver(QtCore.QObject):
         self.err_rest, self.status_lines = '', 0
         g, auto = sdr_settings.gain(s)
         prog = ([ORBCOMM_RX] if self.system is systems.ORBCOMM else [GNSS_RX] if self.system is systems.GNSS_BAND
+                else [GNSS_RX, '--constellation', 'glonass'] if self.system is systems.GLONASS_BAND
                 else [HAM_RX, '--band', self.system['key']])
         args = prog + ['--device', sdr_settings.device_args(s), '--rate', str(sdr_settings.sample_rate(s)),
                 '--center', str(sdr_settings.center_hz(s)), '--gain', '%g' % g, '--ppm', '%g' % s['ppm'],

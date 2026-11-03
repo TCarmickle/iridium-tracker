@@ -95,13 +95,13 @@ HAM70 = dict(_HAM_BAND, **{
 # noise; PocketSDR tracks them and decodes each satellite's own broadcast orbit (ephemeris)
 GNSS = {
     'key': 'gnss',
-    'label': 'GNSS (GPS / Galileo)',
+    'label': 'GNSS (GPS / Galileo / GLONASS)',
     'prefix': None,
     'short': '',
     'colour': (190, 130, 255),
     'carrier_hz': 1575.42e6,
     'inc_hint': None,
-    'tle_groups': ('gps-ops', 'galileo', 'beidou'),     # CelesTrak groups, for satellite names only
+    'tle_groups': ('gps-ops', 'galileo', 'beidou', 'sbas', 'glo-ops'),   # CelesTrak groups, for names only
 }
 GNSS_BAND = {
     'key': 'gnss1',
@@ -125,11 +125,25 @@ GNSS_BAND = {
     'demod': 'am',                   # there is nothing to hear: the signals are under the noise
     'bands': [(1574.4, 1576.44, 'GPS L1 / Galileo E1 - under the noise', (190, 130, 255, 30))],
 }
+# GLONASS (Russia): L1 at 1602 MHz + 0.5625 MHz x its frequency channel (-7..+6). 27 MHz from GPS, so it is
+# its own band; 2.4 MS/s around 1602 MHz covers about channels -2..+2 (the ones in the middle), and the
+# satellites on them - each channel is shared by two satellites on opposite sides of the Earth.
+GLONASS_BAND = dict(GNSS_BAND, **{
+    'key': 'glo1',
+    'label': 'GNSS L1 (GLONASS)',
+    'band_hz': (1600.8e6, 1603.2e6),
+    'rate': 2400000, 'center_hz': 1602000000,
+    'capture_prefix': 'glo-',
+    'antenna': 'the active GPS antenna (if it covers GLONASS too, as most do), plugged straight into the SDR, '
+               'with open sky: outdoors or in a window',
+    'listen_hz': 1602.0e6,
+    'bands': [(1600.8, 1603.2, 'GLONASS L1 channels -2..+2 - under the noise', (190, 130, 255, 30))],
+})
 IRIDIUM['system'] = 'iridium'
 ORBCOMM['system'] = 'orbcomm'
 ORBCOMM.update(rate=1228800, center_hz=137500000)     # the decoder needs a multiple of 9600 S/s
 
-ORDER = [IRIDIUM, ORBCOMM, HAM2M, HAM70, GNSS_BAND]   # what the receiver can listen to (one at a time)
+ORDER = [IRIDIUM, ORBCOMM, HAM2M, HAM70, GNSS_BAND, GLONASS_BAND]   # what the receiver can listen to (one at a time)
 DISPLAY = [IRIDIUM, ORBCOMM, HAM, GNSS]               # what the map, list and Systems filter group satellites by
 SYSTEMS = {s['key']: s for s in ORDER + DISPLAY}
 DEFAULT = 'iridium'

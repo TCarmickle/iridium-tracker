@@ -22,7 +22,9 @@ Lines (from its log):
                                            sync = its data message's symbol / bit / frame sync and polarity
                                            (e.g. 'SBF-'), then navigation frames decoded, frame errors and
                                            times lock was lost (pocket_trk's counters)
-  GEPH: t sat <pocket_trk $EPH fields>     a satellite's decoded broadcast ephemeris (when it changes)
+  GEPH: t sat <pocket_trk $EPH fields>     a satellite's decoded broadcast ephemeris (when it changes);
+                                           WAAS (sat S31 = PRN 131): 'SBAS,t0,x,y,z,vx,vy,vz,ax,ay,az' - its own
+                                           position from its message type 9 (m, m/s, m/s2)
   GPOS: t lat lon height_m nsat            a position fix from the satellites
 """
 import argparse
@@ -52,7 +54,10 @@ POCKET_TRK = os.path.join(HERE, 'pocketsdr', 'pocket_trk.exe')
 CHUNK_S = 180.0
 # GPS and Galileo. BeiDou's B1C signal is at the same frequency, but pocket_trk decodes no BeiDou orbit from it,
 # and searching its 45 codes took over a third of the processing time - so it is left out.
-SIGNALS = ['-sig', 'L1CA', '-prn', '1-32', '-sig', 'E1B', '-prn', '1-36']
+# WAAS: the SBAS satellites serving North America send a GPS-like signal on the same frequency (PRN 131, 133,
+# 135; 138 was in service until 2022) - tracked alongside, and their own position decoded from their messages
+WAAS_PRNS = '131,133,135,138'
+SIGNALS = ['-sig', 'L1CA', '-prn', '1-32,' + WAAS_PRNS, '-sig', 'E1B', '-prn', '1-36']
 GPS_UTC_S = 18                  # GPS time runs this far ahead of UTC (leap seconds)
 GPS_EPOCH = datetime.datetime(1980, 1, 6, tzinfo=datetime.timezone.utc)
 
@@ -71,7 +76,11 @@ ap.add_argument('--parent-pid', type=int, default=0)   # stop when the tracker t
 ap.add_argument('--chunk-s', type=float, default=CHUNK_S)
 ap.add_argument('--keep-chunks', default='')    # for tests: keep the recorded chunks in this folder
 ap.add_argument('--mode', choices=('live', 'chunks'), default='live')
+ap.add_argument('--constellation', choices=('gps', 'glonass'), default='gps')   # gps = GPS + Galileo + WAAS
 opts = ap.parse_args()
+if opts.constellation == 'glonass':     # every frequency channel (the SDR's slice holds the middle ones);
+    # pocket_trk needs the tuning (-fo) to place each channel
+    SIGNALS = ['-sig', 'G1CA', '-prn', ','.join(str(k) for k in range(-7, 7)), '-fo', '%.6f' % (opts.center / 1e6)]
 
 
 def log(text):
@@ -203,11 +212,16 @@ class Lines:
         self.last_ch = {}       # satellite -> receiver time of its last GCH line (one a second is plenty)
         self.seen = set()
         self.fixes = 0
+        self.sbas_types = {}    # WAAS message type -> how many decoded (for the status line)
+        self.glo_slot = {}      # GLONASS frequency channel -> the satellite's slot ('R16')
 
     def orbits(self, ephs, t):
         for sat, sig, fields in ephs:      # in the field order of a $EPH line, so gnss.parse_eph reads it
-            text = ','.join([sig] + [str(fields[k]) for k in gnss.FIELDS])
-            same = ','.join([sig] + [str(fields[k]) for k in gnss.FIELDS if k != 'ttr_gpst'])   # (when received)
+            if fields.get('glo'):           # GLONASS: 'GLO,' + its position / velocity / acceleration at tb
+                text = same = 'GLO,' + ','.join(repr(float(fields[k])) for k in gnss.GLO_FIELDS)
+            else:
+                text = ','.join([sig] + [str(fields[k]) for k in gnss.FIELDS])
+                same = ','.join([sig] + [str(fields[k]) for k in gnss.FIELDS if k != 'ttr_gpst'])   # (when received)
             if self.eph.get(sat) != same:
                 self.eph[sat] = same
                 emit('GEPH: %.3f %s %s' % (t, sat, text))
@@ -220,6 +234,13 @@ class Lines:
         try:
             if f[0] == '$CH' and len(f) > 10:
                 rt, sat, sig, lock, cn0, fd = float(f[1]), f[4], f[5], float(f[7]), float(f[8]), float(f[10])
+                if sat.startswith('R'):         # GLONASS: by its slot number, once that has been decoded
+                    if sat[1:].isdigit():
+                        self.glo_slot[f[6]] = sat
+                    elif f[6] in self.glo_slot:
+                        sat = self.glo_slot[f[6]]
+                    else:
+                        return
                 if lock < 1.0 or rt - self.last_ch.get(sat, -9) < 1.0:
                     return
                 self.last_ch[sat] = rt
@@ -229,6 +250,8 @@ class Lines:
                     sync = ''.join(c if f[12 + k].strip() not in ('', '0') else '-' for k, c in enumerate('SBFR'))
                     extra = ' %s %d %d %d' % (sync, int(f[23]), int(f[24]), int(f[25]))
                 emit('GCH: %.3f %s %s %.1f %.1f %.1f%s' % (when(rt), sat, sig, cn0, fd, lock, extra))
+            elif f[0] == '$NAV' and len(f) > 7 and f[2].startswith('S'):
+                self.sbas(f, when)
             elif f[0] == '$EPH' and len(f) > 4:
                 sat, fields = f[2], ','.join(f[3:])
                 if self.eph.get(sat) != fields:
@@ -240,6 +263,33 @@ class Lines:
                 self.fixes += 1
         except ValueError:
             pass
+
+
+def _bits(hexstr, n):
+    return [int(c) for c in bin(int(hexstr, 16))[2:].zfill(len(hexstr) * 4)][:n]
+
+
+def _sbas(self, f, when):
+    """a WAAS satellite's message: type 9 (its own position) becomes a GEPH line"""
+    try:
+        msg = gnss.sbas_message(_bits(f[7], int(f[6])))
+    except ValueError:
+        return
+    if not msg:
+        return
+    mtype, data = msg
+    self.sbas_types[mtype] = self.sbas_types.get(mtype, 0) + 1
+    if mtype != 9:
+        return
+    t = when(float(f[1]))
+    nav = gnss.sbas_geo_nav(data, t)
+    text = 'SBAS,' + ','.join('%.4f' % nav[k] if k != 't0' else '%.1f' % nav[k] for k in gnss.SBAS_FIELDS)
+    if self.eph.get(f[2]) != text:
+        self.eph[f[2]] = text
+        emit('GEPH: %.3f %s %s' % (t, f[2], text))
+
+
+Lines.sbas = _sbas
 
 
 class Tracker(threading.Thread):
@@ -419,8 +469,10 @@ class LiveTracker(threading.Thread):
                 last_note = time.time()
                 locked = sorted(s for s, rt in self.out.last_ch.items() if when(rt) > time.time() - 5)
                 log('%d | GNSS live: %d satellites locked now (%s), %d broadcast orbits, %d position fixes, '
-                    '%.0f s of samples dropped' % (time.time(), len(locked), ' '.join(locked) or 'none',
-                                                  len(self.out.eph), self.out.fixes, self.dropped / self.rate))
+                    '%.0f s of samples dropped%s' % (time.time(), len(locked), ' '.join(locked) or 'none',
+                                                    len(self.out.eph), self.out.fixes, self.dropped / self.rate,
+                                                    ', WAAS messages %s' % self.out.sbas_types if self.out.sbas_types
+                                                    else ''))
             if not alive:
                 return
             time.sleep(0.5)

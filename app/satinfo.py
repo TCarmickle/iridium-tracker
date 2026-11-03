@@ -105,6 +105,27 @@ GPS_BLOCKS = {
     'BIIF': 'Block IIF (launched 2010-2016, built by Boeing) - added the L5 signal',
     'BIII': 'GPS III (launched from 2018, built by Lockheed Martin) - adds the L1C signal shared with Galileo',
 }
+GLONASS_FACTS = [
+    ('What it does', 'Russia\'s navigation system: like GPS it broadcasts its own time and orbit, and receivers use '
+                     'both together'),
+    ('Signal you receive', 'L1OF around 1602 MHz - unlike GPS, every satellite has the same code on its own frequency '
+                           '(1602 MHz + 0.5625 MHz x its channel, -7..+6; two satellites on opposite sides of the '
+                           'Earth share a channel)'),
+    ('Its orbit', 'broadcast as a position, velocity and Moon / Sun pull every 30 minutes; receivers integrate the '
+                  'motion from there - as this app does'),
+    ('Constellation', 'about 24 working satellites in 3 orbital planes at 19,100 km, inclined 64.8 degrees, once around '
+                      'every 11 h 16 min (it covers high latitudes better than GPS)'),
+    ('Operator', 'Russian Space Forces (Roscosmos)'),
+]
+WAAS_FACTS = [
+    ('What it is', 'A WAAS satellite: a geostationary communications satellite (35,786 km up, over the equator) '
+                   'carrying the FAA\'s Wide Area Augmentation System payload'),
+    ('What it does', 'Broadcasts corrections and integrity warnings for GPS over North America, so aircraft can '
+                     'fly GPS approaches; its signal is GPS-like, on the same 1575.42 MHz'),
+    ('Its position', 'sent every couple of minutes in its own message (SBAS message type 9) - decoded here, '
+                     'which is how it is placed on the map'),
+    ('Operator', 'US Federal Aviation Administration (FAA)'),
+]
 GALILEO_FACTS = [
     ('What it does', 'Europe\'s navigation system: like GPS it broadcasts its own time and orbit, and receivers use '
                      'both together'),
@@ -447,6 +468,10 @@ class SatInfoDialog(QtWidgets.QDialog):
 
     def block(self):
         if self.system is systems.GNSS:
+            if self.name.startswith('WAAS'):
+                return 'WAAS (SBAS), geostationary'
+            if self.name.startswith('GLONASS'):
+                return 'GLONASS'
             if self.name.startswith('Galileo'):
                 return 'Galileo'
             return 'GPS ' + GPS_BLOCKS.get(self._gps_block(), 'satellite').split(' (')[0]
@@ -488,7 +513,11 @@ class SatInfoDialog(QtWidgets.QDialog):
         if self.system is systems.HAM:
             rows += ISS_FACTS if self.name.startswith('ISS') else HAM_FACTS
         elif self.system is systems.GNSS:
-            if self.name.startswith('Galileo'):
+            if self.name.startswith('WAAS'):
+                rows += WAAS_FACTS
+            elif self.name.startswith('GLONASS'):
+                rows += GLONASS_FACTS
+            elif self.name.startswith('Galileo'):
                 rows += GALILEO_FACTS
             else:
                 if self._gps_block() in GPS_BLOCKS:

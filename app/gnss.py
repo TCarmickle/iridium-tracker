@@ -235,3 +235,232 @@ class EphemerisOrbit:
     @property
     def period_min(self):
         return 2 * math.pi / self.p[3] / 60
+
+
+# ---------------------------------------------------------------- SBAS (WAAS) geostationary satellites
+# SBAS satellites send GPS-like signals on L1 and, every couple of minutes, their own position, velocity and
+# acceleration (message type 9, RTCA DO-229) - so they are placed from what you receive, like the others.
+SBAS_PREAMBLES = (0x53, 0x9A, 0xC6)
+GEO_PERIOD_MIN = 1436.068          # one sidereal day
+
+
+def _crc24q_bits(bits):
+    crc = 0
+    for b in bits:
+        crc ^= b << 23
+        crc = ((crc << 1) ^ 0x1864CFB) & 0xFFFFFF if crc & 0x800000 else (crc << 1) & 0xFFFFFF
+    return crc
+
+
+def sbas_message(bits):
+    """a 250-bit SBAS message (list of 0/1, preamble first) -> (type, data bits) if its CRC checks, else None"""
+    if len(bits) < 250:
+        return None
+    pre = int(''.join(map(str, bits[:8])), 2)
+    if pre not in SBAS_PREAMBLES:
+        return None
+    if _crc24q_bits(bits[:226]) != int(''.join(map(str, bits[226:250])), 2):
+        return None
+    return int(''.join(map(str, bits[8:14])), 2), bits[14:226]
+
+
+def _u(bits, i, n):
+    return int(''.join(map(str, bits[i:i + n])), 2)
+
+
+def _s(bits, i, n):
+    x = _u(bits, i, n)
+    return x - (1 << n) if x & (1 << (n - 1)) else x
+
+
+def sbas_geo_nav(data, t_rx):
+    """message type 9's 212 data bits -> {t0, x, y, z (m), vx..(m/s), ax..(m/s2)}; t_rx (unix) resolves the day"""
+    i = 8                                   # (IODN / reserved)
+    t0_tod = _u(data, i, 13) * 16.0
+    i += 13 + 4                             # (and the URA index)
+    x, y, z = _s(data, i, 30) * 0.08, _s(data, i + 30, 30) * 0.08, _s(data, i + 60, 25) * 0.4
+    i += 85
+    vx, vy, vz = _s(data, i, 17) * 0.000625, _s(data, i + 17, 17) * 0.000625, _s(data, i + 34, 18) * 0.004
+    i += 52
+    ax, ay, az = _s(data, i, 10) * 0.0000125, _s(data, i + 10, 10) * 0.0000125, _s(data, i + 20, 10) * 0.0000625
+    # t0 is a GPS time of day: the one nearest the moment it was received
+    gps = t_rx + gpst_minus_utc(t_rx)
+    t0 = math.floor(gps / 86400) * 86400 + t0_tod
+    t0 += 86400 * round((gps - t0) / 86400)
+    return {'t0': t0 - gpst_minus_utc(t_rx), 'x': x, 'y': y, 'z': z, 'vx': vx, 'vy': vy, 'vz': vz,
+            'ax': ax, 'ay': ay, 'az': az}
+
+
+SBAS_FIELDS = ['t0', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'ax', 'ay', 'az']
+
+
+class SBASOrbit:
+    """a geostationary SBAS satellite from its own message type 9, looking like orbitfit.Orbit to the app.
+    Its position is extrapolated with the broadcast velocity and acceleration for up to SBAS_HOLD_S either
+    side of t0, then held (a geostationary satellite drifts only slowly in the Earth-fixed frame)."""
+    SBAS_HOLD_S = 1800.0
+
+    def __init__(self, nav, sat, received):
+        self.nav, self.t0 = nav, nav['t0']
+        r = np.array([nav['x'], nav['y'], nav['z']]) / 1000.0
+        a = float(np.linalg.norm(r))
+        self.p = np.array([0.0, 0.0, 0.0, 2 * math.pi / (GEO_PERIOD_MIN * 60), a])
+        node, inc = self.plane_at(self.t0)
+        self.p[0], self.p[1] = node, inc
+        self.cov = None
+        self.eph = {'e': 0.0}
+        self.info = {'fixes': 0, 'passes': 1, 'doppler_groups': 0, 'doppler_points': 0,
+                     'first_obs': float(received), 'last_obs': float(received), 'fix_rms_km': 0.0,
+                     'ephemeris': True, 'sbas': True, 'sat': sat, 'sig': 'L1 SBAS', 'toe': self.t0,
+                     'health': 0, 'geo': True}
+
+    @classmethod
+    def from_fields(cls, text, sat, received):
+        """'SBAS,t0,x,y,z,vx,vy,vz,ax,ay,az' (a GEPH line's fields) -> SBASOrbit"""
+        v = [float(x) for x in text.split(',')[1:]]
+        return cls(dict(zip(SBAS_FIELDS, v)), sat, received)
+
+    def ecef(self, t):
+        t = np.atleast_1d(np.asarray(t, float))
+        dt = np.clip(t - self.t0, -self.SBAS_HOLD_S, self.SBAS_HOLD_S)[:, None]
+        n = self.nav
+        p = np.array([n['x'], n['y'], n['z']])
+        v = np.array([n['vx'], n['vy'], n['vz']])
+        a = np.array([n['ax'], n['ay'], n['az']])
+        return (p + v * dt + 0.5 * a * dt * dt) / 1000.0
+
+    def sigma_km(self, t):
+        """1-sigma (km): metres within 15 min of t0, then ~2 km per hour of holding it still (the slow daily
+        figure-eight a geostationary satellite traces)"""
+        h = np.maximum(np.abs(np.atleast_1d(np.asarray(t, float)) - self.t0) / 3600.0 - 0.25, 0.0)
+        return 0.01 + 2.0 * np.minimum(h, 12.0)
+
+    def plane_at(self, t):
+        t = np.atleast_1d(np.asarray(t, float))
+        p = self.ecef(t)
+        n = self.nav
+        v = np.repeat([[n['vx'] / 1000.0, n['vy'] / 1000.0, n['vz'] / 1000.0]], len(t), 0)
+        w = 2 * math.pi * 1.00273781191135448 / 86400
+        ri = orbitfit.ecef_to_eci(p, t)
+        vi = orbitfit.ecef_to_eci(v, t) + w * np.stack([-ri[:, 1], ri[:, 0], np.zeros(len(t))], -1)
+        node, inc, _ = _plane(ri, vi)
+        if len(t) == 1:
+            return float(node[0]), float(inc[0])
+        return node, inc
+
+    @property
+    def plane_sigma_km(self):
+        return 0.01
+
+    @property
+    def period_min(self):
+        return GEO_PERIOD_MIN
+
+
+# ---------------------------------------------------------------- GLONASS
+# GLONASS broadcasts, every 30 minutes, its position, velocity and the Moon / Sun acceleration at a reference
+# time tb (in the Earth-fixed PZ-90 frame, practically WGS-84); receivers integrate the motion from there under
+# the Earth's gravity with its J2 term (GLONASS ICD, A.3.1.2; as in RTKLIB's glorbit).
+GLO_MU, GLO_J2, GLO_RE, GLO_OMGE = 3.9860044e14, 1.0826257e-3, 6378136.0, 7.292115e-5
+GLO_FIELDS = ['toe', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'ax', 'ay', 'az', 'taun', 'gamn', 'fcn', 'slot']
+GLO_STEP_S = 30.0
+GLO_SPAN_S = 8 * 3600.0           # integrated this far either side of tb (a little over half an orbit... and more)
+
+
+def _glo_deq(x, acc):
+    r2 = x[0] * x[0] + x[1] * x[1] + x[2] * x[2]
+    r3 = r2 * math.sqrt(r2)
+    a = 1.5 * GLO_J2 * GLO_MU * GLO_RE * GLO_RE / r2 / r3
+    b = 5.0 * x[2] * x[2] / r2
+    c = -GLO_MU / r3 - a * (1.0 - b)
+    w2 = GLO_OMGE * GLO_OMGE
+    return np.array([x[3], x[4], x[5],
+                     (c + w2) * x[0] + 2 * GLO_OMGE * x[4] + acc[0],
+                     (c + w2) * x[1] - 2 * GLO_OMGE * x[3] + acc[1],
+                     (c - 2 * a) * x[2] + acc[2]])
+
+
+def _glo_rk4(x, acc, h):
+    k1 = _glo_deq(x, acc)
+    k2 = _glo_deq(x + k1 * h / 2, acc)
+    k3 = _glo_deq(x + k2 * h / 2, acc)
+    k4 = _glo_deq(x + k3 * h, acc)
+    return x + (k1 + 2 * k2 + 2 * k3 + k4) * h / 6
+
+
+class GlonassOrbit:
+    """a GLONASS satellite from its own broadcast ephemeris, looking like orbitfit.Orbit to the app. The motion is
+    integrated once (RK4, 30 s steps, GLO_SPAN_S either side of tb) and interpolated (Hermite, with the
+    velocities); the broadcast Moon / Sun acceleration is only meant for +-15 min, so it is applied only there."""
+
+    def __init__(self, g, sat, received):
+        self.g, self.t0 = g, g['toe']
+        x0 = np.array([g['x'], g['y'], g['z'], g['vx'], g['vy'], g['vz']])
+        acc = np.array([g['ax'], g['ay'], g['az']])
+        n = int(GLO_SPAN_S / GLO_STEP_S)
+        fwd, back = [x0], [x0]
+        for k in range(n):
+            a = acc if (k + 1) * GLO_STEP_S <= 900 else np.zeros(3)
+            fwd.append(_glo_rk4(fwd[-1], a, GLO_STEP_S))
+            back.append(_glo_rk4(back[-1], a, -GLO_STEP_S))
+        self.states = np.array(back[::-1] + fwd[1:])           # (2n + 1, 6), m and m/s
+        self.ts = self.t0 + GLO_STEP_S * np.arange(-n, n + 1)
+        r = float(np.linalg.norm(x0[:3])) / 1000.0
+        vi = (x0[3:] + np.cross([0.0, 0.0, GLO_OMGE], x0[:3])) / 1000.0       # inertial velocity, km/s
+        a_km = 1.0 / (2.0 / r - float(vi @ vi) / (GLO_MU / 1e9))              # (vis-viva)
+        self.p = np.array([0.0, 0.0, 0.0, math.sqrt(GLO_MU / 1e9 / a_km ** 3), a_km])
+        node, inc = self.plane_at(self.t0)
+        self.p[0], self.p[1] = node, inc
+        self.cov = None
+        self.eph = {'e': 0.0}
+        self.info = {'fixes': 0, 'passes': 1, 'doppler_groups': 0, 'doppler_points': 0,
+                     'first_obs': float(received), 'last_obs': float(received), 'fix_rms_km': 0.0,
+                     'ephemeris': True, 'glonass': True, 'sat': sat, 'sig': 'L1OF (channel %+d)' % int(g['fcn']),
+                     'toe': self.t0, 'health': 0, 'geo': False}
+
+    @classmethod
+    def from_fields(cls, text, sat, received):
+        """'GLO,toe,x,y,z,vx,vy,vz,ax,ay,az,taun,gamn,fcn,slot' (a GEPH line's fields) -> GlonassOrbit"""
+        v = [float(x) for x in text.split(',')[1:]]
+        return cls(dict(zip(GLO_FIELDS, v)), sat, received)
+
+    def _state(self, t):
+        t = np.clip(np.atleast_1d(np.asarray(t, float)), self.ts[0], self.ts[-1])
+        i = np.clip(((t - self.ts[0]) // GLO_STEP_S).astype(int), 0, len(self.ts) - 2)
+        h = GLO_STEP_S
+        s = ((t - self.ts[i]) / h)[:, None]
+        p0, p1 = self.states[i, :3], self.states[i + 1, :3]
+        v0, v1 = self.states[i, 3:], self.states[i + 1, 3:]
+        h00, h10, h01, h11 = 2 * s ** 3 - 3 * s ** 2 + 1, s ** 3 - 2 * s ** 2 + s, -2 * s ** 3 + 3 * s ** 2, s ** 3 - s ** 2
+        pos = h00 * p0 + h10 * h * v0 + h01 * p1 + h11 * h * v1
+        vel = v0 + (v1 - v0) * s
+        return pos, vel
+
+    def ecef(self, t):
+        return self._state(t)[0] / 1000.0
+
+    def sigma_km(self, t):
+        """1-sigma (km): metres within 15 min of tb (what the broadcast is made for), then growing - the Moon and
+        Sun pull is left out beyond that: ~1 km after 2 h, ~5 km after 6 h; past the integrated span, hidden"""
+        dt = np.abs(np.atleast_1d(np.asarray(t, float)) - self.t0)
+        h = np.maximum(dt / 3600.0 - 0.25, 0.0)
+        return np.where(dt > GLO_SPAN_S, 5000.0, 0.005 + 0.3 * h + 0.1 * h * h)
+
+    def plane_at(self, t):
+        t = np.atleast_1d(np.asarray(t, float))
+        p, v = self._state(t)
+        w = 2 * math.pi * 1.00273781191135448 / 86400
+        ri = orbitfit.ecef_to_eci(p / 1000.0, t)
+        vi = orbitfit.ecef_to_eci(v / 1000.0, t) + w * np.stack([-ri[:, 1], ri[:, 0], np.zeros(len(t))], -1)
+        node, inc, _ = _plane(ri, vi)
+        if len(t) == 1:
+            return float(node[0]), float(inc[0])
+        return node, inc
+
+    @property
+    def plane_sigma_km(self):
+        return 0.005
+
+    @property
+    def period_min(self):
+        return 2 * math.pi / self.p[3] / 60

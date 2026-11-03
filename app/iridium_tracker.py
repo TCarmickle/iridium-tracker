@@ -256,7 +256,10 @@ def gnss_block(cat_name):
         return 'IOV'
     if cat_name.startswith('GSAT02'):
         return 'FOC'
-    return '-'
+    if cat_name.startswith('COSMOS') and '(' in cat_name:     # GLONASS: 7xx = GLONASS-M, 8xx = GLONASS-K
+        num = cat_name[cat_name.rindex('(') + 1:].rstrip(')')
+        return {'7': 'M', '8': 'K'}.get(num[:1], '-')
+    return 'GEO'
 
 
 def fmt_time(t, seconds=False):
@@ -333,8 +336,12 @@ class Data:
         o = self.orbits.get(n)
         if name is None and o is not None:
             t = datetime.datetime.fromtimestamp(o.t0, datetime.timezone.utc)
-            name = catalog.match_ecef([s for s in self.tles('gnss') if s.name.startswith('GSAT')], t,
-                                      o.ecef(o.t0)[0], max_km=300.0)[0]
+            waas = sat.startswith('S')
+            want = (lambda s: s.name.startswith('COSMOS')) if sat.startswith('R') else \
+                (lambda s: s.name.startswith('GSAT')) if not waas else \
+                (lambda s: '(PRN' not in s.name and not s.name.startswith(('GSAT', 'BEIDOU', 'COSMOS')))
+            cands = [s for s in self.tles('gnss') if want(s)]
+            name = catalog.match_ecef(cands, t, o.ecef(o.t0)[0], max_km=500.0 if waas else 300.0)[0]
         if name is not None or o is not None:       # Galileo: try again once its orbit is known
             self._gnss_cat[n] = name
         return name
@@ -451,6 +458,10 @@ class Data:
         try:
             import gnss
             t, fields = got
+            if fields.startswith('SBAS'):       # a WAAS satellite: its own position from its message type 9
+                return gnss.SBASOrbit.from_fields(fields, sat, t), None
+            if fields.startswith('GLO'):        # GLONASS: its own position / velocity, integrated
+                return gnss.GlonassOrbit.from_fields(fields, sat, t), None
             return gnss.EphemerisOrbit(gnss.parse_eph('$EPH,%.3f,%s,%s' % (t, sat, fields.replace(' ', ',')))), None
         except Exception as e:      # (gnss.py missing, or an ephemeris it can't read)
             return None, 'could not use its ephemeris (%s)' % e
@@ -1653,7 +1664,6 @@ class Tracker(QtWidgets.QMainWindow):
 
         self.map = MapView()
         self.map.satelliteClicked.connect(self.select)
-        self.map.satelliteClicked.connect(self.show_sat_info)
         self.sat_info = None
         self.timeline = Timeline()
         self.timeline.timeChanged.connect(self.scrub)
@@ -2005,7 +2015,6 @@ class Tracker(QtWidgets.QMainWindow):
         if self.globe is None:
             self.globe = globe.GlobeWindow(self, (HOME_LAT, HOME_LON), self._globe_tile, self.map.map_theme)
             self.globe.view.satelliteClicked.connect(self.select)
-            self.globe.view.satelliteClicked.connect(self.show_sat_info)
             self.globe.layout().insertWidget(0, self._sys_window_bar())
             self.globe.layout().insertWidget(1, self._globe_options())
             self.globe.view.corner = self._map_switches(self.globe.view)[0]
@@ -2451,7 +2460,8 @@ class Tracker(QtWidgets.QMainWindow):
             ids = [', '.join(i.get('callsigns', [])) or '-', str(passes)]
             num = (str(i.get('frames', 0)), i.get('frames', 0))
         else:       # gnss
-            ids = [gnss_block(d.gnss_catalog_name(n)), '✓' if n in d.orbits else '–']
+            ids = ['GEO' if n.startswith('WAAS') else gnss_block(d.gnss_catalog_name(n)),
+                   '✓' if n in d.orbits else '–']
             num = ('%.1f' % i['best'] if i['best'] else '-', i['best'])
         if want is not None:
             return ids + [num]
@@ -2472,9 +2482,11 @@ class Tracker(QtWidgets.QMainWindow):
             return {'Orbcomm': (len(heard), len(d.tles('orbcomm')))}
         if key == 'gnss':
             tl = d.tles('gnss')
-            return {'GPS': (sum(1 for n in heard if n.startswith('GPS')), sum(1 for x in tl if '(PRN' in x.name)),
+            return {'GPS': (sum(1 for n in heard if n.startswith('GPS')), sum(1 for x in tl if x.name.startswith('GPS '))),
                     'Galileo': (sum(1 for n in heard if n.startswith('Galileo')),
-                                sum(1 for x in tl if x.name.startswith('GSAT')))}
+                                sum(1 for x in tl if x.name.startswith('GSAT'))),
+                    'GLONASS': (sum(1 for n in heard if n.startswith('GLONASS')),
+                                sum(1 for x in tl if x.name.startswith('COSMOS')))}
         if key == 'ham':
             if self._ham_known is None:
                 import satellites
@@ -2502,12 +2514,14 @@ class Tracker(QtWidgets.QMainWindow):
                      ('%d/66' % len(d.slots_heard), 'plane slots heard', 'of the 66 plane/slot positions in the constellation')]
         elif want == 'gnss':
             c = self._constellation('gnss')
-            boxes = [(orbit, 'with broadcast orbit', 'their own orbit (ephemeris) decoded: on the map'),
+            boxes = [(orbit, 'with broadcast orbit', 'their own orbit (ephemeris) decoded: on the map\n(%d GNSS '
+                                                     'position fixes of your own so far)' % len(d.gnss_fixes)),
                      ('%d/%d' % c['GPS'], 'GPS heard', 'GPS satellites tracked, of the %d in the public '
                                                        'operational list' % c['GPS'][1]),
                      ('%d/%d' % c['Galileo'], 'Galileo heard', 'Galileo satellites tracked, of the %d in the public '
                                                                'list (a few of them are not in service)' % c['Galileo'][1]),
-                     (len(d.gnss_fixes), 'GPS position fixes', 'your own position, worked out from the satellites')]
+                     ('%d/%d' % c['GLONASS'], 'GLONASS heard', 'GLONASS satellites tracked, of the %d in the public '
+                                                               'operational list' % c['GLONASS'][1])]
         elif want == 'orbcomm':
             c = self._constellation('orbcomm')['Orbcomm']
             boxes = [('%d/%d' % c, 'satellites heard', 'Orbcomm satellites heard, of the %d in the public list '
