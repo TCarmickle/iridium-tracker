@@ -68,9 +68,9 @@ PLANE_COLORS = {1: (77, 148, 255), 2: (176, 120, 240), 3: (40, 200, 200), 4: (24
 
 # colours: the window's theme (theme.py, light or dark), set by _use_colours() at start and on a switch
 BG = PANEL = SURFACE = BORDER = TEXT = MUTED = ACCENT = ALERT = GOOD = ''
-IDLE = UP = ALERT_BG = ROW_HEAD = ''
+IDLE = UP = ALERT_BG = ROW_HEAD = SEL_BG = ''
 COLOUR_NAMES = ('BG', 'PANEL', 'SURFACE', 'BORDER', 'TEXT', 'MUTED', 'ACCENT', 'ALERT', 'GOOD', 'IDLE', 'UP',
-                'ALERT_BG', 'ROW_HEAD')
+                'ALERT_BG', 'ROW_HEAD', 'SEL_BG')
 
 
 def _use_colours():
@@ -1036,6 +1036,12 @@ class MapView(QtWidgets.QWidget):
         lon, lat = unmerc(wx % 1.0, wy)
         return (lon + 180) % 360 - 180, lat
 
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if getattr(self, 'corner', None) is not None:      # the map switches, top right
+            self.corner.adjustSize()
+            self.corner.move(self.width() - self.corner.width() - 10, 10)
+
     def _tile_loaded(self, key, img):
         if key[3] == self.map_theme:
             self.tiles[key] = QtGui.QPixmap.fromImage(img)
@@ -1360,7 +1366,7 @@ class MapView(QtWidgets.QWidget):
         p.setFont(font)
         ink = theme.MAP_INK[self.map_theme]
         fm = p.fontMetrics()
-        h = 18 * len(items) + 10
+        h = 24 * len(items) + 12
         open_ = self.legend_open and self.height() > h + 90      # folds itself on a short map
         if not open_:
             r = QtCore.QRectF(10, self.height() - 52, fm.width('Key \u25b8') + 20, 24)
@@ -1371,7 +1377,7 @@ class MapView(QtWidgets.QWidget):
             p.setPen(QtGui.QColor(ink['text']))
             p.drawText(r, Qt.AlignCenter, 'Key \u25b8')
         else:
-            width = max(fm.width(t) for _, t in items) + 58
+            width = max(fm.width(t) for _, t in items) + 70
             r = QtCore.QRectF(10, self.height() - h - 24, width, h)
             self.legend_rect = r
             p.setPen(QtGui.QPen(QtGui.QColor(*ink['box_edge'])))
@@ -1380,8 +1386,8 @@ class MapView(QtWidgets.QWidget):
             p.setPen(QtGui.QColor(ink['muted']))
             p.drawText(QtCore.QRectF(r.right() - 22, r.top() + 2, 18, 14), Qt.AlignCenter, '\u2715')
         for k, (kind, text) in enumerate(items if open_ else []):
-            y = r.top() + 14 + 18 * k
-            x = r.left() + 18
+            y = r.top() + 18 + 24 * k
+            x = r.left() + 20
             if kind == 'fix':
                 p.setPen(QtGui.QPen(Qt.white, 1.5))
                 p.setBrush(C_FIX)
@@ -1407,7 +1413,7 @@ class MapView(QtWidgets.QWidget):
             else:
                 draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.8)
             p.setPen(QtGui.QColor(ink['text']))
-            p.drawText(QPointF(x + 18, y + 4), text)
+            p.drawText(QPointF(x + 24, y + 4), text)
         p.setPen(QtGui.QColor(ink['muted']))
         credit = '© OpenStreetMap contributors'
         p.drawText(QPointF(self.width() - p.fontMetrics().width(credit) - 8, self.height() - 6), credit)
@@ -1691,22 +1697,26 @@ class Tracker(QtWidgets.QMainWindow):
         self.fix_box.addItems(['My fixes: last hour (replay)', 'My fixes: all', 'My fixes: none'])
         self.planes_box = QtWidgets.QComboBox()
         self.planes_box.addItems(['Planes: all', "Planes: selected satellite's", 'Planes: none'])
-        self.night_chk = QtWidgets.QCheckBox('Day/night')
-        self.night_chk.setChecked(True)
+        self.night_chk = QtWidgets.QCheckBox('Day/night', self)      # (driven by the switch on the map)
+        self.night_chk.setChecked(theme.load_ui().get('night', True))
+        self.night_chk.hide()
+        self.night_chk.stateChanged.connect(lambda _: theme.save_ui(night=self.night_chk.isChecked()))
         self.sys_box.currentIndexChanged.connect(self.reload_lists)
         for wdg in (self.sys_box, self.tracks_box, self.fp_box, self.fix_box, self.planes_box, self.night_chk):
-            opts.addWidget(wdg)
+            if wdg is not self.night_chk:
+                opts.addWidget(wdg)
             sig = wdg.stateChanged if isinstance(wdg, QtWidgets.QCheckBox) else wdg.currentIndexChanged
             sig.connect(self.refresh)
-        self.map_theme_box = QtWidgets.QComboBox()     # the map (and the globe's Earth): dark or light
+        self.map_theme_box = QtWidgets.QComboBox(self)  # the map (and the globe's Earth): dark or light (the switch)
+        self.map_theme_box.hide()
         self.map_theme_box.addItem('Map: dark', 'dark')
         self.map_theme_box.addItem('Map: light', 'light')
         self.map_theme_box.setToolTip('The map and the globe\'s Earth: dark, or light as OpenStreetMap draws it')
         self.map_theme_box.setCurrentIndex(self.map_theme_box.findData(theme.load()[1]))
         self.map.set_map_theme(self.map_theme_box.currentData())
         self.map_theme_box.currentIndexChanged.connect(lambda _: self.set_map_theme(self.map_theme_box.currentData()))
-        opts.addWidget(self.map_theme_box)
         opts.addStretch(1)
+        self.map.corner, self.map_theme_btn, self.night_btn = self._map_switches(self.map)
 
         # receiver bar: start / stop the SDR receiver and decoder
         self.receiver = receiver.Receiver(replay)
@@ -1753,8 +1763,13 @@ class Tracker(QtWidgets.QMainWindow):
         theme.style(header, 'QFrame#hdr { background: %(PANEL)s; border: 1px solid %(BORDER)s; border-radius: 8px; }'
                             ' QFrame#hdr QLabel { background: transparent; }')
         header.setObjectName('hdr')
-        hl = QtWidgets.QHBoxLayout(header)
-        hl.setContentsMargins(12, 6, 8, 6)
+        hv = QtWidgets.QVBoxLayout(header)
+        hv.setContentsMargins(12, 6, 8, 6)
+        hv.setSpacing(4)
+        hl = QtWidgets.QHBoxLayout()
+        hv.addLayout(hl)
+        status_row = QtWidgets.QHBoxLayout()       # lights and the receiver's status, the full width
+        hv.addLayout(status_row)
         hl.addWidget(title)
         hl.addSpacing(16)
         hl.addWidget(self.rx_btn)
@@ -1763,10 +1778,10 @@ class Tracker(QtWidgets.QMainWindow):
         hl.addWidget(self.spec_btn)
         hl.addWidget(self.sky_btn)
         hl.addWidget(self.globe_btn)
-        hl.addSpacing(6)
-        hl.addWidget(self.rx_dot)
-        hl.addWidget(self.activity)
-        hl.addWidget(self.rx_status, 1)
+        hl.addStretch(1)
+        status_row.addWidget(self.rx_dot)
+        status_row.addWidget(self.activity)
+        status_row.addWidget(self.rx_status, 1)
         self.loc_btn = QtWidgets.QPushButton()
         self.loc_btn.setToolTip('Change or detect your antenna location')
         self.loc_btn.clicked.connect(self.start_pick)
@@ -1812,6 +1827,9 @@ class Tracker(QtWidgets.QMainWindow):
         pl.addWidget(pick_text, 1)
         typed = QtWidgets.QPushButton('Type coordinates...')
         typed.clicked.connect(self.type_location)
+        self.gps_loc_btn = QtWidgets.QPushButton()
+        self.gps_loc_btn.clicked.connect(self.use_gnss_location)
+        pl.addWidget(self.gps_loc_btn)
         self.pick_cancel = QtWidgets.QPushButton('Cancel')
         self.pick_cancel.clicked.connect(self.cancel_pick)
         pl.addWidget(typed)
@@ -1973,10 +1991,84 @@ class Tracker(QtWidgets.QMainWindow):
             self.globe.view.satelliteClicked.connect(self.select)
             self.globe.view.satelliteClicked.connect(self.show_sat_info)
             self.globe.layout().insertWidget(0, self._sys_window_bar())
+            self.globe.layout().insertWidget(1, self._globe_options())
+            self.globe.view.corner = self._map_switches(self.globe.view)[0]
+            self.globe_info = QtWidgets.QLabel()
+            self.globe_info.setTextFormat(Qt.RichText)
+            self.globe_info.setContentsMargins(10, 4, 10, 6)
+            self.globe.layout().addWidget(self.globe_info)
         self.globe.view.home = (HOME_LAT, HOME_LON)
         self.globe.view.set_scene(self.map.scene)
         self.globe.show()
         self.globe.raise_()
+
+    def _map_switches(self, parent):
+        """the map's two switches, for the top right corner of a map or globe: light / dark map and day / night
+        shading - tied to the (hidden) map theme box and night checkbox, so every copy stays in step"""
+        box = QtWidgets.QFrame(parent)
+        box.setObjectName('switches')
+        theme.style(box, 'QFrame#switches { background: %(PANEL)s; border: 1px solid %(BORDER)s; border-radius: 8px; }')
+        lay = QtWidgets.QHBoxLayout(box)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        mt = QtWidgets.QPushButton()
+        mt.setToolTip('Switch the map (and the globe\'s Earth) between dark and light, as OpenStreetMap draws it')
+        mt.clicked.connect(lambda: self.map_theme_box.setCurrentIndex(1 - self.map_theme_box.currentIndex()))
+        dn = QtWidgets.QPushButton('\U0001F317  Day / night')
+        dn.setCheckable(True)
+        dn.setToolTip('Shade the night side of the Earth (from the Sun\'s real position)')
+        dn.setChecked(self.night_chk.isChecked())
+        dn.toggled.connect(self.night_chk.setChecked)
+        self.night_chk.toggled.connect(dn.setChecked)
+
+        def label(_=None):
+            mt.setText('\u2600  Light map' if self.map_theme_box.currentData() == 'dark' else '\u263e  Dark map')
+        label()
+        self.map_theme_box.currentIndexChanged.connect(label)
+        lay.addWidget(mt)
+        lay.addWidget(dn)
+        box.adjustSize()
+        return box, mt, dn
+
+    def _mirror(self, src):
+        """a copy of one of the map's option boxes for another window, kept in step with it both ways"""
+        c = QtWidgets.QComboBox()
+        for k in range(src.count()):
+            c.addItem(src.itemText(k), src.itemData(k))
+        c.setToolTip(src.toolTip())
+        c.setCurrentIndex(src.currentIndex())
+        c.currentIndexChanged.connect(src.setCurrentIndex)
+        src.currentIndexChanged.connect(c.setCurrentIndex)
+        return c
+
+    def _globe_options(self):
+        """the map's options for the globe window: tracks, footprints, fixes, planes"""
+        w = QtWidgets.QWidget()
+        row = QtWidgets.QHBoxLayout(w)
+        row.setContentsMargins(8, 4, 8, 0)
+        for src in (self.tracks_box, self.fp_box, self.fix_box, self.planes_box):
+            row.addWidget(self._mirror(src))
+        row.addStretch(1)
+        return w
+
+    def _globe_info_text(self):
+        """the line under the globe: what it shows, and the selected satellite"""
+        sc = self.map.scene or {}
+        sats = sc.get('sats', [])
+        up = sum(1 for s in sats if s['el'] > 0)
+        heard = sum(1 for s in sats if s['live'])
+        txt = ('<b>%d</b> satellites shown &middot; <b>%d</b> above your horizon%s &middot; %s'
+               % (len(sats), up, ' &middot; <b>%d</b> heard in the last minute' % heard if self.following else '',
+                  ('<b style="color:%s">LIVE</b> ' % GOOD if self.following else '') + fmt_time(self.t, True)))
+        s = next((s for s in sats if s['selected']), None)
+        if s:
+            txt += ('<br><span style="color:%s">\u25a0</span> <b>%s</b> &middot; %.0f km up &middot; %s &middot; '
+                    'lat %+.1f, lon %+.1f' % (C_SELECT.name(), s['name'], s['alt'],
+                                              '%.0f\u00b0 up, azimuth %.0f\u00b0' % (s['el'], s['az']) if s['el'] > 0
+                                              else 'below your horizon', s['lat'], s['lon']))
+        elif self.selected:
+            txt += '<br><b>%s</b>: not on the globe now (no orbit, or too uncertain at this time)' % self.selected
+        return txt
 
     def _globe_tile(self, z, x, y):
         """a map tile for the globe's Earth, in the map's theme"""
@@ -2134,12 +2226,35 @@ class Tracker(QtWidgets.QMainWindow):
     def start_pick(self):
         """the next click on the map sets the antenna location"""
         self.pick_cancel.setVisible(catalog.HOME is not None)
+        fix = self.gnss_location()
+        self.gps_loc_btn.setVisible(fix is not None)
+        if fix:
+            self.gps_loc_btn.setText('\U0001F6F0  Use GPS-tracked position')
+            self.gps_loc_btn.setToolTip('%.5f, %.5f, %.0f m - the middle of your %d most recent GNSS position fixes\n'
+                                        '(worked out from the GPS / Galileo satellites your antenna tracked)'
+                                        % (fix[0], fix[1], fix[2] * 1000, fix[3]))
         self.pick_bar.show()
         self.map.set_picking(True)
 
     def cancel_pick(self):
         self.pick_bar.hide()
         self.map.set_picking(False)
+
+    def gnss_location(self):
+        """(lat, lon, height km, n) from your most recent GNSS position fixes (their median), or None"""
+        fixes = sorted(self.data.gnss_fixes, key=lambda f: f['t'])[-20:]
+        if not fixes:
+            return None
+        med = lambda k: float(np.median([f[k] for f in fixes]))     # noqa: E731
+        return med('lat'), med('lon'), med('height_m') / 1000, len(fixes)
+
+    def use_gnss_location(self):
+        fix = self.gnss_location()
+        if fix:
+            self.cancel_pick()
+            self.apply_location(fix[:3])
+            self.events.insertItem(0, '%s  Location from your GNSS position fixes (%d of them)'
+                                   % (fmt_clock(time.time()), fix[3]))
 
     def type_location(self):
         home = (HOME_LAT, HOME_LON, HOME_H) if catalog.HOME else None
@@ -2612,6 +2727,9 @@ class Tracker(QtWidgets.QMainWindow):
         self.map.update()
         if self.globe is not None and self.globe.isVisible():
             self.globe.view.set_scene(self.map.scene)
+            self.globe_info.setText(self._globe_info_text())
+        if self.sky is not None and self.sky.isVisible():
+            self.sky.update_now()
         self._update_table(by_name)
         self._update_detail(by_name.get(self.selected))
 
@@ -2667,55 +2785,106 @@ class Tracker(QtWidgets.QMainWindow):
         self.pass_cache = (name, self.t, res)
         return res
 
+    # ---- the selected satellite's details
+    def _badge(self, text, fg, bg):
+        return '<span style="background-color:%s; color:%s">&nbsp;%s&nbsp;</span>' % (bg, fg, text)
+
+    def _card(self, name, i, s=None, extra=''):
+        """the details' header, in the selection's colour: name, system, what it is, and badges for where it is
+        and whether it is being heard"""
+        sysd = systems.of_name(name)
+        col = QtGui.QColor(*sysd['colour']).name()
+        label = sysd['label'].split(' (')[0]
+        if i.get('system') == 'gnss':
+            cat = self.data.gnss_catalog_name(name)
+            sub = cat or 'not matched to the public catalog yet'
+        elif i.get('system') == 'iridium':
+            sub = ', '.join('plane %d, slot %d' % ps for ps in sorted(i['slots'])) or 'plane / slot not heard yet'
+        elif i.get('system') == 'orbcomm':
+            sub = 'satellite ID %s' % fmt_ids(i, 'unknown')
+        else:
+            sub = 'callsign %s' % (', '.join(i.get('callsigns', [])) or 'not heard')
+        badges = []
+        if s is None:
+            badges.append(self._badge('not on the map', TEXT, ROW_HEAD))
+        elif s['el'] > 0:
+            badges.append(self._badge('▲ %.0f° up' % s['el'], '#ffffff', '#1f8a4c'))
+        else:
+            badges.append(self._badge('▼ below your horizon', TEXT, ROW_HEAD))
+        heard = self.data.live_heard.get(name, 0)
+        if self.following and time.time() - heard < 60:
+            badges.append(self._badge('● heard now', '#ffffff', '#1f8a4c'))
+        elif i.get('last'):
+            badges.append(self._badge('last heard %s ago' % fmt_age(max(0, time.time() - i['last'])), TEXT, ROW_HEAD))
+        badges.append(extra)
+        return ('<table width="100%%" cellspacing="0" cellpadding="0" bgcolor="%s"><tr>'
+                '<td width="5" bgcolor="%s"></td>'
+                '<td><table cellspacing="0" cellpadding="7"><tr><td>'
+                '<span style="font-size:17px; font-weight:700">%s</span> &nbsp;'
+                '<span style="color:%s; font-weight:600">● %s</span><br>'
+                '<span style="color:%s">%s</span><br>%s'
+                '</td></tr></table></td></tr></table>'
+                % (SEL_BG, C_SELECT.name(), name, col, label, MUTED, sub, ' '.join(b for b in badges if b)))
+
+    def _section(self, title, rows=None, html=''):
+        """a titled block: label / value rows, then any html"""
+        out = ('<p style="margin-top:10px; margin-bottom:3px; color:%s; font-weight:700; font-size:11px">%s</p>'
+               % (ACCENT, title.upper()))
+        if rows:
+            out += '<table cellspacing="0" cellpadding="2">%s</table>' % ''.join(
+                '<tr><td style="color:%s; padding-right:10px" valign="top">%s</td><td>%s</td></tr>' % (MUTED, k, v)
+                for k, v in rows if v is not None)
+        return out + html
+
+    def _where_rows(self, s, nxt):
+        return [('At %s' % fmt_clock(self.t), 'lat %+.2f, lon %+.2f &middot; %.0f km up' % (s['lat'], s['lon'], s['alt'])),
+                ('From you', ('<b>%.0f&deg; up</b>, azimuth %.0f&deg; &middot; %.0f km away' % (s['el'], s['az'], s['rng']))
+                 if s['el'] > 0 else 'below your horizon (%.0f km away)' % s['rng']),
+                ('Next pass', nxt)]
+
     def _update_detail(self, s):
         if not s:
-            if self.selected in self.data.orbits:
-                o = self.data.orbits[self.selected]
-                self.detail.setText('<h3 style="margin:0">%s</h3>Our orbit for this satellite is too uncertain at %s '
-                                    '(&plusmn;%.0f km), so it is not drawn. Last observed %s.<br>'
-                                    'Move the timeline closer to when you heard it, or catch another fix.<hr>%s'
-                                    % (self.selected, fmt_time(self.t), o.sigma_km(self.t)[0], fmt_time(o.info['last_obs']),
-                                       self._fixes_html(self.selected)))
-            elif self.selected in self.data.info and 'tracked' in self.data.info[self.selected]['how']:
-                i = self.data.info[self.selected]       # GNSS: tracked, broadcast orbit not decoded yet
-                why = self.data.no_orbit.get(self.selected, '')
-                self.detail.setText(
-                    '<h3 style="margin:0">%s</h3>%s%s'
-                    '<b>Tracked</b> on its own ranging code (every GNSS satellite has '
-                    'its own), %d seconds in all.<br>Last heard %s &middot; best signal %.1f dB-Hz &middot; '
-                    '%d Doppler curve%s'
-                    '<br><span style="color:%s">Not on the map: %s. That takes about 30 s of steady tracking at '
-                    'roughly 35 dB-Hz or better - give the antenna more open sky.</span>'
-                    % (self.selected, self._gnss_catalog_line(self.selected), self._gnss_live_html(i), i.get('frames', 0),
-                       fmt_time(i['last']) if i['last'] else '-', i['best'],
-                       len(self.data.doppler.get(self.selected, [])),
-                       '' if len(self.data.doppler.get(self.selected, [])) == 1 else 's', MUTED,
-                       why or 'its broadcast orbit (ephemeris) has not been decoded yet'))
-            elif self.selected in self.data.info and 'frames' in self.data.info[self.selected]['how']:
-                i = self.data.info[self.selected]       # ISS / ham: heard, no orbit yet
-                self.detail.setText(
-                    '<h3 style="margin:0">%s</h3>Identified by its decoded frames (%d)%s.<br>Last heard %s &middot; '
-                    'best signal %.0f dB &middot; %d Doppler curve%s'
-                    '<br><span style="color:%s">Not on the map: it doesn\'t send its position, so its orbit has to '
-                    'come from its Doppler curves - that needs passes on more than one orbit.</span>'
-                    % (self.selected, i.get('frames', 0),
-                       ', callsign ' + ', '.join(i['callsigns']) if i.get('callsigns') else '',
-                       fmt_time(i['last']) if i['last'] else '-', i['best'], len(self.data.doppler.get(self.selected, [])),
-                       '' if len(self.data.doppler.get(self.selected, [])) == 1 else 's', MUTED))
-            elif self.selected in self.data.info:      # identified by Doppler, but no orbit yet
-                i = self.data.info[self.selected]
-                why = self.data.no_orbit.get(self.selected, '')
-                self.detail.setText(
-                    '<h3 style="margin:0">%s</h3>Identified by its Doppler curve: the way its frequency shifted '
-                    'as it passed matched this satellite.<br>Slot: %s &middot; last heard %s &middot; best signal %.0f dB'
-                    '<br><span style="color:%s">Not on the map: we have no orbit for it yet%s. A position fix from it '
-                    '(or a longer Doppler curve) will put it there.</span>'
-                    % (self.selected, ', '.join('P%d S%02d' % ps for ps in sorted(i['slots'])) or '-',
-                       fmt_time(i['last']) if i['last'] else '-', i['best'], MUTED,
-                       ' (%s)' % why if why else ''))
-            else:
-                self.detail.setText('Click a satellite on the map or in the list to see where it is, '
-                                    'how you identified it, how good our orbit for it is, and its next pass over you.')
+            name = self.selected
+            i = self.data.info.get(name) if name else None
+            if not i:
+                self.detail.setText('<span style="color:%s">Click a satellite on the map or in the list to see where '
+                                    'it is, how you identified it, how good our orbit for it is, and its next pass '
+                                    'over you.</span>' % MUTED)
+                return
+            nd = len(self.data.doppler.get(name, []))
+            if name in self.data.orbits:
+                o = self.data.orbits[name]
+                html = (self._card(name, i) + self._section('Our orbit', [
+                    ('Uncertainty', '&plusmn;%.0f km at %s - too uncertain to draw' % (o.sigma_km(self.t)[0], fmt_time(self.t))),
+                    ('Last observed', fmt_time(o.info['last_obs']))],
+                    '<span style="color:%s">Move the timeline closer to when you heard it, or catch another fix.</span>'
+                    % MUTED) + '<br>' + self._fixes_html(name))
+            elif i['system'] == 'gnss':
+                why = self.data.no_orbit.get(name, '')
+                html = (self._card(name, i, extra=self._badge('… no orbit yet', TEXT, ROW_HEAD)) +
+                        self._gnss_live_html(i) + self._section('Tracking', [
+                            ('Tracked', 'on its own ranging code, %d s in all' % i.get('frames', 0)),
+                            ('Best signal', '%.1f dB-Hz' % i['best']), ('Doppler curves', str(nd)),
+                            ('Last heard', fmt_time(i['last']) if i['last'] else '-')],
+                            '<span style="color:%s">Not on the map: %s. That takes about 30 s of steady tracking at '
+                            'roughly 35 dB-Hz or better - give the antenna more open sky.</span>'
+                            % (MUTED, why or 'its broadcast orbit (ephemeris) has not been decoded yet')))
+            elif 'frames' in i['how']:          # ISS / ham: heard, no orbit yet
+                html = (self._card(name, i) + self._section('Heard', [
+                    ('Identified by', 'its decoded frames (%d)' % i.get('frames', 0)),
+                    ('Best signal', '%.0f dB' % i['best']), ('Doppler curves', str(nd)),
+                    ('Last heard', fmt_time(i['last']) if i['last'] else '-')],
+                    '<span style="color:%s">Not on the map: it doesn\'t send its position, so its orbit has to come '
+                    'from its Doppler curves - that needs passes on more than one orbit.</span>' % MUTED))
+            else:                               # identified by Doppler, but no orbit yet
+                why = self.data.no_orbit.get(name, '')
+                html = (self._card(name, i) + self._section('Heard', [
+                    ('Identified by', 'its Doppler curve: the way its frequency shifted as it passed matched it'),
+                    ('Best signal', '%.0f dB' % i['best']),
+                    ('Last heard', fmt_time(i['last']) if i['last'] else '-')],
+                    '<span style="color:%s">Not on the map: we have no orbit for it yet%s. A position fix from it '
+                    '(or a longer Doppler curve) will put it there.</span>' % (MUTED, ' (%s)' % why if why else '')))
+            self.detail.setText(html)
             return
         i = self.data.info[s['name']]
         o = self.data.orbits[s['name']]
@@ -2729,70 +2898,53 @@ class Tracker(QtWidgets.QMainWindow):
             if np_[3]:
                 nxt = '<b style="color:%s">in view now</b> - sets %s%s' % (GOOD, fmt_clock(np_[1]), plus)
             else:
-                nxt = '%s to %s, max %.0f&deg; up%s' % (fmt_time(np_[0]), fmt_clock(np_[1]), np_[2], plus)
-        orbit_txt = ('%d position fix%s over %d pass%s + %d Doppler curve%s (%d frames)<br>'
-                     '%s'
-                     'fits your fixes to &plusmn;%.1f km &middot; period %.2f min<br>'
-                     '<b>Uncertainty at this time:</b> &plusmn;%.0f km'
-                     % (oi['fixes'], '' if oi['fixes'] == 1 else 'es', oi['passes'], '' if oi['passes'] == 1 else 'es',
-                        oi['doppler_groups'], '' if oi['doppler_groups'] == 1 else 's', oi['doppler_points'],
-                        'heading (north/south) from the measured orbital plane it lines up with<br>' if oi.get('direction_from_plane') else '',
-                        oi['fix_rms_km'], o.period_min, s['sigma']))
-        if oi.get('doppler_only'):      # ISS / ham: from Doppler curves alone
-            orbit_txt = ('from %d Doppler curves alone (%d frames), no position fixes<br>'
-                         'fits them to &plusmn;%.0f Hz &middot; period %.2f min<br>'
-                         '<b>Uncertainty at this time:</b> &plusmn;%.0f km'
-                         % (oi['doppler_groups'], oi['doppler_points'], oi.get('doppler_rms_hz', 0), o.period_min, s['sigma']))
+                nxt = '%s to %s, up to %.0f&deg;%s' % (fmt_time(np_[0]), fmt_clock(np_[1]), np_[2], plus)
         if i['system'] == 'gnss':
             self._update_detail_gnss(s, i, o, nxt)
             return
+        if oi.get('doppler_only'):      # ISS / ham: from Doppler curves alone
+            orbit_rows = [('Built from', '%d Doppler curves alone (%d frames), no position fixes'
+                           % (oi['doppler_groups'], oi['doppler_points'])),
+                          ('Fit', '&plusmn;%.0f Hz &middot; period %.2f min' % (oi.get('doppler_rms_hz', 0), o.period_min))]
+        else:
+            orbit_rows = [('Built from', '%d position fix%s over %d pass%s + %d Doppler curve%s (%d frames)'
+                           % (oi['fixes'], '' if oi['fixes'] == 1 else 'es', oi['passes'], '' if oi['passes'] == 1 else 'es',
+                              oi['doppler_groups'], '' if oi['doppler_groups'] == 1 else 's', oi['doppler_points'])),
+                          ('Fit', 'your fixes to &plusmn;%.1f km &middot; period %.2f min' % (oi['fix_rms_km'], o.period_min)),
+                          ('Heading', 'from the measured orbital plane it lines up with')
+                          if oi.get('direction_from_plane') else ('', None)]
+        orbit_rows.append(('Uncertainty now', '<b>%s</b>' % fmt_sigma(s['sigma'])))
+        heard_rows = [('Identified by', ' and '.join(sorted(i['how'])) or '-')]
+        if i['system'] == 'ham':
+            heard_rows.append(('Frames decoded', str(i.get('frames', 0))))
+        else:
+            heard_rows.append(('Position fixes', str(i['fixes'])))
+        heard_rows += [('Best signal', '%.1f dB' % i['best']), ('Last heard', fmt_time(i['last']) if i['last'] else '-')]
         self.detail.setText(
-            '<h3 style="margin:0">%s</h3>'
-            '<b>Identified by:</b> %s<br>'
-            '%s<br>'
-            '<b>Your position fixes:</b> %d &nbsp; <b>Best signal:</b> %.1f dB<br>'
-            '<b>Last heard:</b> %s<hr>'
-            '%s<hr>'
-            '<b>Our orbit:</b> %s<hr>'
-            '<b>At %s</b> (predicted):<br>lat %+.2f, lon %+.2f, altitude %.0f km<br>'
-            'From you: %s<br>'
-            '<b>Next pass:</b> %s'
-            % (s['name'], ' and '.join(sorted(i['how'])) or '-',
-               ('<b>Satellite ID:</b> %s' % fmt_ids(i, 'unknown')) if i['system'] == 'orbcomm' else
-               ('<b>Frames decoded:</b> %d &nbsp; <b>Callsigns:</b> %s' % (i.get('frames', 0), ', '.join(i.get('callsigns', [])) or '-'))
-               if i['system'] == 'ham' else
-               '<b>Plane/slot:</b> %s &nbsp; <b>Network ID:</b> %s' % (
-                   ', '.join('plane %d #%d' % ps for ps in sorted(i['slots'])) or 'unknown', fmt_ids(i, 'unknown')),
-               i['fixes'], i['best'], fmt_time(i['last']) if i['last'] else '-',
-               self._fixes_html(s['name']) if i['system'] != 'ham' else
-               'It sends no position: everything here comes from the Doppler shifts of its frames.', orbit_txt,
-               fmt_clock(self.t), s['lat'], s['lon'], s['alt'],
-               ('elevation %.0f&deg;, azimuth %.0f&deg;, %.0f km away' % (s['el'], s['az'], s['rng'])) if s['el'] > 0
-               else 'below your horizon (%.0f km away)' % s['rng'], nxt))
-
-    def _gnss_catalog_line(self, name):
-        cat = self.data.gnss_catalog_name(name)
-        return '<span style="color:%s">%s</span><br>' % (MUTED, 'Public catalog: ' + cat if cat else
-                                                          'Not matched to the public catalog yet')
+            self._card(s['name'], i, s) +
+            self._section('Where it is', self._where_rows(s, nxt)) +
+            self._section('Heard by you', heard_rows) +
+            self._section('Our orbit', orbit_rows) +
+            ('<br>' + self._fixes_html(s['name']) if i['system'] != 'ham' else
+             '<p style="color:%s">It sends no position: everything here comes from the Doppler shifts of its frames.</p>'
+             % MUTED))
 
     def _gnss_live_html(self, i):
         """the satellite's signal right now (from the receiver, every second) - or when it was last tracked"""
         now = i.get('now')
         age = time.time() - now['t'] if now else None
         if not now or not self.following or age > 10:
-            return ('<b>Live signal:</b> <span style="color:%s">not being tracked right now%s</span><hr>'
-                    % (MUTED, ' (last heard %s ago)' % fmt_age(age) if age is not None else ''))
+            return self._section('Live signal', [('Now', '<span style="color:%s">not being tracked%s</span>'
+                                                  % (MUTED, ' (last heard %s ago)' % fmt_age(age) if age is not None else ''))])
         level = max(0, min(10, int(round((now['cn0'] - 25) / 2))))      # 25 .. 45 dB-Hz
         bar = '<span style="color:%s">%s</span><span style="color:%s">%s</span>' % (
             GOOD if now['cn0'] >= 35 else ACCENT if now['cn0'] >= 30 else ALERT, '\u25ae' * level,
             MUTED, '\u25af' * (10 - level))
-        html = ('<b>Live signal</b> <span style="color:%s">(updated every second)</span><br>'
-                '<b>%.1f dB-Hz</b> %s &nbsp;%s<br>'
-                'Doppler <b>%+.0f Hz</b> (%s) &middot; locked for %s<br>'
-                % (MUTED, now['cn0'], bar,
-                   'strong enough to read its orbit' if now['cn0'] >= 35 else
-                   'weak: its orbit may not decode' if now['cn0'] >= 30 else 'very weak',
-                   now['dop'], 'coming closer' if now['dop'] > 0 else 'moving away', fmt_age(now['lock'])))
+        rows = [('Signal', '<b>%.1f dB-Hz</b> %s<br><span style="color:%s">%s</span>'
+                 % (now['cn0'], bar, MUTED, 'strong enough to read its orbit' if now['cn0'] >= 35 else
+                    'weak: its orbit may not decode' if now['cn0'] >= 30 else 'very weak')),
+                ('Doppler', '<b>%+.0f Hz</b> (%s)' % (now['dop'], 'coming closer' if now['dop'] > 0 else 'moving away')),
+                ('Locked for', fmt_age(now['lock']))]
         sync = now.get('sync')
         if sync:
             # (bit sync and frame sync together = its data message is being read; the first flag stays 0)
@@ -2800,36 +2952,29 @@ class Tracker(QtWidgets.QMainWindow):
             ticks = ' '.join('<span style="color:%s">%s %s</span>' % (GOOD if ok else MUTED, '\u2714' if ok else '\u2026', n)
                              for n, ok in steps)
             reading = all(ok for _, ok in steps)
-            html += ('Data message: %s &nbsp;%s<br>'
-                     'Message frames decoded: <b>%d</b> &middot; errors %d &middot; lock lost %d\u00d7'
-                     % (ticks, '<b style="color:%s">reading it</b>' % GOOD if reading else
-                        '<span style="color:%s">lining up...</span>' % MUTED, now['nav'], now['err'], now['lol']))
-        return html + '<hr>'
+            rows += [('Data message', '%s &nbsp;%s' % (ticks, '<b style="color:%s">reading it</b>' % GOOD if reading else
+                                                       '<span style="color:%s">lining up...</span>' % MUTED)),
+                     ('Frames decoded', '<b>%d</b> &middot; errors %d &middot; lock lost %d\u00d7'
+                      % (now['nav'], now['err'], now['lol']))]
+        return self._section('Live signal \u00b7 every second', rows)
 
     def _update_detail_gnss(self, s, i, o, nxt):
         """details of a GPS / Galileo satellite: tracked on its code, placed by its own broadcast orbit"""
         oi = o.info
         health = oi.get('health', 0)
         self.detail.setText(
-            '<h3 style="margin:0">%s</h3>%s%s'
-            '<b>Tracked</b> on its own ranging code, %d seconds in all<br>'
-            '<b>Best signal:</b> %.1f dB-Hz &nbsp; <b>Doppler curves:</b> %d<br>'
-            '<b>Last heard:</b> %s<hr>'
-            '<b>Its broadcast orbit</b> (ephemeris, decoded from its own signal):<br>'
-            'reference time %s &middot; received %s<br>'
-            'health: %s<br>'
-            'period %.2f min &middot; <b>uncertainty at this time:</b> %s<hr>'
-            '<b>At %s</b> (predicted):<br>lat %+.2f, lon %+.2f, altitude %.0f km<br>'
-            'From you: %s<br>'
-            '<b>Next pass:</b> %s'
-            % (s['name'], self._gnss_catalog_line(s['name']), self._gnss_live_html(i), i.get('frames', 0), i['best'],
-               len(self.data.doppler.get(s['name'], [])), fmt_time(i['last']) if i['last'] else '-',
-               fmt_time(oi['toe']), fmt_time(oi['last_obs']),
-               'OK' if not health else '<b style="color:%s">marked unhealthy by the satellite</b>' % ALERT,
-               o.period_min, fmt_sigma(s['sigma']),
-               fmt_clock(self.t), s['lat'], s['lon'], s['alt'],
-               ('elevation %.0f&deg;, azimuth %.0f&deg;, %.0f km away' % (s['el'], s['az'], s['rng'])) if s['el'] > 0
-               else 'below your horizon (%.0f km away)' % s['rng'], nxt))
+            self._card(s['name'], i, s, self._badge('\u2713 broadcast orbit', '#ffffff', '#2f6fb8')) +
+            self._gnss_live_html(i) +
+            self._section('Where it is', self._where_rows(s, nxt)) +
+            self._section('Tracking', [
+                ('Tracked', 'on its own ranging code, %d s in all' % i.get('frames', 0)),
+                ('Best signal', '%.1f dB-Hz' % i['best']),
+                ('Doppler curves', str(len(self.data.doppler.get(s['name'], [])))),
+                ('Last heard', fmt_time(i['last']) if i['last'] else '-')]) +
+            self._section('Its broadcast orbit', [
+                ('Reference time', fmt_time(oi['toe'])), ('Received', fmt_time(oi['last_obs'])),
+                ('Health', 'OK' if not health else '<b style="color:%s">marked unhealthy by the satellite</b>' % ALERT),
+                ('Period', '%.2f min' % o.period_min), ('Uncertainty now', '<b>%s</b>' % fmt_sigma(s['sigma']))]))
 
     def _fixes_html(self, name):
         """the positions this satellite sent us (Iridium ring alerts, Orbcomm ephemeris), newest pass first"""

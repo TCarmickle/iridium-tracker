@@ -17,13 +17,13 @@ PALETTES = {
                  HOVER='#2c323d', HOVER_BORDER='#3d4452', PRESSED='#353c49', SCROLL='#3a4150',
                  SCROLL_HOVER='#4a5263', STATUS='#101317', IDLE='#4a5263', PICK='#16324f', UP='#1c5434',
                  ALERT_BG='#3a1d22', ROW_HEAD='#262b35', DISABLED_BG='#3a4150', DISABLED_TEXT='#9aa1ad',
-                 WARN='#ffb454'),
+                 WARN='#ffb454', SEL_BG='#13303c'),
     'light': dict(BG='#eef1f5', PANEL='#ffffff', SURFACE='#e4e8ee', BORDER='#c9d0da', TEXT='#1d232c',
                   MUTED='#5d6675', ACCENT='#2f7de1', ALERT='#d64550', GOOD='#1f9d55', ALT='#f4f6f9',
                   HOVER='#d9dfe7', HOVER_BORDER='#aeb7c4', PRESSED='#cdd4de', SCROLL='#bcc4cf',
                   SCROLL_HOVER='#a3adba', STATUS='#e2e6ec', IDLE='#b3bcc8', PICK='#dbe9fb', UP='#c5ebd3',
                   ALERT_BG='#fbe1e4', ROW_HEAD='#e8ecf1', DISABLED_BG='#d5dae1', DISABLED_TEXT='#8a929e',
-                  WARN='#b86e00'),
+                  WARN='#b86e00', SEL_BG='#e1f3fa'),
 }
 # the map's own label and key colours (it can be light while the window is dark, or the other way round)
 MAP_INK = {

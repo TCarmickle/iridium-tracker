@@ -374,6 +374,12 @@ class GlobeView(QtWidgets.QWidget):
     def mouseDoubleClickEvent(self, e):
         self.center_home()
 
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        if getattr(self, 'corner', None) is not None:      # the map switches, top right
+            self.corner.adjustSize()
+            self.corner.move(self.width() - self.corner.width() - 10, 10)
+
     def wheelEvent(self, e):
         step = 1 / 1.15 if e.angleDelta().y() > 0 else 1.15
         if self.ground:
