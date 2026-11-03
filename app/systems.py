@@ -139,6 +139,13 @@ GLONASS_BAND = dict(GNSS_BAND, **{
     'listen_hz': 1602.0e6,
     'bands': [(1600.8, 1603.2, 'GLONASS L1 channels -2..+2 - under the noise', (190, 130, 255, 30))],
 })
+# each system's signal measure and its scale for the strength colours and bars: (weak - barely decodes,
+# strong, unit). Iridium / Orbcomm / ham: the SNR of each burst, packet or frame (dB over the noise in its
+# channel); GNSS: C/N0 every second (dB-Hz: the signal against the noise in 1 Hz - 35 is enough for the orbit)
+IRIDIUM['signal'] = (12.0, 30.0, 'dB')
+ORBCOMM['signal'] = (8.0, 25.0, 'dB')
+HAM['signal'] = (6.0, 24.0, 'dB')
+GNSS['signal'] = (28.0, 45.0, 'dB-Hz')
 IRIDIUM['system'] = 'iridium'
 ORBCOMM['system'] = 'orbcomm'
 ORBCOMM.update(rate=1228800, center_hz=137500000)     # the decoder needs a multiple of 9600 S/s

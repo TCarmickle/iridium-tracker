@@ -150,7 +150,7 @@ class SkyPlot(QtWidgets.QWidget):
         if self.show_now:
             for s in sorted(self.now, key=lambda s: s['selected']):
                 q = self._xy(s['el'], s['az'], cx, cy, R)
-                ring = it.heard_colour(s.get('heard_age'))
+                ring = it.heard_colour(s.get('heard_age'), s.get('sig_q'))
                 if ring is not None:
                     p.setPen(QtGui.QPen(ring, 2))
                     p.setBrush(Qt.NoBrush)
@@ -236,8 +236,8 @@ class SkyDialog(QtWidgets.QDialog):
         top.addWidget(self.period)
         top.addStretch(1)
         note = QtWidgets.QLabel('<span style="color:%s">Centre = straight overhead, edge = horizon, north up, east right. '
-                                'Satellites: up now (click one to select it; ring = heard: green now, yellow in the '
-                                'last 10 s, red in the last minute). '
+                                'Satellites: up now (click one to select it; ring = signal strength, red weak to '
+                                'green strong, fading as it goes quiet). '
                                 'Big dots: positions the satellites reported (colour = signal). Small dots: everything '
                                 'else heard from identified satellites. Move the antenna and watch the empty areas '
                                 'fill in.</span>' % MUTED)
@@ -285,7 +285,7 @@ class SkyDialog(QtWidgets.QDialog):
         import systems
         import iridium_tracker as it
         sats = [dict(el=s['el'], az=s['az'], name=s['name'], selected=s['selected'], live=s['live'],
-                     heard_age=s.get('heard_age'),
+                     heard_age=s.get('heard_age'), sig_q=s.get('sig_q'),
                      system=s['system'], label=systems.short_name(s['name']))
                 for s in sc.get('sats', []) if s['el'] > 0]
         path = []

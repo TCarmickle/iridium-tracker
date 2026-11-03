@@ -39,6 +39,7 @@ import lights  # noqa: E402
 import sdr_settings  # noqa: E402
 import source_dialog  # noqa: E402
 import settings_dialog  # noqa: E402  (location, data and storage)
+import signalview  # noqa: E402  (the Signal window)
 import spectrum  # noqa: E402
 import skyplot  # noqa: E402
 import globe  # noqa: E402
@@ -313,6 +314,7 @@ class Data:
         self.live_read = {}     # live file -> how far we've read it
         self.live_cap = None    # the newest capture (the one the receiver writes while running)
         self.live_fixes, self.live_heard, self.live_events = [], {}, []
+        self.live_signal = {}       # satellite -> deque of (t, signal) heard live: the last SIGNAL_KEEP_S
         self.frame_queue = []   # (kind, line) of new frames in the newest capture, for the activity lights
         self.unlinked = {}      # (capture, (plane, slot)) -> [(t, Hz)] of time & location frames not yet tied to a satellite
         self.live_links = {}    # (capture, (plane, slot)) -> name, matched while receiving
@@ -341,6 +343,26 @@ class Data:
             except OSError:
                 self._tles[system] = []
         return self._tles[system]
+
+    SIGNAL_KEEP_S = 600
+
+    def heard(self, name, t, value=None):
+        """a satellite heard at t, with its signal (SNR dB, or C/N0 dB-Hz for GNSS)"""
+        self.live_heard[name] = max(t, self.live_heard.get(name, 0))
+        if value:
+            dq = self.live_signal.setdefault(name, collections.deque())
+            dq.append((t, value))
+            while dq and dq[0][0] < t - self.SIGNAL_KEEP_S:
+                dq.popleft()
+
+    def signal_now(self, name):
+        """(signal, when) - the middle of its receptions in the 5 s before it was last heard; or None"""
+        dq = self.live_signal.get(name)
+        if not dq:
+            return None
+        t_last = dq[-1][0]
+        vals = [v for t, v in dq if t >= t_last - 5]
+        return float(np.median(vals)), t_last
 
     def gnss_catalog_name(self, n):
         """the public catalog's name of a GNSS satellite ('GPS G06' -> 'GPS BIIF-6  (PRN 06)'), for the info
@@ -762,13 +784,14 @@ class Data:
                 self._add_live_fix_info(fx)
                 if name:
                     refit.add(name)
+                    self.heard(name, t, snr)
                 events.append('%s  POSITION  %s  %+.2f, %+.2f  (%.0f dB)' % (fmt_clock(t), name or 'net ID %03d' % fx['net_id'], lat, lon, snr))
             pm = re.search(r' P(\d) S(\d+) ', line)
             if kind == 'ITL' and pm:
                 ps = (int(pm.group(1)), int(pm.group(2)))
                 name = self.slot_name.get(ps)
                 if name:
-                    self.live_heard[name] = t
+                    self.heard(name, t, snr)
                     self.info[name]['last'] = max(self.info[name]['last'], t)
                     if not self.live_doppler.get((cap, name)):
                         self.live_doppler[(cap, name)] = []
@@ -808,7 +831,7 @@ class Data:
                                                                             lat, lon, snr))
             name = self.oc_ids.get(sid)
             if name:                    # every packet's frequency is a point on its Doppler curve
-                self.live_heard[name] = t
+                self.heard(name, t, snr)
                 self._info(name)['last'] = max(self._info(name)['last'], t)
                 if not self.live_doppler.get((cap, name)):
                     self.live_doppler[(cap, name)] = []
@@ -845,7 +868,7 @@ class Data:
                 i['callsigns'] = sorted(set(i.get('callsigns', [])) | {call})
             i['last'] = max(i['last'], t)
             i['best'] = max(i['best'], snr)
-            self.live_heard[name] = t
+            self.heard(name, t, snr)
             if not self.live_doppler.get((cap, name)):
                 self.live_doppler[(cap, name)] = []
                 self.doppler.setdefault(name, []).append(self.live_doppler[(cap, name)])
@@ -874,7 +897,7 @@ class Data:
                 i['frames'] = i.get('frames', 0) + 1
                 i['last'] = max(i['last'], t)
                 i['best'] = max(i['best'], float(f[2]))
-                self.live_heard[name] = t
+                self.heard(name, t, float(f[2]))
                 if not self.live_doppler.get((cap, name)):
                     self.live_doppler[(cap, name)] = []
                     self.doppler.setdefault(name, []).append(self.live_doppler[(cap, name)])
@@ -1003,17 +1026,35 @@ def unmerc(wx, wy):
 
 
 C_SELECT = QtGui.QColor(56, 217, 255)       # the selected satellite's corner brackets (map, globe, key)
-# the ring round a satellite your receiver is hearing: by how long ago it last heard it
-HEARD_RINGS = [(4.0, QtGui.QColor(30, 210, 80)),        # green: now (the receiver's lines are read every 2 s)
-               (10.0, QtGui.QColor(245, 200, 40)),      # yellow: in the last 10 seconds
-               (60.0, QtGui.QColor(235, 70, 60))]       # red: in the last minute
+# the ring round a satellite your receiver is hearing: its colour is the signal's strength (red weak -
+# yellow - green strong, on its system's own scale, systems.py 'signal'), and it fades as the satellite goes
+# quiet, gone after HEARD_S
+HEARD_S = 60.0
+SIGNAL_COLOURS = [(0.0, (235, 70, 60)), (0.5, (245, 200, 40)), (1.0, (30, 210, 80))]
 
 
-def heard_colour(age):
-    """the ring colour for a satellite last heard `age` seconds ago (None: no ring)"""
-    if age is None:
+def signal_quality(name, value):
+    """a signal on its system's scale: 0 = barely decodes, 1 = strong"""
+    lo, hi, _ = systems.of_name(name).get('signal', (10.0, 30.0, 'dB'))
+    return min(1.0, max(0.0, (value - lo) / (hi - lo)))
+
+
+def strength_colour(q, alpha=255):
+    """red (weak) - yellow - green (strong) for a quality 0..1"""
+    for (q0, c0), (q1, c1) in zip(SIGNAL_COLOURS, SIGNAL_COLOURS[1:]):
+        if q <= q1:
+            k = (q - q0) / (q1 - q0)
+            return QtGui.QColor(*(int(a + (b - a) * k) for a, b in zip(c0, c1)), alpha)
+    return QtGui.QColor(*SIGNAL_COLOURS[-1][1], alpha)
+
+
+def heard_colour(age, q=None):
+    """the ring for a satellite heard `age` s ago with signal quality q: its strength colour, fading from
+    4 s (the receiver's lines are read every 2 s) to faint at HEARD_S; None after that (or never heard)"""
+    if age is None or age > HEARD_S:
         return None
-    return next((c for limit, c in HEARD_RINGS if age <= limit), None)
+    alpha = 255 if age <= 4 else int(255 - (age - 4) / (HEARD_S - 4) * 190)
+    return strength_colour(0.5 if q is None else q, alpha)
 
 
 def draw_selection(p, x, y, r=17.0):
@@ -1287,7 +1328,7 @@ class MapView(QtWidgets.QWidget):
                         p.setPen(QtGui.QPen(QtGui.QColor(160, 165, 175), 1, Qt.DotLine))
                         p.setBrush(Qt.NoBrush)
                         p.drawEllipse(QPointF(x + o, y), ring, ring)
-                    heard = heard_colour(s.get('heard_age'))
+                    heard = heard_colour(s.get('heard_age'), s.get('sig_q'))
                     if heard is not None:
                         p.setPen(QtGui.QPen(heard, 2))
                         p.setBrush(Qt.NoBrush)
@@ -1407,7 +1448,7 @@ class MapView(QtWidgets.QWidget):
                  ('orbcomm', 'Panel edge: orange Orbcomm, green ham'),
                  ('sat', 'Predicted (faded = uncertain)'),
                  ('view', 'Green = above your horizon'),
-                 ('live', 'Ring: heard now / 10 s / 1 min'),
+                 ('live', 'Ring: signal (red weak - green strong)'),
                  ('select', 'Brackets = selected')]
         font = p.font()
         font.setPointSize(8)
@@ -1456,10 +1497,10 @@ class MapView(QtWidgets.QWidget):
             elif kind == 'select':
                 draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.5)
                 draw_selection(p, x, y, 7.5)
-            elif kind == 'live':        # three small rings: green, yellow, red
+            elif kind == 'live':        # three small rings: weak, medium, strong
                 p.setBrush(Qt.NoBrush)
-                for j, (_, c) in enumerate(HEARD_RINGS):
-                    p.setPen(QtGui.QPen(c, 1.6))
+                for j, q in enumerate((0.0, 0.5, 1.0)):
+                    p.setPen(QtGui.QPen(strength_colour(q), 1.6))
                     p.drawEllipse(QPointF(x - 7 + 7 * j, y), 3.5, 3.5)
             else:
                 draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.65)
@@ -1804,6 +1845,11 @@ class Tracker(QtWidgets.QMainWindow):
                                 'shows blind spots, e.g. overhead or behind the house')
         self.sky_btn.clicked.connect(self.show_sky)
         self.sky = None
+        self.signal_btn = QtWidgets.QPushButton('\U0001F4F6  Signal')
+        self.signal_btn.setToolTip('How strongly your receiver hears each satellite: live bars, and the selected '
+                                   'one\'s signal over the last ten minutes')
+        self.signal_btn.clicked.connect(self.show_signal)
+        self.signal_win = None
         self.globe_btn = QtWidgets.QPushButton('\U0001F310  Globe')
         self.globe_btn.setToolTip('A 3D globe: the satellites, their orbital planes and your fixes around the Earth')
         self.globe_btn.clicked.connect(self.show_globe)
@@ -1834,6 +1880,7 @@ class Tracker(QtWidgets.QMainWindow):
         hl.addWidget(self.spec_btn)
         hl.addWidget(self.sky_btn)
         hl.addWidget(self.globe_btn)
+        hl.addWidget(self.signal_btn)
         hl.addSpacing(8)
         status_row.addWidget(self.rx_dot)
         status_row.addWidget(self.activity)
@@ -2126,6 +2173,16 @@ class Tracker(QtWidgets.QMainWindow):
             txt += '<br><b>%s</b>: not on the globe now (no orbit, or too uncertain at this time)' % self.selected
         return txt
 
+    def show_signal(self):
+        """the Signal window: live bars of how strongly each satellite is heard"""
+        if self.signal_win is None:
+            self.signal_win = signalview.SignalWindow(self)
+            self.signal_win.layout().insertWidget(0, self._sys_window_bar())
+            self.sys_box.currentIndexChanged.connect(lambda _: self.signal_win.refresh())
+        self.signal_win.show()
+        self.signal_win.raise_()
+        self.signal_win.refresh()
+
     def _globe_tile(self, z, x, y):
         """a map tile for the globe's Earth, in the map's theme"""
         return load_tile_rgb(z, x, y, self.map.map_theme)
@@ -2380,7 +2437,7 @@ class Tracker(QtWidgets.QMainWindow):
 
     def closeEvent(self, e):
         self.receiver.shutdown()
-        for win in (self.sky, self.globe, self.sat_info):      # separate windows: close them too
+        for win in (self.sky, self.globe, self.sat_info, self.signal_win):      # separate windows: close them too
             if win is not None:
                 win.close()
         super().closeEvent(e)
@@ -2799,7 +2856,7 @@ class Tracker(QtWidgets.QMainWindow):
                          'az': float(az[0]), 'rng': float(rng[0]), 'selected': n == self.selected, 'ident': ident,
                          'sigma': sigma, 'live': self.following and time.time() - d.live_heard.get(n, 0) < 60,
                          'heard_age': max(0.0, time.time() - d.live_heard[n]) if self.following and n in d.live_heard
-                         else None})
+                         else None, 'sig_q': self._sig_q(n)})
         by_name = {s['name']: s for s in sats}
 
         tmode = self.tracks_box.currentIndex()
@@ -2889,6 +2946,8 @@ class Tracker(QtWidgets.QMainWindow):
             self.globe_info.setText(self._globe_info_text())
         if self.sky is not None and self.sky.isVisible():
             self.sky.update_now()
+        if self.signal_win is not None and self.signal_win.isVisible():
+            self.signal_win.refresh()
         self._update_table(by_name)
         self._update_detail(by_name.get(self.selected))
 
@@ -2971,10 +3030,14 @@ class Tracker(QtWidgets.QMainWindow):
         else:
             badges.append(self._badge('▼ below your horizon', TEXT, ROW_HEAD))
         age = time.time() - self.data.live_heard.get(name, 0)
-        ring = heard_colour(age) if self.following else None
+        got = self.data.signal_now(name)
+        q = signal_quality(name, got[0]) if got else None
+        ring = heard_colour(age, q) if self.following else None
         if ring is not None:
-            badges.append(self._badge('\u25cf heard %s' % ('now' if age <= HEARD_RINGS[0][0] else '%d s ago' % age),
-                                      '#ffffff', ring.darker(130).name()))
+            unit = systems.of_name(name).get('signal', (0, 0, 'dB'))[2]
+            badges.append(self._badge('\u25cf %s%s' % ('%.0f %s' % (got[0], unit) if got else 'heard',
+                                                        '' if age <= 4 else ', %d s ago' % age),
+                                      '#ffffff', strength_colour(0.5 if q is None else q).darker(140).name()))
         elif i.get('last'):
             badges.append(self._badge('last heard %s ago' % fmt_age(max(0, time.time() - i['last'])), TEXT, ROW_HEAD))
         badges.append(extra)
@@ -3089,6 +3152,11 @@ class Tracker(QtWidgets.QMainWindow):
             ('<br>' + self._fixes_html(s['name']) if i['system'] != 'ham' else
              '<p style="color:%s">It sends no position: everything here comes from the Doppler shifts of its frames.</p>'
              % MUTED))
+
+    def _sig_q(self, name):
+        """the satellite's signal now on its system's scale (0..1), or None"""
+        got = self.data.signal_now(name)
+        return signal_quality(name, got[0]) if got else None
 
     def _gnss_live_html(self, i):
         """the satellite's signal right now (from the receiver, every second) - or when it was last tracked"""
