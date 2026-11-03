@@ -216,6 +216,7 @@ def fmt_sigma(km):
     return '±%.0f m' % (km * 1000) if km < 1 else '±%.0f km' % km
 
 
+NO_SYSTEM = 'none'      # the Systems filter's "None": no satellites shown (where the app starts)
 COL_TRACKS, COL_AT = 3, 5     # satellite list columns: the numeric one (sorts as a number), At this time
 # the three middle columns of the satellite list, per Systems filter (None = all systems)
 LIST_COLUMNS = {
@@ -1688,10 +1689,11 @@ class Tracker(QtWidgets.QMainWindow):
 
         opts = QtWidgets.QHBoxLayout()
         self.sys_box = QtWidgets.QComboBox()      # which satellite systems to show
+        self.sys_box.addItem('Systems: none', NO_SYSTEM)
         self.sys_box.addItem('Systems: all', None)
         for s in systems.DISPLAY:
             self.sys_box.addItem('%s only' % s['label'], s['key'])
-        self.sys_box.setToolTip('Show every satellite system, or just one')
+        self.sys_box.setToolTip('Show no satellites, every satellite system, or just one')
         self.tracks_box = QtWidgets.QComboBox()
         # (the order is what refresh() reads: 0 overhead + selected, 1 selected, 2 all, 3 none)
         self.tracks_box.addItems(['Tracks: overhead + selected', 'Tracks: selected only', 'Tracks: all satellites',
@@ -1699,8 +1701,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.tracks_box.setToolTip('Which satellites get their orbit track drawn on the map and globe:\n'
                                    'overhead (above your horizon now) plus the one you selected, only the selected one,\n'
                                    'every satellite with an orbit, or none')
-        self.tracks_box.setCurrentIndex(min(3, max(0, int(theme.load_ui().get('tracks', 0)))))
-        self.tracks_box.currentIndexChanged.connect(lambda i: theme.save_ui(tracks=i))
+        self.tracks_box.setCurrentIndex(0)          # starts on overhead + selected every time
         self.fp_box = QtWidgets.QComboBox()
         self.fp_box.addItems(['Footprint: selected', 'Footprints: all in view', 'Footprints: none'])
         self.fix_box = QtWidgets.QComboBox()
@@ -2394,14 +2395,16 @@ class Tracker(QtWidgets.QMainWindow):
             b = QtWidgets.QPushButton()
             b.setCheckable(True)
             b.setMinimumHeight(height)
-            col = QtGui.QColor(*systems.get(key)['colour']).name() if key else ACCENT
+            col = QtGui.QColor(*systems.get(key)['colour']).name() if key and key != NO_SYSTEM else \
+                ('#7a8494' if key == NO_SYSTEM else ACCENT)
             theme.style(b, 'QPushButton { padding: 2px 4px; font-size: 11px; border: 1px solid %%(BORDER)s;'
                            ' border-radius: 6px; background: %%(SURFACE)s; color: %%(TEXT)s; }'
                            ' QPushButton:checked { background: %s; border: 2px solid %s; color: white; font-weight: 700; }'
                            ' QPushButton:hover:!checked { border-color: %s; }'
                            % (QtGui.QColor(col).darker(180).name(), col, col))
             b.setToolTip('Show %s on the map, globe, sky plot and in the list'
-                         % ('every satellite system' if key is None else systems.get(key)['label']))
+                         % ('every satellite system' if key is None else 'no satellites' if key == NO_SYSTEM
+                            else systems.get(key)['label']))
             group.addButton(b, i)
             row.addWidget(b, 1)
         group.button(max(0, self.sys_box.currentIndex())).setChecked(True)
@@ -2425,6 +2428,10 @@ class Tracker(QtWidgets.QMainWindow):
         listed = self.data.tracked + self.data.doppler_only
         for i in range(self.sys_box.count()):
             key = self.sys_box.itemData(i)
+            if key == NO_SYSTEM:
+                for g in self.sys_groups:
+                    g.button(i).setText('None\n\u2013')
+                continue
             n = sum(1 for x in listed if key is None or systems.of_name(x)['key'] == key)
             label = 'All' if key is None else {'ham': 'ISS / ham'}.get(key, systems.get(key)['label'].split(' (')[0])
             for g in self.sys_groups:
@@ -2480,9 +2487,11 @@ class Tracker(QtWidgets.QMainWindow):
         d = self.data
         self._label_sys_buttons()
         want = self.sys_box.currentData()
+        if want == NO_SYSTEM:           # nothing shown: the boxes count every system
+            names = d.tracked + d.doppler_only
         orbit = sum(1 for x in names if x in d.orbits)
         heard = len(names) - orbit
-        fixes = [f for f in d.all_fixes() if self.shows(f['name'], f['cap'])]
+        fixes = [f for f in d.all_fixes() if want == NO_SYSTEM or self.shows(f['name'], f['cap'])]
         boxes = [(len(names), 'satellites listed', 'satellites you have received'),
                  (orbit, 'with our own orbit', 'on the map: an orbit worked out from your own receptions'),
                  (heard, 'heard, no orbit yet', 'in the list but not on the map yet (see each one for why)')]
@@ -2519,6 +2528,10 @@ class Tracker(QtWidgets.QMainWindow):
         for box, (v, cap, tip) in zip(self.stats, boxes):
             box.set(v, cap, tip)
         waiting = sorted(n for n, why in d.no_orbit.items() if 'direction' in why and self.shows(n))
+        if want == NO_SYSTEM:
+            self.summary.setText('<span style="color:%s">No satellites shown - pick a system above to see them '
+                                 '(the boxes count every system).</span>' % MUTED)
+            return
         self.summary.setText('<span style="color:%s">Every position and track comes only from your own receptions.%s</span>'
                              % (MUTED, ' Needs another fix: %s.' % ', '.join(waiting) if waiting else ''))
 
@@ -2527,6 +2540,8 @@ class Tracker(QtWidgets.QMainWindow):
         want = self.sys_box.currentData()
         if want is None:
             return True
+        if want == NO_SYSTEM:
+            return False
         if cap is not None and not name_or_system:
             return systems.of_capture(cap)['system'] == want
         key = name_or_system if name_or_system in systems.SYSTEMS else systems.of_name(name_or_system)['key']
