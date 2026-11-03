@@ -537,8 +537,9 @@ class GlobeView(QtWidgets.QWidget):
                     continue
                 col = QtGui.QColor(40, 190, 90) if st['el'] > 0 else QtGui.QColor(150, 156, 168)
                 p.setOpacity(1.0 if front else 0.12)       # behind the Earth: just a hint
-                if st.get('live') and front:               # heard by your receiver in the last minute
-                    p.setPen(QtGui.QPen(QtGui.QColor(0, 200, 0), 2))
+                ring = it.heard_colour(st.get('heard_age'))
+                if ring is not None and front:             # heard by your receiver: now / 10 s / a minute ago
+                    p.setPen(QtGui.QPen(ring, 2))
                     p.setBrush(Qt.NoBrush)
                     p.drawEllipse(QPointF(x, y), 14, 14)
                 self._sprite(p, x, y, col, 1.2 if st['selected'] else 0.85, st.get('system', 'iridium'))

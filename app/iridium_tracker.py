@@ -12,6 +12,7 @@ Run with 3-tracker.bat. Reads catalog-data.json (from catalog.py) and, while
 1-receive.bat is running, the live output-*.live file it writes.
 Map tiles come from OpenStreetMap and are cached in the tiles folder.
 """
+import collections
 import concurrent.futures
 import datetime
 import glob
@@ -217,6 +218,22 @@ def fmt_sigma(km):
 
 
 NO_SYSTEM = 'none'      # the Systems filter's "None": no satellites shown (where the app starts)
+# the Systems filter: categories, and the systems you can turn on and off under each
+CATEGORIES = [('comms', 'Communications', 'Comms', ('iridium', 'orbcomm')),
+              ('gnss', 'Navigation (GNSS)', 'Navigation', ('gps', 'galileo', 'glonass', 'waas')),
+              ('ham', 'ISS and ham satellites', 'ISS / ham', ('ham',))]
+SUB_LABELS = {'iridium': 'Iridium', 'orbcomm': 'Orbcomm', 'gps': 'GPS', 'galileo': 'Galileo', 'glonass': 'GLONASS',
+              'waas': 'WAAS', 'ham': 'ISS & ham'}
+SUB_CATEGORY = {sub: key for key, _, _, subs in CATEGORIES for sub in subs}
+GNSS_SUBS = {'GPS': 'gps', 'Galileo': 'galileo', 'GLONASS': 'glonass', 'WAAS': 'waas'}
+
+
+def sub_of(name):
+    """the system a satellite belongs to, finely: iridium, orbcomm, ham, gps, galileo, glonass or waas"""
+    key = systems.of_name(name)['key']
+    if key == 'gnss':
+        return GNSS_SUBS.get(name.split()[0], 'gps')
+    return key
 COL_TRACKS, COL_AT = 3, 5     # satellite list columns: the numeric one (sorts as a number), At this time
 # the three middle columns of the satellite list, per Systems filter (None = all systems)
 LIST_COLUMNS = {
@@ -986,6 +1003,17 @@ def unmerc(wx, wy):
 
 
 C_SELECT = QtGui.QColor(56, 217, 255)       # the selected satellite's corner brackets (map, globe, key)
+# the ring round a satellite your receiver is hearing: by how long ago it last heard it
+HEARD_RINGS = [(4.0, QtGui.QColor(30, 210, 80)),        # green: now (the receiver's lines are read every 2 s)
+               (10.0, QtGui.QColor(245, 200, 40)),      # yellow: in the last 10 seconds
+               (60.0, QtGui.QColor(235, 70, 60))]       # red: in the last minute
+
+
+def heard_colour(age):
+    """the ring colour for a satellite last heard `age` seconds ago (None: no ring)"""
+    if age is None:
+        return None
+    return next((c for limit, c in HEARD_RINGS if age <= limit), None)
 
 
 def draw_selection(p, x, y, r=17.0):
@@ -1259,8 +1287,9 @@ class MapView(QtWidgets.QWidget):
                         p.setPen(QtGui.QPen(QtGui.QColor(160, 165, 175), 1, Qt.DotLine))
                         p.setBrush(Qt.NoBrush)
                         p.drawEllipse(QPointF(x + o, y), ring, ring)
-                    if s['live']:
-                        p.setPen(QtGui.QPen(QtGui.QColor(0, 200, 0), 2))
+                    heard = heard_colour(s.get('heard_age'))
+                    if heard is not None:
+                        p.setPen(QtGui.QPen(heard, 2))
                         p.setBrush(Qt.NoBrush)
                         p.drawEllipse(QPointF(x + o, y), 15, 15)
                     draw_satellite(p, x + o, y, col, 1.25 if s['selected'] else 0.9, s['system'])
@@ -1378,7 +1407,7 @@ class MapView(QtWidgets.QWidget):
                  ('orbcomm', 'Panel edge: orange Orbcomm, green ham'),
                  ('sat', 'Predicted (faded = uncertain)'),
                  ('view', 'Green = above your horizon'),
-                 ('live', 'Ring = heard in the last minute'),
+                 ('live', 'Ring: heard now / 10 s / 1 min'),
                  ('select', 'Brackets = selected')]
         font = p.font()
         font.setPointSize(8)
@@ -1427,11 +1456,11 @@ class MapView(QtWidgets.QWidget):
             elif kind == 'select':
                 draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.5)
                 draw_selection(p, x, y, 7.5)
-            elif kind == 'live':
-                p.setPen(QtGui.QPen(QtGui.QColor(0, 200, 0), 1.6))
+            elif kind == 'live':        # three small rings: green, yellow, red
                 p.setBrush(Qt.NoBrush)
-                p.drawEllipse(QPointF(x, y), 7.5, 7.5)
-                draw_satellite(p, x, y, QtGui.QColor(120, 126, 138), 0.5)
+                for j, (_, c) in enumerate(HEARD_RINGS):
+                    p.setPen(QtGui.QPen(c, 1.6))
+                    p.drawEllipse(QPointF(x - 7 + 7 * j, y), 3.5, 3.5)
             else:
                 draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.65)
             p.setPen(QtGui.QColor(ink['text']))
@@ -1701,9 +1730,11 @@ class Tracker(QtWidgets.QMainWindow):
         self.sys_box = QtWidgets.QComboBox()      # which satellite systems to show
         self.sys_box.addItem('Systems: none', NO_SYSTEM)
         self.sys_box.addItem('Systems: all', None)
-        for s in systems.DISPLAY:
-            self.sys_box.addItem('%s only' % s['label'], s['key'])
-        self.sys_box.setToolTip('Show no satellites, every satellite system, or just one')
+        for key, label, _, _ in CATEGORIES:
+            self.sys_box.addItem(label, key)
+        self.sys_box.setToolTip('Show no satellites, every one, or one category (and pick its systems)')
+        self.sub_off = set()            # systems turned off under their category (e.g. {'glonass'})
+        self.sub_chips = []             # (system, button, its row) in every window's filter
         self.tracks_box = QtWidgets.QComboBox()
         # (the order is what refresh() reads: 0 overhead + selected, 1 selected, 2 all, 3 none)
         self.tracks_box.addItems(['Tracks: overhead + selected', 'Tracks: selected only', 'Tracks: all satellites',
@@ -1711,7 +1742,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.tracks_box.setToolTip('Which satellites get their orbit track drawn on the map and globe:\n'
                                    'overhead (above your horizon now) plus the one you selected, only the selected one,\n'
                                    'every satellite with an orbit, or none')
-        self.tracks_box.setCurrentIndex(0)          # starts on overhead + selected every time
+        self.tracks_box.setCurrentIndex(1)          # starts on selected only, every time
         self.fp_box = QtWidgets.QComboBox()
         self.fp_box.addItems(['Footprint: selected', 'Footprints: all in view', 'Footprints: none'])
         self.fix_box = QtWidgets.QComboBox()
@@ -2370,7 +2401,7 @@ class Tracker(QtWidgets.QMainWindow):
                        key=lambda n: (systems.DISPLAY.index(systems.of_name(n)), int(re.sub(r'\D', '', n) or 0), n))
         self.table.blockSignals(True)
         self.table.setSortingEnabled(False)
-        cols = LIST_COLUMNS.get(self.sys_box.currentData(), LIST_COLUMNS[None])
+        cols = LIST_COLUMNS.get(self.view_key(), LIST_COLUMNS[None])
         for c, (label, tip) in enumerate(cols, 1):
             head = QtWidgets.QTableWidgetItem(label)
             head.setToolTip(tip)
@@ -2378,7 +2409,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.table.setRowCount(len(names))
         for r, n in enumerate(names):
             i = d.info[n]
-            mid = self._list_cells(n, i, self.sys_box.currentData())
+            mid = self._list_cells(n, i, self.view_key())
             vals = [n] + mid[:2] + [mid[2][0], short_time(i['last']) if i['last'] else '-', '']
             for c, v in enumerate(vals):
                 item = NumItem(v, mid[2][1]) if c == COL_TRACKS else \
@@ -2393,18 +2424,22 @@ class Tracker(QtWidgets.QMainWindow):
         self.tle_note = 'Orbits: computed from your own observations only'
 
     def _sys_bar(self, height):
-        """a row of system buttons (All / Iridium / ... with their satellite counts) tied to the Systems
-        filter: (layout, button group)"""
+        """the Systems filter's buttons: the categories (None / All / Comms / Navigation / ISS & ham, with
+        satellite counts), and under them the chosen category's systems to turn on and off - (layout, group)"""
         group = QtWidgets.QButtonGroup(self)
         group.setExclusive(True)
+        box = QtWidgets.QVBoxLayout()
+        box.setSpacing(4)
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(4)
+        box.addLayout(row)
+        cat_colour = {'comms': systems.IRIDIUM['colour'], 'gnss': systems.GNSS['colour'], 'ham': systems.HAM['colour']}
         for i in range(self.sys_box.count()):
             key = self.sys_box.itemData(i)
             b = QtWidgets.QPushButton()
             b.setCheckable(True)
             b.setMinimumHeight(height)
-            col = QtGui.QColor(*systems.get(key)['colour']).name() if key and key != NO_SYSTEM else \
+            col = QtGui.QColor(*cat_colour[key]).name() if key in cat_colour else \
                 ('#7a8494' if key == NO_SYSTEM else ACCENT)
             theme.style(b, 'QPushButton { padding: 2px 4px; font-size: 11px; border: 1px solid %%(BORDER)s;'
                            ' border-radius: 6px; background: %%(SURFACE)s; color: %%(TEXT)s; }'
@@ -2413,16 +2448,62 @@ class Tracker(QtWidgets.QMainWindow):
                            % (QtGui.QColor(col).darker(180).name(), col, col))
             b.setToolTip('Show %s on the map, globe, sky plot and in the list'
                          % ('every satellite system' if key is None else 'no satellites' if key == NO_SYSTEM
-                            else systems.get(key)['label']))
+                            else self.sys_box.itemText(i)))
             group.addButton(b, i)
             row.addWidget(b, 1)
         group.button(max(0, self.sys_box.currentIndex())).setChecked(True)
         group.idClicked.connect(self.sys_box.setCurrentIndex)
         self.sys_box.currentIndexChanged.connect(lambda i, g=group: g.button(i).setChecked(True))
+        # the systems under each category: small on / off chips, shown for the chosen category
+        for key, _, _, subs in CATEGORIES:
+            if len(subs) < 2:
+                continue
+            chips = QtWidgets.QWidget()
+            cl = QtWidgets.QHBoxLayout(chips)
+            cl.setContentsMargins(0, 0, 0, 0)
+            cl.setSpacing(4)
+            col = QtGui.QColor(*cat_colour[key]).name()
+            for sub in subs:
+                c = QtWidgets.QPushButton(SUB_LABELS[sub])
+                c.setCheckable(True)
+                c.setChecked(sub not in self.sub_off)
+                c.setToolTip('Show or hide %s (within %s)' % (SUB_LABELS[sub], self.sys_box.itemText(
+                    self.sys_box.findData(key))))
+                theme.style(c, 'QPushButton { padding: 2px 10px; font-size: 10px; border: 1px solid %%(BORDER)s;'
+                               ' border-radius: 10px; background: %%(SURFACE)s; color: %%(MUTED)s; }'
+                               ' QPushButton:checked { background: %s; border: 1px solid %s; color: white; }'
+                               % (QtGui.QColor(col).darker(200).name(), col))
+                c.toggled.connect(lambda on, s=sub: self._set_sub(s, on))
+                cl.addWidget(c)
+                self.sub_chips.append((sub, c, chips))
+            cl.addStretch(1)
+            box.addWidget(chips)
+            chips.setProperty('category', key)
+        self.sys_box.currentIndexChanged.connect(lambda _: self._show_chips())
         self.sys_groups.append(group)
+        self._show_chips()
         if self.sys_groups[1:]:             # a new window's buttons: give them their counts straight away
             self._label_sys_buttons()
-        return row, group
+        return box, group
+
+    def _show_chips(self):
+        """only the chosen category's system chips are shown"""
+        want = self.sys_box.currentData()
+        for _, _, row in self.sub_chips:
+            row.setVisible(row.property('category') == want)
+
+    def _set_sub(self, sub, on):
+        """a system turned on or off under its category (every window's chip follows)"""
+        (self.sub_off.discard if on else self.sub_off.add)(sub)
+        for s, c, _ in self.sub_chips:
+            if s == sub and c.isChecked() != on:
+                c.blockSignals(True)
+                c.setChecked(on)
+                c.blockSignals(False)
+        self.reload_lists()
+        self.refresh()
+        if self.sky is not None:
+            self.sky.refresh()
 
     def _sys_window_bar(self):
         """the system buttons for the Sky / Globe windows, in a strip of their own"""
@@ -2435,16 +2516,20 @@ class Tracker(QtWidgets.QMainWindow):
     def _label_sys_buttons(self):
         """each system button: its name and how many of its satellites are listed"""
         listed = self.data.tracked + self.data.doppler_only
+        subs = collections.Counter(sub_of(x) for x in listed)
+        short = {key: s for key, _, s, _ in CATEGORIES}
         for i in range(self.sys_box.count()):
             key = self.sys_box.itemData(i)
             if key == NO_SYSTEM:
                 for g in self.sys_groups:
                     g.button(i).setText('None\n\u2013')
                 continue
-            n = sum(1 for x in listed if key is None or systems.of_name(x)['key'] == key)
-            label = 'All' if key is None else {'ham': 'ISS / ham'}.get(key, systems.get(key)['label'].split(' (')[0])
+            n = len(listed) if key is None else sum(v for s, v in subs.items() if SUB_CATEGORY.get(s) == key)
             for g in self.sys_groups:
-                g.button(i).setText('%s\n%d' % (label, n))
+                g.button(i).setText('%s\n%d' % ('All' if key is None else short[key], n))
+        for sub, c, _ in self.sub_chips:
+            c.setText('%s  %d' % (SUB_LABELS[sub], subs.get(sub, 0)))
+            c.setMinimumWidth(c.fontMetrics().width(c.text()) + 28)     # (grow with the count)
 
     def _list_cells(self, n, i, want):
         """the three middle cells of a satellite's row: two texts and (text, number) for the numeric one"""
@@ -2498,7 +2583,7 @@ class Tracker(QtWidgets.QMainWindow):
         """the system buttons' counts, the number boxes and the note under them, for the systems shown"""
         d = self.data
         self._label_sys_buttons()
-        want = self.sys_box.currentData()
+        want = self.view_key()
         if want == NO_SYSTEM:           # nothing shown: the boxes count every system
             names = d.tracked + d.doppler_only
         orbit = sum(1 for x in names if x in d.orbits)
@@ -2550,16 +2635,32 @@ class Tracker(QtWidgets.QMainWindow):
                              % (MUTED, ' Needs another fix: %s.' % ', '.join(waiting) if waiting else ''))
 
     def shows(self, name_or_system, cap=None):
-        """is this satellite (or system key, or a fix from capture `cap`) shown by the Systems filter?"""
+        """is this satellite (or system key, or a fix from capture `cap`) shown by the Systems filter -
+        its category chosen, and its system not turned off there?"""
         want = self.sys_box.currentData()
         if want is None:
             return True
         if want == NO_SYSTEM:
             return False
         if cap is not None and not name_or_system:
-            return systems.of_capture(cap)['system'] == want
-        key = name_or_system if name_or_system in systems.SYSTEMS else systems.of_name(name_or_system)['key']
-        return key == want
+            band = systems.of_capture(cap)
+            subs = (('glonass',) if band['key'] == 'glo1' else ('gps', 'galileo', 'waas')) \
+                if band['system'] == 'gnss' else (band['system'],)
+        elif name_or_system in systems.SYSTEMS:
+            key = systems.SYSTEMS[name_or_system].get('system', name_or_system)
+            subs = [s for s, c in SUB_CATEGORY.items() if c == key] if key == 'gnss' else [key]
+        else:
+            subs = [sub_of(name_or_system)]
+        return any(SUB_CATEGORY.get(s) == want and s not in self.sub_off for s in subs)
+
+    def view_key(self):
+        """the system the list's columns and the number boxes are about: iridium / orbcomm / gnss / ham, None for
+        a mix (All, or Comms with both systems on), or NO_SYSTEM"""
+        want = self.sys_box.currentData()
+        if want == 'comms':
+            on = [s for s in ('iridium', 'orbcomm') if s not in self.sub_off]
+            return on[0] if len(on) == 1 else None
+        return want
 
     def _table_clicked(self, row, _col):
         self.select(self.table.item(row, 0).data(Qt.UserRole), from_table=True)
@@ -2696,7 +2797,9 @@ class Tracker(QtWidgets.QMainWindow):
                                                     ', '.join('net ID %03d' % x for x in sorted(i['net_ids']))]))
             sats.append({'name': n, 'system': i['system'], 'lat': float(lat[0]), 'lon': float(lon[0]), 'alt': float(alt[0]), 'el': float(el[0]),
                          'az': float(az[0]), 'rng': float(rng[0]), 'selected': n == self.selected, 'ident': ident,
-                         'sigma': sigma, 'live': self.following and time.time() - d.live_heard.get(n, 0) < 60})
+                         'sigma': sigma, 'live': self.following and time.time() - d.live_heard.get(n, 0) < 60,
+                         'heard_age': max(0.0, time.time() - d.live_heard[n]) if self.following and n in d.live_heard
+                         else None})
         by_name = {s['name']: s for s in sats}
 
         tmode = self.tracks_box.currentIndex()
@@ -2867,9 +2970,11 @@ class Tracker(QtWidgets.QMainWindow):
             badges.append(self._badge('▲ %.0f° up' % s['el'], '#ffffff', '#1f8a4c'))
         else:
             badges.append(self._badge('▼ below your horizon', TEXT, ROW_HEAD))
-        heard = self.data.live_heard.get(name, 0)
-        if self.following and time.time() - heard < 60:
-            badges.append(self._badge('● heard now', '#ffffff', '#1f8a4c'))
+        age = time.time() - self.data.live_heard.get(name, 0)
+        ring = heard_colour(age) if self.following else None
+        if ring is not None:
+            badges.append(self._badge('\u25cf heard %s' % ('now' if age <= HEARD_RINGS[0][0] else '%d s ago' % age),
+                                      '#ffffff', ring.darker(130).name()))
         elif i.get('last'):
             badges.append(self._badge('last heard %s ago' % fmt_age(max(0, time.time() - i['last'])), TEXT, ROW_HEAD))
         badges.append(extra)
