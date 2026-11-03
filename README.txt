@@ -6,9 +6,10 @@ ring alerts (each one carries the satellite's own position) and their Doppler sh
 the tracker fits every orbit from those observations alone - no downloaded orbit data is
 used for positions. Satellites appear once they have sent you a position fix.
 
-It also receives ORBCOMM satellites (137 MHz), which send their own position too, and the
-ISS and amateur (ham) CubeSats on 2 m and 70 cm (see "SYSTEMS" below). The map, list, globe and sky plot show every system together, with a
-Systems filter to show just one.
+It also receives ORBCOMM satellites (137 MHz), which send their own position too, the
+ISS and amateur (ham) CubeSats on 2 m and 70 cm, and the GPS and Galileo navigation satellites
+with a GPS antenna (see "SYSTEMS" and "GNSS" below). The map, list, globe and sky plot show
+every system together, with a Systems filter to show just one.
 
 Everything is in this folder: the decoder (gr-iridium + iridium-toolkit), Python, and the app.
 Nothing is installed on the computer.
@@ -25,6 +26,8 @@ WHAT YOU NEED
   two arms of about 53 cm opened to 120 degrees (the classic 137 MHz satellite antenna).
 - For the ISS / ham satellites: a whip of about 49 cm (19 1/4 in) for 2 m or 16.5 cm (6 1/2 in)
   for 70 cm, or a 2 m / 70 cm dual-band whip.
+- For GPS / Galileo: an active GPS antenna (the usual puck with an SMA plug, 3-5 V) and an SDR
+  with a bias-T to power it.
 
 
 ONE-TIME SETUP: THE USB DRIVER (needs administrator rights)
@@ -122,6 +125,7 @@ receiver, or in Source:
   Orbcomm        (137 MHz)  antenna about 52 cm (whip), or a V-dipole of 2 x 53 cm at 120 degrees
   ISS & ham 2 m  (145 MHz)  antenna about 49 cm (19 1/4 in)
   Ham 70 cm      (436 MHz)  antenna about 16.5 cm (6 1/2 in)
+  GNSS L1 (GPS)  (1575 MHz) an active GPS antenna, straight into the SDR (see GNSS below)
 Change the antenna to match, then press Start. Each band keeps its own gain. Every band but
 Iridium has a fixed sample rate and frequency, set for its decoders.
 
@@ -144,13 +148,48 @@ which callsign. These satellites don't send their own position, so they appear i
 (with their Doppler curves) but not on the map until their orbit can be worked out from Doppler
 alone.
 
-Everything you have received is always shown; the Systems box under the map (Systems: all /
-Iridium only / Orbcomm only / ISS & ham sats only) filters the map, list, globe and sky plot.
+Everything you have received is always shown; the system buttons above the satellite list
+(All / Iridium / Orbcomm / ISS & ham / GNSS, each with how many satellites it has) filter the
+map, list, globe and sky plot, and the boxes under them sum up the system you picked.
 Iridium's orbital-plane rings are Iridium only.
 
 Sound: the Audio menu (next to the spectrum) has a Mode (NFM, WFM, AM, USB, LSB, CW) and a
 Bandwidth for the tuned sound; each band starts on its own default (ham: NFM). To hear the ISS's
 voice contacts or SSTV events, tune to 145.800 MHz on NFM.
+
+
+GNSS: GPS AND GALILEO (1575.42 MHz)
+-----------------------------------
+GPS and Galileo satellites all transmit on 1575.42 MHz. Their signals are weaker than the radio
+noise - nothing shows in the spectrum - but a GNSS receiver digs them out by correlating with
+each satellite's code. The tracker uses PocketSDR (by T. Takasu, the author of RTKLIB) for that.
+
+Antenna: an ACTIVE GPS antenna (it has an amplifier inside, powered through the coax). Plug it
+straight into the SDR and turn on Bias-T in Source (some SDRs, like the SMArTee XTR, power the
+antenna all the time). It needs open sky: outdoors, or at least in a window. A metal plate under
+a puck antenna (10 cm or more across) helps - it blocks signals bouncing off the ground.
+
+Pick "GNSS L1 (GPS)" next to Start receiver and press Start. The receiver records 3 minutes at a
+time and hands each piece to PocketSDR, so satellites show up a few minutes after Start, then
+every 3 minutes. Leave it running at least 10-15 minutes.
+  - Satellites it tracks appear in the list ("GPS G06", "Galileo E18") with their Doppler
+    curves, as "Doppler only, no orbit" at first.
+  - Once a satellite has been tracked long enough (about 30 seconds of strong, unbroken signal)
+    its broadcast orbit (ephemeris) is decoded: the satellite's own description of its orbit.
+    It then goes on the map and globe at its real height (about 20,200 km) with a full orbit,
+    and the summary box counts it under "with broadcast orbit".
+  - With 4 or more broadcast orbits the receiver works out where YOU are: the log shows
+    "GNSS FIX lat, lon, height (N satellites)". It should land near the location you set
+    (within a kilometre or so) - a good check of the whole chain.
+A broadcast orbit is accurate to a few metres for about 4 hours and slowly gets less certain
+after that; the next run refreshes it. BeiDou is not received (its signals at this frequency
+need more processing than one 3-minute piece allows). A GPS orbit takes 12 hours, so its track
+on the flat map sweeps from about 55 degrees south to 55 north and back across half the world;
+on the globe it is a ring around the Earth.
+
+Offset tuning (Source, on by default for the E4000 tuner) keeps the SDR's own spike at the
+centre frequency off the signal. If nothing is tracked after 10 minutes: check the antenna has
+sky, Bias-T is on, and try a higher gain in Source.
 
 
 ACTIVITY LIGHTS
@@ -213,6 +252,8 @@ captures\                  one set of files per receiver run:
   output-<date-time>.start      the exact time the capture started (kept)
   output-<date-time>.frames.gz  only the ring alerts and time & location frames (kept, ~1-2%
                                 of the size) - enough to rebuild the catalog
+  (Orbcomm, ham and GNSS runs are named orbcomm-, ham- and gnss-<date-time> and keep only the
+  lines the tracker uses: positions, Doppler, broadcast orbits and fixes)
 tiles\                     cached map pictures from OpenStreetMap
 
 Keeping it small: once a capture is in the catalog, its raw files (.bits .live .log) are

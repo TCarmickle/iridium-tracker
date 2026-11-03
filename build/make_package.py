@@ -13,7 +13,7 @@ OUT = os.path.join(ROOT, 'dist', 'IridiumTracker.zip')
 INCLUDE = ['Iridium Tracker.bat', 'Iridium Console.bat', 'README.txt', 'LICENSES', 'app', 'python']
 # never shipped: your location, captures, catalog, map cache, logs
 EXCLUDE = ['app/settings.json', 'app/output*', 'app/catalog-data*.json', 'app/catalog.txt',
-           'app/iridium-names.tle', 'app/tiles/*', 'app/tracker-error.log', '*/__pycache__/*', '*.pyc']
+           'app/iridium-names.tle', 'app/tiles/*', 'app/tracker-error.log', 'app/pocketsdr/.pocket_navdata.csv', '*/__pycache__/*', '*.pyc']
 
 
 def excluded(rel):

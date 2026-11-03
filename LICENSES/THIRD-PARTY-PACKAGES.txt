@@ -7,6 +7,8 @@ package                              version          license
 _openmp_mutex                        4.5              BSD-3-Clause
 _python_abi3_support                 1.0              MIT
 backports.zstd                       1.8.0            Python-2.0
+brotli                               1.2.1            MIT
+brotli-bin                           1.2.1            MIT
 brotli-python                        1.2.1            MIT
 bzip2                                1.0.8            bzip2-1.0.6
 ca-certificates                      2026.10.23       ISC
@@ -14,8 +16,11 @@ cairo                                1.18.6           LGPL-2.1-only or MPL-1.1
 certifi                              2026.10.23       ISC
 charset-normalizer                   3.5.2            MIT
 click                                8.5.0            BSD-3-Clause
+construct                            2.10.70          MIT
+contourpy                            1.4.0            BSD-3-Clause
 cpython                              3.12.16          Python-2.0
 crcmod                               1.7              MIT
+cycler                               0.12.1           BSD-3-Clause
 fftw                                 3.3.11           GPL-2.0-or-later
 fmt                                  12.1.0           MIT
 font-ttf-dejavu-sans-mono            2.37             BSD-3-Clause
@@ -25,6 +30,7 @@ font-ttf-ubuntu                      0.83             LicenseRef-Ubuntu-Font-Lic
 fontconfig                           2.18.3           MIT
 fonts-conda-ecosystem                1                BSD-3-Clause
 fonts-conda-forge                    1                BSD-3-Clause
+fonttools                            4.68.0           MIT
 freetype                             2.14.3           GPL-2.0-only OR FTL
 fribidi                              1.0.18           LGPL-2.1-or-later
 glib                                 2.90.1           LGPL-2.1-or-later
@@ -34,7 +40,9 @@ gnuradio-iqbalance                   0.38.3           GPL-3.0-or-later
 gnuradio-iridium                     1!1.0.0          GPL-3.0-or-later
 gnuradio-osmosdr                     0.2.6            GPL-3.0-or-later
 gnuradio-pmt                         3.10.12.0        GPL-3.0-or-later
+gnuradio-satellites                  5.9.0            GPL-3.0-or-later
 gnuradio-uhd                         3.10.12.0        GPL-3.0-or-later
+gnuradio-zeromq                      3.10.12.0        GPL-3.0-or-later
 graphite2                            1.3.15           LGPL-2.0-or-later
 gsl                                  2.8              GPL-3.0-or-later
 gst-plugins-base                     1.26.11          LGPL-2.0-or-later
@@ -45,16 +53,23 @@ hyperframe                           6.1.0            MIT
 icu                                  78.3             MIT
 idna                                 3.20             BSD-3-Clause
 importlib-metadata                   10.0.0           Apache-2.0
+kiwisolver                           1.5.1            BSD-3-Clause
 krb5                                 1.22.2           MIT
 lame                                 4.0              LGPL-2.0-only
+lcms2                                2.20             MIT
+lerc                                 4.3.0            Apache-2.0
 libairspy                            1.0.10           BSD-3-Clause AND MIT AND GPL-2.0-or-later AND LGPL-2.1-or-later
 libairspyhf                          1.6.8            BSD-3-Clause AND LGPL-2.1-or-later
 libbladerf2                          2025.10          LGPL-2.1-or-later AND GPL-2.0-or-later
 libblas                              3.11.0           BSD-3-Clause
 libboost                             1.88.0           BSL-1.0
+libbrotlicommon                      1.2.1            MIT
+libbrotlidec                         1.2.1            MIT
+libbrotlienc                         1.2.1            MIT
 libcblas                             3.11.0           BSD-3-Clause
 libclang13                           23.1.4           Apache-2.0 WITH LLVM-exception
 libcodec2                            1.2.0            LGPL-2.1-or-later
+libdeflate                           1.25             MIT
 libexpat                             2.9.0            MIT
 libffi                               3.7.0            MIT
 libflac                              1.5.0            BSD-3-Clause
@@ -81,10 +96,14 @@ libpango                             1.58.2           LGPL-2.1-or-later
 libpango-devel                       1.58.2           LGPL-2.1-or-later
 libpng                               1.6.59           zlib-acknowledgement
 libpython                            3.14.10          Python-2.0
+libraqm                              0.11.0           MIT
 libsndfile                           1.2.2            LGPL-2.1-or-later
+libsodium                            1.0.22           ISC
 libsqlite                            3.54.1           blessing
+libtiff                              4.7.2            HPND
 libusb                               1.0.30           LGPL-2.1-or-later
 libvorbis                            1.3.7            BSD-3-Clause
+libwebp-base                         1.6.0            BSD-3-Clause
 libwinpthread                        12.0.0.r688.g6b2176247.1 MIT
 libxml2-16                           2.15.4           MIT
 libxml2                              2.15.4           MIT
@@ -92,25 +111,34 @@ libzlib                              1.3.2            Zlib
 llvm-openmp                          23.1.4           Apache-2.0 WITH LLVM-exception
 mako                                 1.4.3            MIT
 markupsafe                           3.0.4            BSD-3-Clause
+matplotlib-base                      3.11.2           PSF-2.0
 mpg123                               1.33.7           LGPL-2.1-only
 mpir                                 3.0.0            LGPL 3
+munkres                              1.1.4            Apache-2.0
 numpy                                2.2.3            BSD-3-Clause
+openjpeg                             2.5.4            BSD-2-Clause
 openssl                              3.6.5            Apache-2.0
 packaging                            26.3             Apache-2.0
 pango                                1.58.2           LGPL-2.1-or-later
 pcre2                                10.47            BSD-3-Clause
+pillow                               13.0.0           HPND
 pip                                  26.2.2           MIT
 pixman                               0.46.4           MIT
 ply                                  3.11             BSD-3-Clause
 portaudio                            19.7.0           MIT
 pybind11-abi                         11               BSD-3-Clause
+pyparsing                            3.3.3            MIT
 pyqt                                 5.15.9           GPL-3.0-only
 pyqt5-sip                            12.12.2          GPL-3.0-only
 pysocks                              1.7.1            BSD-3-Clause
 python                               3.12.9           Python-2.0
+python-dateutil                      4.0.0            Apache-2.0
 python-gil                           3.12.16          Python-2.0
+python-tzdata                        2026.6           Apache-2.0
 python_abi                           3.12             BSD-3-Clause
 pyyaml                               6.0.3            MIT
+pyzmq                                27.2.0           BSD-3-Clause
+qhull                                2020.2           LicenseRef-Qhull
 qt-main                              5.15.15          LGPL-3.0-only
 requests                             2.34.2           Apache-2.0
 rtl-sdr                              2.0.3            GPL-2.0-or-later AND LGPL-2.1-or-later
@@ -127,14 +155,18 @@ tomli                                2.5.0            MIT
 tzdata                               2026e            LicenseRef-Public-Domain
 ucrt                                 10.0.26100.0     LicenseRef-MicrosoftWindowsSDK10
 uhd                                  4.10.0.0         GPL-3.0-or-later
+unicodedata2                         18.0.0           Apache-2.0
 urllib3                              2.8.0            MIT
 vc                                   14.5             BSD-3-Clause
 vc14_runtime                         14.51.36247      LicenseRef-MicrosoftVisualCpp2015-2022Runtime
 vcomp14                              14.51.36247      LicenseRef-MicrosoftVisualCpp2015-2022Runtime
 volk                                 3.3.0            LGPL-3.0-or-later AND Apache-2.0
+websocket-client                     1.9.2            Apache-2.0
 wheel                                0.48.0           MIT
 win_inet_pton                        1.1.0            LicenseRef-Public-Domain
 yaml                                 0.2.5            MIT
+zeromq                               4.3.5            MPL-2.0
 zipp                                 4.1.2            MIT
 zlib                                 1.3.2            Zlib
+zlib-ng                              2.3.3            Zlib
 zstd                                 1.5.7            BSD-3-Clause

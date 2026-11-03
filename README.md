@@ -1,7 +1,7 @@
 # Iridium Tracker
 
-A Windows app that maps the Iridium and Orbcomm satellites **your own antenna** hears - and logs the ISS and
-ham CubeSats it hears - using an RTL-SDR.
+A Windows app that maps the Iridium, Orbcomm, GPS and Galileo satellites **your own antenna** hears - and
+logs the ISS and ham CubeSats it hears - using an RTL-SDR.
 
 The receiver decodes the satellites' *ring alerts* (each carries the satellite's own position)
 and measures their Doppler shift. The tracker then fits every satellite's orbit **from those
@@ -9,8 +9,9 @@ observations alone**: no downloaded orbit data is used for positions or tracks. 
 once they have sent you a position fix, and fade as the time since you last heard them grows.
 
 Orbcomm satellites (137 MHz) work the same way: each one broadcasts its own position (ephemeris
-packets), so their orbits come from your receptions too. One SDR receives one system at a time;
-everything received from both is shown together, with a **Systems** filter.
+packets), so their orbits come from your receptions too. So do GPS and Galileo: with a GPS antenna,
+each satellite's own broadcast orbit is decoded from its signal. One SDR receives one system at a time;
+everything received is shown together, with a **Systems** filter.
 
 ## Features
 - **Several systems: Iridium (1.6 GHz), Orbcomm (137 MHz), ISS & ham satellites (2 m / 70 cm)** - pick which
@@ -19,6 +20,10 @@ everything received from both is shown together, with a **Systems** filter.
 - **ISS and CubeSats**: the whole 2 m / 70 cm slice is watched; each signal's Doppler shift is measured and the
   [gr-satellites](https://github.com/daniestevez/gr-satellites) decoders of nearby satellites are tried; only
   unambiguous frames name a satellite (ISS: packets it digipeated). Frame contents are never stored
+- **GNSS: GPS + Galileo** (1575.42 MHz, active GPS antenna straight into the SDR): [PocketSDR](https://github.com/tomojitakasu/PocketSDR)
+  tracks the satellites under the noise; their Doppler curves are listed, each satellite's own broadcast orbit
+  (ephemeris) puts it on the map and globe, and with four of them the app works out your own position as a
+  check of the whole chain
 - **Sound modes**: NFM, WFM, AM, USB, LSB, CW with a bandwidth, defaulting per band
 - **Start / stop the receiver** from the app; captures are decoded into a running catalog automatically
 - **Live map** (dark theme, OpenStreetMap) with measured fixes, predicted positions and tracks,
@@ -50,6 +55,8 @@ everything received from both is shown together, with a **Systems** filter.
 - Windows 10/11 (64-bit)
 - An RTL-SDR that reaches 1626 MHz (tested: Nooelec SMArTee XTR, E4000 tuner)
 - An L-band antenna (1.6 GHz) with a view of the sky - even a short whip outdoors decodes ring alerts
+- Optional: a 137 MHz whip or V-dipole (Orbcomm), a 2 m / 70 cm whip (ISS, CubeSats), an active GPS
+  antenna and an SDR with a bias-T (GPS / Galileo)
 - The WinUSB driver for the SDR, installed once with [Zadig](https://zadig.akeo.ie)
 
 ## Getting started
@@ -68,6 +75,7 @@ The full user guide is [README.txt](README.txt).
 | Decode bursts into frames | [iridium-toolkit](https://github.com/muccc/iridium-toolkit) `iridium-parser` |
 | Receive and decode ISS / ham satellites (2 m, 70 cm) | `app/ham_rx.py` (GNU Radio) + [gr-satellites](https://github.com/daniestevez/gr-satellites) |
 | Receive and decode Orbcomm (all 8 channels at once) | `app/orbcomm_rx.py` (GNU Radio) + `app/orbcomm/`, adapted from [ORBCOMM-receiver](https://github.com/fbieberly/ORBCOMM-receiver) |
+| Track GPS / Galileo and decode their broadcast orbits | `app/gnss_rx.py` (GNU Radio, 3-minute IQ pieces) + [PocketSDR](https://github.com/tomojitakasu/PocketSDR) `pocket_trk`; orbits read from its RTCM 3 output (`app/rtcm3.py`) and computed in `app/gnss.py` |
 | Catalog satellites, planes and positions | `app/catalog.py` |
 | Fit orbits from your fixes + Doppler | `app/orbitfit.py` |
 | Map, timeline, receiver control | `app/iridium_tracker.py`, `app/receiver.py` |
