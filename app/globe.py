@@ -11,7 +11,9 @@ tilted from straight down (top view) towards the horizon (side view).
   drag: move around the Earth          right-drag: tilt up/down, turn left/right
   wheel: zoom                          double-click: back to your location
 """
+import concurrent.futures
 import math
+import os
 import threading
 import time
 
@@ -36,6 +38,8 @@ EYE_R = (R_EARTH + 0.5) / R_EARTH
 GROUND_FOV = (90.0, 25.0, 130.0)     # field of view: start, narrowest, widest
 GROUND_START = dict(heading=0.0, pitch=25.0)
 COMPASS = [('N', 0), ('NE', 45), ('E', 90), ('SE', 135), ('S', 180), ('SW', 225), ('W', 270), ('NW', 315)]
+SKY = {'dark': ((7, 9, 10), (25, 45, 80)),            # standing-here sky: overhead, at the horizon (RGB)
+       'light': ((70, 130, 200), (190, 215, 240))}
 SETTLE_MS = 180                 # after the last zoom/drag step, re-render at full resolution
 
 
@@ -69,7 +73,7 @@ def build_texture(load_tile):
 class GlobeView(QtWidgets.QWidget):
     satelliteClicked = QtCore.pyqtSignal(str)
 
-    def __init__(self, home, load_tile):
+    def __init__(self, home, load_tile, map_theme='dark'):
         super().__init__()
         self.setMinimumSize(500, 500)
         self.setMouseTracking(True)
@@ -81,6 +85,11 @@ class GlobeView(QtWidgets.QWidget):
         self.pitch, self.fov = GROUND_START['pitch'], GROUND_FOV[0]
         self.scene = None
         self.tex = None
+        self.tex32 = None                   # the texture packed as ARGB words, ready for the renderer
+        self.theme = map_theme              # the Earth's map: light or dark, like the flat map
+        self.threads = max(1, min(8, os.cpu_count() or 1))     # the Earth is rendered in bands, in parallel
+        self.pool = concurrent.futures.ThreadPoolExecutor(self.threads)
+        self.full_ms = 0.0                  # how long the last full-resolution Earth took
         self.earth = None                   # cached rendering of the Earth (QImage) and what it was for
         self.earth_key = None
         self.drag = None
@@ -94,7 +103,20 @@ class GlobeView(QtWidgets.QWidget):
     def _load_texture(self, load_tile):
         tex = build_texture(load_tile)
         self.tex = tex
+        lift = 1.35 if self.theme == 'dark' else 1.0     # the dark map is dim; lift it a little on the globe
+        rgb = np.clip(tex.astype(np.float32) * lift, 0, 255).astype(np.uint32)
+        self.tex32 = (np.uint32(0xFF000000) | (rgb[..., 0] << 16) | (rgb[..., 1] << 8) | rgb[..., 2]).ravel()
+        self.earth_key = None
         QtCore.QMetaObject.invokeMethod(self, 'update', Qt.QueuedConnection)
+
+    def set_theme(self, theme, load_tile):
+        """light or dark: the map texture and the sky colours (the texture is rebuilt in the background)"""
+        if theme == self.theme:
+            return
+        self.theme = theme
+        threading.Thread(target=self._load_texture, args=(load_tile,), daemon=True).start()
+        self.earth_key = None
+        self.update()
 
     def set_scene(self, scene):
         first = self.scene is None
@@ -198,78 +220,106 @@ class GlobeView(QtWidgets.QWidget):
         return sx, sy, visible, inview
 
     def _render_earth(self, fast):
-        """the Earth (and its glow) as an image the size of the window - half resolution while moving"""
+        """the Earth (and its glow) as an image the size of the window - half resolution while moving.
+        Only the pixels that hit the Earth get the full work: which ones do is worked out from 2D sums
+        (the camera axes are orthonormal), and colours come from a packed 32-bit texture."""
         w, h = self.width(), self.height()
-        k = 3 if fast else 1             # moving: a third of the resolution, sharp again once it stops
+        # moving: full resolution if that is quick enough here, else half - sharp again once it stops
+        k = 2 if fast and self.full_ms > 35 else 1
         W, H = max(1, w // k), max(1, h // k)
         sun = self.scene['sun'] if self.scene else (0.0, 0.0)
         night = bool(self.scene and self.scene.get('night'))
         fps = tuple((round(fp['lat'], 1), round(fp['lon'], 1), round(fp['radius'], 1), fp['selected'])
                     for fp in (self.scene or {}).get('footprints', []))
         key = (fps, round(self.lat0, 3), round(self.lon0, 3), round(self.dist, 4), round(self.tilt, 2), self.target_r,
-               round(self.heading, 2), self.ground, round(self.pitch, 2), round(self.fov, 2), W, H, round(sun[0], 1), round(sun[1], 1), self.tex is not None, night)
+               round(self.heading, 2), self.ground, round(self.pitch, 2), round(self.fov, 2), W, H, round(sun[0], 1),
+               round(sun[1], 1), self.tex32 is not None, night, self.theme)
         if key == self.earth_key:
             return self.earth
         pos, right, up, fwd, f = self._camera()
         f = f / k
-        px = (np.arange(W, dtype=np.float32) + 0.5 - W / 2) / f
-        py = (self._centre_y() / k - np.arange(H, dtype=np.float32) - 0.5) / f
-        d = (fwd.astype(np.float32)[None, None, :] + px[None, :, None] * right.astype(np.float32)
-             + py[:, None, None] * up.astype(np.float32))
-        d /= np.linalg.norm(d, axis=2, keepdims=True)
-        b = d @ pos.astype(np.float32)                  # ray: pos + t d
+        f32 = np.float32
+        px = ((np.arange(W, dtype=f32) + f32(0.5) - f32(W / 2)) / f32(f))[None, :]
+        py = ((f32(self._centre_y() / k) - np.arange(H, dtype=f32) - f32(0.5)) / f32(f))[:, None]
         c = float(pos @ pos) - 1.0
-        disc = b * b - c
-        hit = (disc > 0) & (-b - np.sqrt(np.clip(disc, 0, None)) > 0)
-        img = np.zeros((H, W, 4), np.uint8)
-        if self.ground:     # the sky: dark blue at the horizon fading to black overhead
-            el = np.clip(d @ (pos / np.linalg.norm(pos)).astype(np.float32), 0, 1)
-            k_sky = (1 - el) ** 3
-            sky = ~hit
-            img[sky] = np.stack([10 + 70 * k_sky[sky], 9 + 36 * k_sky[sky], 7 + 18 * k_sky[sky],
-                                 np.full(sky.sum(), 255, np.float32)], -1).astype(np.uint8)
-        # atmosphere: a faint blue glow just outside the edge of the Earth
-        miss = ~hit & (b < 0)
-        dmin = np.sqrt(np.clip(c + 1.0 - b * b, 0, None))
-        glow = miss & (dmin < 1.06) & (not self.ground)
-        a = np.clip((1.06 - dmin[glow]) / 0.06, 0, 1) * 80
-        img[glow] = np.stack([np.full_like(a, 255), np.full_like(a, 154), np.full_like(a, 76), a], -1).astype(np.uint8)
-        if hit.any():
-            dh = d[hit]
-            bh = b[hit]
-            t = -bh - np.sqrt(disc[hit])
-            p = pos[None, :] + t[:, None] * dh
-            lat = np.degrees(np.arcsin(np.clip(p[:, 2], -1, 1)))
-            lon = np.degrees(np.arctan2(p[:, 1], p[:, 0]))
-            if self.tex is not None:
-                u = np.clip(((lon + 180) / 360 * TEX_W).astype(int), 0, TEX_W - 1)
-                v = np.clip(((90 - lat) / 180 * TEX_H).astype(int), 0, TEX_H - 1)
-                rgb = self.tex[v, u].astype(np.float32)
-            else:                           # map still loading: a plain ocean colour with a light grid
-                rgb = np.tile(np.array([24, 44, 62], np.float32), (len(lat), 1))
-                grid = (np.abs((lat + 90) % 30 - 15) > 14.2) | (np.abs((lon + 180) % 30 - 15) > 14.2)
-                rgb[grid] = (50, 70, 90)
-            rgb = rgb * 1.35                # the map is dark-themed; lift it a little on the globe
-            # coverage footprints, like the map's: red for the selected satellite, orange for others
-            for fla, flo, frad, fsel in fps:
-                a, o = math.radians(fla), math.radians(flo)
-                centre = np.array([math.cos(a) * math.cos(o), math.cos(a) * math.sin(o), math.sin(a)], np.float32)
-                inside = p.astype(np.float32) @ centre > math.cos(math.radians(frad))
-                tint, k_fp = (np.array([255, 60, 60], np.float32), 0.3) if fsel else \
-                    (np.array([255, 160, 0], np.float32), 0.15)
-                rgb[inside] = rgb[inside] * (1 - k_fp) + tint * k_fp
-            facing = np.clip(-np.einsum('ij,ij->i', p, dh), 0, 1)
-            shade = 0.72 + 0.28 * facing    # a little darker towards the edge: looks round
-            if night:
-                sl, so = np.radians(sun[0]), np.radians(sun[1])
-                sun_v = np.array([math.cos(sl) * math.cos(so), math.cos(sl) * math.sin(so), math.sin(sl)], np.float32)
-                day = np.clip((p @ sun_v) * 8 + 0.5, 0, 1)        # soft terminator
-                shade = shade * (0.55 + 0.45 * day)
-            rgb = np.clip(rgb * shade[:, None], 0, 255).astype(np.uint8)
-            img[hit] = np.stack([rgb[:, 2], rgb[:, 1], rgb[:, 0], np.full(len(rgb), 255, np.uint8)], -1)   # BGRA
-        self.earth = QtGui.QImage(img.tobytes(), W, H, W * 4, QtGui.QImage.Format_ARGB32).copy()
+        img = np.zeros((H, W), np.uint32)               # ARGB, one word per pixel
+        tex = self.tex32 if self.tex32 is not None else self._grid32()
+
+        def band(r0, r1):
+            """rows r0..r1 of the image (the bands run in parallel: numpy lets go of the GIL)"""
+            py_ = py[r0:r1]
+            img_ = img[r0:r1]
+            inv = 1 / np.sqrt(1 + px * px + py_ * py_)        # 1 / length of the un-normalised ray fwd + px right + py_ up
+            b = (f32(fwd @ pos) + f32(right @ pos) * px + f32(up @ pos) * py_) * inv     # ray: pos + t d, b = d . pos
+            disc = b * b - f32(c)
+            root = np.sqrt(np.maximum(disc, 0))
+            hit = (disc > 0) & (-b - root > 0)
+            if self.ground:     # the sky: dark blue at the horizon fading to black overhead (light: pale blue)
+                U = pos / np.linalg.norm(pos)
+                el = np.clip((f32(fwd @ U) + f32(right @ U) * px + f32(up @ U) * py_) * inv, 0, 1)
+                k_sky = (1 - el) ** 3
+                lo, hi = SKY[self.theme]
+                sky = np.uint32(0xFF000000)
+                for sh, ch in ((16, 0), (8, 1), (0, 2)):
+                    sky = sky | ((lo[ch] + (hi[ch] - lo[ch]) * k_sky).astype(np.uint32) << np.uint32(sh))
+                img_[~hit] = sky[~hit]
+            else:               # atmosphere: a faint blue glow just outside the edge of the Earth
+                dmin = np.sqrt(np.maximum(f32(c + 1.0) - b * b, 0))
+                glow = ~hit & (b < 0) & (dmin < 1.06)
+                a = (np.clip((1.06 - dmin[glow]) / 0.06, 0, 1) * 80).astype(np.uint32)
+                img_[glow] = (a << np.uint32(24)) | np.uint32(0x4C9AFF)
+            iy, ix = np.nonzero(hit)
+            if len(iy):
+                pxh, pyh, invh = px[0, ix], py_[iy, 0], inv[iy, ix]
+                t = -b[iy, ix] - root[iy, ix]
+                dx = (f32(fwd[0]) + pxh * f32(right[0]) + pyh * f32(up[0])) * invh
+                dy = (f32(fwd[1]) + pxh * f32(right[1]) + pyh * f32(up[1])) * invh
+                dz = (f32(fwd[2]) + pxh * f32(right[2]) + pyh * f32(up[2])) * invh
+                X, Y, Z = f32(pos[0]) + t * dx, f32(pos[1]) + t * dy, f32(pos[2]) + t * dz
+                v = ((0.5 - np.arcsin(np.clip(Z, -1, 1)) / f32(math.pi)) * TEX_H).astype(np.int32)
+                u = ((np.arctan2(Y, X) / f32(2 * math.pi) + 0.5) * TEX_W).astype(np.int32)
+                np.clip(v, 0, TEX_H - 1, out=v)
+                np.clip(u, 0, TEX_W - 1, out=u)
+                col = tex[v * TEX_W + u]
+                rgb = [(col >> np.uint32(sh)) & np.uint32(255) for sh in (16, 8, 0)]
+                # coverage footprints, like the map's: red for the selected satellite, orange for others
+                for fla, flo, frad, fsel in fps:
+                    la, lo = math.radians(fla), math.radians(flo)
+                    inside = (X * f32(math.cos(la) * math.cos(lo)) + Y * f32(math.cos(la) * math.sin(lo))
+                              + Z * f32(math.sin(la))) > f32(math.cos(math.radians(frad)))
+                    tint, kk = ((255, 60, 60), 77) if fsel else ((255, 160, 0), 38)     # 0.3 / 0.15 of 256
+                    for ch in range(3):
+                        rgb[ch][inside] = (rgb[ch][inside] * np.uint32(256 - kk) + np.uint32(tint[ch] * kk)) >> np.uint32(8)
+                shade = 0.72 + 0.28 * np.clip(-(X * dx + Y * dy + Z * dz), 0, 1)    # darker towards the edge: round
+                if night:
+                    sl, so = math.radians(sun[0]), math.radians(sun[1])
+                    day = np.clip((X * f32(math.cos(sl) * math.cos(so)) + Y * f32(math.cos(sl) * math.sin(so))
+                                   + Z * f32(math.sin(sl))) * 8 + 0.5, 0, 1)          # soft terminator
+                    shade = shade * (0.55 + 0.45 * day)
+                s8 = (shade * 256).astype(np.uint32)
+                out = np.uint32(0xFF000000)
+                for ch, sh in zip(rgb, (16, 8, 0)):
+                    out = out | (np.minimum((ch * s8) >> np.uint32(8), 255) << np.uint32(sh))
+                img_[iy, ix] = out
+
+        n = min(self.threads, H)
+        cuts = [H * i // n for i in range(n + 1)]
+        t0 = time.perf_counter()
+        list(self.pool.map(lambda i: band(cuts[i], cuts[i + 1]), range(n)))
+        if k == 1:
+            self.full_ms = (time.perf_counter() - t0) * 1000
+        self.earth = QtGui.QImage(img.data, W, H, W * 4, QtGui.QImage.Format_ARGB32).copy()
         self.earth_key = key
         return self.earth
+
+    def _grid32(self):
+        """while the map loads: a plain ocean colour with a light 30-degree grid, packed like tex32"""
+        if getattr(self, '_grid', None) is None:
+            lat = 90 - (np.arange(TEX_H) + 0.5) / TEX_H * 180
+            lon = (np.arange(TEX_W) + 0.5) / TEX_W * 360 - 180
+            grid = (np.abs((lat[:, None] + 90) % 30 - 15) > 14.2) | (np.abs((lon[None, :] + 180) % 30 - 15) > 14.2)
+            self._grid = np.where(grid, np.uint32(0xFF32465A), np.uint32(0xFF182C3E)).ravel()
+        return self._grid
 
     # ---- mouse
     def mousePressEvent(self, e):
@@ -484,7 +534,7 @@ class GlobeView(QtWidgets.QWidget):
                 p.setOpacity(1.0 if front else 0.12)       # behind the Earth: just a hint
                 self._sprite(p, x, y, col, 1.2 if st['selected'] else 0.85, st.get('system', 'iridium'))
                 if front and (st['selected'] or st['el'] > 0):
-                    p.setPen(QtGui.QColor(it.TEXT))
+                    p.setPen(QtGui.QColor('#e6e9ef'))      # (space is dark in both themes)
                     p.drawText(QPointF(x + 12, y - 8), systems.short_name(st['name']))
                 if front:
                     self.hits.append((x, y, st['name'], '<b>%s</b><br>%s<br>altitude %.0f km<br>%s' % (
@@ -513,11 +563,11 @@ def _segments(pts):
 
 
 class GlobeWindow(QtWidgets.QDialog):
-    def __init__(self, parent, home, load_tile):
+    def __init__(self, parent, home, load_tile, map_theme='dark'):
         super().__init__(None)      # its own window: taskbar button, minimize/maximize (closed with the main window)
         self.setWindowFlags(Qt.Window | Qt.WindowMinMaxButtonsHint | Qt.WindowCloseButtonHint)
         self.setWindowTitle('Globe - satellites and orbits from your own observations')
-        self.view = GlobeView(home, load_tile)
+        self.view = GlobeView(home, load_tile, map_theme)
         bar = QtWidgets.QHBoxLayout()
         bar.setContentsMargins(8, 6, 8, 0)
         for label, tip, preset in (('Top view', 'Look straight down on the Earth', TOP_VIEW),

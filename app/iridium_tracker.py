@@ -42,6 +42,7 @@ import skyplot  # noqa: E402
 import globe  # noqa: E402
 import satinfo  # noqa: E402
 import systems  # noqa: E402
+import theme  # noqa: E402  (light / dark colours)
 import sound  # noqa: E402
 import orbitfit  # noqa: E402  (orbits from our own observations)
 import receiver  # noqa: E402  (the SDR receiver and decoder, run from here)
@@ -65,22 +66,34 @@ ORBIT_RADIUS = 6378.137 + 781   # Iridium's design altitude, only used to draw t
 PLANE_COLORS = {1: (77, 148, 255), 2: (176, 120, 240), 3: (40, 200, 200), 4: (240, 100, 180),
                 5: (215, 150, 80), 6: (150, 200, 60), None: (150, 150, 150)}
 
-# dark theme
-BG, PANEL, SURFACE, BORDER = '#14171c', '#1b1f26', '#232832', '#2f3541'
-TEXT, MUTED, ACCENT, ALERT, GOOD = '#e6e9ef', '#8b93a1', '#4c9aff', '#ff6b6b', '#4cd07d'
+# colours: the window's theme (theme.py, light or dark), set by _use_colours() at start and on a switch
+BG = PANEL = SURFACE = BORDER = TEXT = MUTED = ACCENT = ALERT = GOOD = ''
+IDLE = UP = ALERT_BG = ROW_HEAD = ''
+COLOUR_NAMES = ('BG', 'PANEL', 'SURFACE', 'BORDER', 'TEXT', 'MUTED', 'ACCENT', 'ALERT', 'GOOD', 'IDLE', 'UP',
+                'ALERT_BG', 'ROW_HEAD')
+
+
+def _use_colours():
+    """this module's colour names <- the current theme (paint code reads them when it draws)"""
+    globals().update({k: theme.PAL[k] for k in COLOUR_NAMES})
+
+
+_use_colours()
+
+
 STYLE = """
 QWidget { background: %(BG)s; color: %(TEXT)s; font-family: "Segoe UI"; font-size: 9pt; }
 QPushButton { background: %(SURFACE)s; border: 1px solid %(BORDER)s; border-radius: 6px; padding: 5px 12px; }
-QPushButton:hover { background: #2c323d; border-color: #3d4452; }
-QPushButton:pressed { background: #353c49; }
+QPushButton:hover { background: %(HOVER)s; border-color: %(HOVER_BORDER)s; }
+QPushButton:pressed { background: %(PRESSED)s; }
 QPushButton:checked { background: %(ACCENT)s; border-color: %(ACCENT)s; color: white; font-weight: 600; }
 QComboBox { background: %(SURFACE)s; border: 1px solid %(BORDER)s; border-radius: 6px; padding: 4px 8px; }
-QComboBox:hover { border-color: #3d4452; }
+QComboBox:hover { border-color: %(HOVER_BORDER)s; }
 QComboBox::drop-down { border: none; width: 18px; }
 QComboBox QAbstractItemView { background: %(SURFACE)s; border: 1px solid %(BORDER)s;
                               selection-background-color: %(ACCENT)s; outline: none; }
 QCheckBox { spacing: 6px; }
-QTableWidget, QListWidget { background: %(PANEL)s; alternate-background-color: #1f242c;
+QTableWidget, QListWidget { background: %(PANEL)s; alternate-background-color: %(ALT)s;
                             border: 1px solid %(BORDER)s; border-radius: 6px; }
 QTableWidget { selection-background-color: transparent; selection-color: %(TEXT)s; }
 QHeaderView::section { background: %(SURFACE)s; color: %(MUTED)s; border: none;
@@ -88,15 +101,31 @@ QHeaderView::section { background: %(SURFACE)s; color: %(MUTED)s; border: none;
 QScrollArea { background: %(PANEL)s; border: 1px solid %(BORDER)s; border-radius: 6px; }
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
 QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
-QScrollBar::handle { background: #3a4150; border-radius: 3px; min-height: 24px; min-width: 24px; }
-QScrollBar::handle:hover { background: #4a5263; }
+QScrollBar::handle { background: %(SCROLL)s; border-radius: 3px; min-height: 24px; min-width: 24px; }
+QScrollBar::handle:hover { background: %(SCROLL_HOVER)s; }
 QScrollBar::add-line, QScrollBar::sub-line { width: 0; height: 0; }
 QScrollBar::add-page, QScrollBar::sub-page { background: none; }
 QSplitter::handle { background: %(BG)s; }
-QStatusBar { background: #101317; color: %(MUTED)s; }
+QStatusBar { background: %(STATUS)s; color: %(MUTED)s; }
 QStatusBar QLabel { background: transparent; color: %(MUTED)s; }
 QToolTip { background: %(SURFACE)s; color: %(TEXT)s; border: 1px solid %(BORDER)s; padding: 4px; }
-""" % dict(BG=BG, PANEL=PANEL, SURFACE=SURFACE, BORDER=BORDER, TEXT=TEXT, MUTED=MUTED, ACCENT=ACCENT)
+"""
+
+
+def apply_app_colours(app):
+    """the whole window in the current theme: this module's colours, the style sheet and the palette"""
+    _use_colours()
+    pal = QtGui.QPalette()
+    P = theme.PAL
+    for role, key in ((QtGui.QPalette.Window, 'BG'), (QtGui.QPalette.WindowText, 'TEXT'), (QtGui.QPalette.Base, 'PANEL'),
+                      (QtGui.QPalette.AlternateBase, 'ALT'), (QtGui.QPalette.Text, 'TEXT'),
+                      (QtGui.QPalette.Button, 'SURFACE'), (QtGui.QPalette.ButtonText, 'TEXT'),
+                      (QtGui.QPalette.Highlight, 'ACCENT'), (QtGui.QPalette.ToolTipBase, 'SURFACE'),
+                      (QtGui.QPalette.ToolTipText, 'TEXT')):
+        pal.setColor(role, QtGui.QColor(P[key]))
+    pal.setColor(QtGui.QPalette.HighlightedText, QtGui.QColor('#ffffff'))
+    app.setPalette(pal)
+    app.setStyleSheet(STYLE % P)
 TILE_DIR = paths.TILES
 TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png'
 TILE_HEADERS = {'User-Agent': 'IridiumTracker/1.0 (personal hobby satellite map)'}
@@ -837,12 +866,15 @@ _DARK_MAP = np.array([[-0.574, 1.430, 0.144],
                       [0.426, 1.430, -0.856]]) * 0.82
 
 
-def darken_tile(data):
-    """OpenStreetMap tile bytes -> dark-themed QImage (safe to call off the GUI thread)"""
+def style_tile(data, map_theme='dark'):
+    """OpenStreetMap tile bytes -> QImage in the map's theme: as OpenStreetMap draws it (light), or
+    darkened (safe to call off the GUI thread)"""
     img = QtGui.QImage.fromData(data)
     if img.isNull():
         return None
     img = img.convertToFormat(QtGui.QImage.Format_RGB32)
+    if map_theme == 'light':
+        return img
     w, h = img.width(), img.height()
     ptr = img.constBits()
     ptr.setsize(img.byteCount())
@@ -854,8 +886,8 @@ def darken_tile(data):
     return QtGui.QImage(out.tobytes(), w, h, 4 * w, QtGui.QImage.Format_RGB32).copy()
 
 
-def load_tile_rgb(z, x, y):
-    """one darkened map tile as an RGB array (from the cache, downloading it if needed) - for the globe"""
+def load_tile_rgb(z, x, y, map_theme='dark'):
+    """one map tile in the map's theme as an RGB array (from the cache, downloading it if needed) - for the globe"""
     path = os.path.join(TILE_DIR, str(z), str(x), '%d.png' % y)
     try:
         if os.path.exists(path):
@@ -868,7 +900,7 @@ def load_tile_rgb(z, x, y):
             open(path, 'wb').write(data)
     except Exception:
         return None
-    img = darken_tile(data)
+    img = style_tile(data, map_theme)
     if img is None:
         return None
     img = img.convertToFormat(QtGui.QImage.Format_RGB32)
@@ -895,7 +927,8 @@ class TileLoader(QtCore.QObject):
         self.pool.submit(self._fetch, key)
 
     def _fetch(self, key):
-        z, x, y = key
+        """key: (z, x, y, map theme)"""
+        z, x, y, map_theme = key
         path = os.path.join(TILE_DIR, str(z), str(x), '%d.png' % y)
         try:
             if os.path.exists(path):
@@ -907,7 +940,7 @@ class TileLoader(QtCore.QObject):
                 data = r.content
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 open(path, 'wb').write(data)
-            img = darken_tile(data)
+            img = style_tile(data, map_theme)
             if img is not None:
                 self.loaded.emit(key, img)
         except Exception:
@@ -959,7 +992,8 @@ class MapView(QtWidgets.QWidget):
         self.setMouseTracking(True)
         self.zoom = 2.3
         self.cx, self.cy = merc(-100, 25)
-        self.tiles = {}
+        self.tiles = {}             # (z, x, y, map theme) -> picture
+        self.map_theme = 'dark'
         self.loader = TileLoader()
         self.loader.loaded.connect(self._tile_loaded)
         self.scene = None
@@ -982,7 +1016,14 @@ class MapView(QtWidgets.QWidget):
         return (lon + 180) % 360 - 180, lat
 
     def _tile_loaded(self, key, img):
-        self.tiles[key] = QtGui.QPixmap.fromImage(img)
+        if key[3] == self.map_theme:
+            self.tiles[key] = QtGui.QPixmap.fromImage(img)
+            self.update()
+
+    def set_map_theme(self, map_theme):
+        """light or dark map: its pictures are styled again (from the tile cache on disk)"""
+        self.map_theme = map_theme
+        self.tiles = {k: v for k, v in self.tiles.items() if k[3] == map_theme}
         self.update()
 
     # ---- coordinates
@@ -1178,7 +1219,7 @@ class MapView(QtWidgets.QWidget):
                         p.drawEllipse(QPointF(x + o, y), 15, 15)
                     draw_satellite(p, x + o, y, col, 1.25 if s['selected'] else 0.9, s['system'])
                     if s['selected'] or s['el'] > 0:
-                        p.setPen(QtGui.QColor(TEXT))
+                        p.setPen(QtGui.QColor(theme.MAP_INK[self.map_theme]['text']))
                         p.drawText(QPointF(x + o + 12, y - 8), systems.short_name(s['name']))
                     self.hits.append((x + o, y, s['name'], tip))
             p.setOpacity(1.0)
@@ -1193,7 +1234,7 @@ class MapView(QtWidgets.QWidget):
         p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
         for i in range(math.floor(-ox / ts), math.floor((self.width() - ox) / ts) + 1):
             for j in range(max(0, math.floor(-oy / ts)), min(n, math.floor((self.height() - oy) / ts) + 1)):
-                key = (z, i % n, j)
+                key = (z, i % n, j, self.map_theme)
                 rect = QtCore.QRectF(ox + i * ts, oy + j * ts, ts + 0.5, ts + 0.5)
                 pm = self.tiles.get(key)
                 if pm:
@@ -1201,7 +1242,7 @@ class MapView(QtWidgets.QWidget):
                 else:
                     self.loader.request(key)
                     # use the parent tile, scaled up, until this one arrives
-                    parent = self.tiles.get((z - 1, (i % n) // 2, j // 2))
+                    parent = self.tiles.get((z - 1, (i % n) // 2, j // 2, self.map_theme))
                     if parent:
                         src = QtCore.QRectF((i % n) % 2 * 128, j % 2 * 128, 128, 128)
                         p.drawPixmap(rect, parent, src)
@@ -1292,25 +1333,26 @@ class MapView(QtWidgets.QWidget):
         font = p.font()
         font.setPointSize(8)
         p.setFont(font)
+        ink = theme.MAP_INK[self.map_theme]
         fm = p.fontMetrics()
         h = 18 * len(items) + 10
         open_ = self.legend_open and self.height() > h + 90      # folds itself on a short map
         if not open_:
             r = QtCore.QRectF(10, self.height() - 52, fm.width('Key \u25b8') + 20, 24)
             self.legend_rect = r
-            p.setPen(QtGui.QPen(QtGui.QColor(60, 66, 78)))
-            p.setBrush(QtGui.QColor(24, 28, 35, 225))
+            p.setPen(QtGui.QPen(QtGui.QColor(*ink['box_edge'])))
+            p.setBrush(QtGui.QColor(*ink['box']))
             p.drawRoundedRect(r, 8, 8)
-            p.setPen(QtGui.QColor(TEXT))
+            p.setPen(QtGui.QColor(ink['text']))
             p.drawText(r, Qt.AlignCenter, 'Key \u25b8')
         else:
             width = max(fm.width(t) for _, t in items) + 58
             r = QtCore.QRectF(10, self.height() - h - 24, width, h)
             self.legend_rect = r
-            p.setPen(QtGui.QPen(QtGui.QColor(60, 66, 78)))
-            p.setBrush(QtGui.QColor(24, 28, 35, 225))
+            p.setPen(QtGui.QPen(QtGui.QColor(*ink['box_edge'])))
+            p.setBrush(QtGui.QColor(*ink['box']))
             p.drawRoundedRect(r, 8, 8)
-            p.setPen(QtGui.QColor(MUTED))
+            p.setPen(QtGui.QColor(ink['muted']))
             p.drawText(QtCore.QRectF(r.right() - 22, r.top() + 2, 18, 14), Qt.AlignCenter, '\u2715')
         for k, (kind, text) in enumerate(items if open_ else []):
             y = r.top() + 14 + 18 * k
@@ -1331,9 +1373,9 @@ class MapView(QtWidgets.QWidget):
                 p.drawLine(QPointF(x - 9, y), QPointF(x + 9, y))
             else:
                 draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.8)
-            p.setPen(QtGui.QColor(TEXT))
+            p.setPen(QtGui.QColor(ink['text']))
             p.drawText(QPointF(x + 18, y + 4), text)
-        p.setPen(QtGui.QColor(MUTED))
+        p.setPen(QtGui.QColor(ink['muted']))
         credit = '© OpenStreetMap contributors'
         p.drawText(QPointF(self.width() - p.fontMetrics().width(credit) - 8, self.height() - 6), credit)
 
@@ -1426,7 +1468,7 @@ class Timeline(QtWidgets.QWidget):
             d = datetime.datetime.fromtimestamp(t)
             midnight = d.hour == 0 and d.minute == 0
             label = d.strftime('%a %b %d') if midnight or step >= 86400 else d.strftime('%I:%M %p').lstrip('0')
-            p.setPen(QtGui.QPen(QtGui.QColor('#4a5263' if midnight else BORDER), 1))
+            p.setPen(QtGui.QPen(QtGui.QColor(IDLE if midnight else BORDER), 1))
             p.drawLine(QPointF(x, top + 2), QPointF(x, top + th - 2))
             lx = x - fm.width(label) / 2
             if 4 <= lx <= w - fm.width(label) - 4:
@@ -1503,15 +1545,15 @@ class StatBox(QtWidgets.QFrame):
     def __init__(self):
         super().__init__()
         self.setObjectName('stat')
-        self.setStyleSheet('QFrame#stat { background: %s; border: 1px solid %s; border-radius: 6px; }'
-                           ' QFrame#stat QLabel { background: transparent; border: none; }' % (SURFACE, BORDER))
+        theme.style(self, 'QFrame#stat { background: %(SURFACE)s; border: 1px solid %(BORDER)s; border-radius: 6px; }'
+                          ' QFrame#stat QLabel { background: transparent; border: none; }')
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(8, 5, 8, 5)
         lay.setSpacing(0)
         self.value = QtWidgets.QLabel()
-        self.value.setStyleSheet('font-size: 18px; font-weight: 700; color: %s;' % TEXT)
+        theme.style(self.value, 'font-size: 18px; font-weight: 700; color: %(TEXT)s;')
         self.caption = QtWidgets.QLabel()
-        self.caption.setStyleSheet('font-size: 10px; color: %s;' % MUTED)
+        theme.style(self.caption, 'font-size: 10px; color: %(MUTED)s;')
         self.caption.setWordWrap(True)
         lay.addWidget(self.value)
         lay.addWidget(self.caption)
@@ -1616,6 +1658,14 @@ class Tracker(QtWidgets.QMainWindow):
             opts.addWidget(wdg)
             sig = wdg.stateChanged if isinstance(wdg, QtWidgets.QCheckBox) else wdg.currentIndexChanged
             sig.connect(self.refresh)
+        self.map_theme_box = QtWidgets.QComboBox()     # the map (and the globe's Earth): dark or light
+        self.map_theme_box.addItem('Map: dark', 'dark')
+        self.map_theme_box.addItem('Map: light', 'light')
+        self.map_theme_box.setToolTip('The map and the globe\'s Earth: dark, or light as OpenStreetMap draws it')
+        self.map_theme_box.setCurrentIndex(self.map_theme_box.findData(theme.load()[1]))
+        self.map.set_map_theme(self.map_theme_box.currentData())
+        self.map_theme_box.currentIndexChanged.connect(lambda _: self.set_map_theme(self.map_theme_box.currentData()))
+        opts.addWidget(self.map_theme_box)
         opts.addStretch(1)
 
         # receiver bar: start / stop the SDR receiver and decoder
@@ -1656,12 +1706,12 @@ class Tracker(QtWidgets.QMainWindow):
         self.globe = None
         self.rx_dot = QtWidgets.QLabel()
         self.rx_status = ElidedLabel('Receiver off')
-        self.rx_status.setStyleSheet('color: %s;' % MUTED)
+        theme.style(self.rx_status, 'color: %(MUTED)s;')
         title = QtWidgets.QLabel('SATELLITE TRACKER')
-        title.setStyleSheet('font-size: 13px; font-weight: 700; letter-spacing: 2px; color: %s;' % TEXT)
+        theme.style(title, 'font-size: 13px; font-weight: 700; letter-spacing: 2px; color: %(TEXT)s;')
         header = QtWidgets.QFrame()
-        header.setStyleSheet('QFrame#hdr { background: %s; border: 1px solid %s; border-radius: 8px; }'
-                             ' QFrame#hdr QLabel { background: transparent; }' % (PANEL, BORDER))
+        theme.style(header, 'QFrame#hdr { background: %(PANEL)s; border: 1px solid %(BORDER)s; border-radius: 8px; }'
+                            ' QFrame#hdr QLabel { background: transparent; }')
         header.setObjectName('hdr')
         hl = QtWidgets.QHBoxLayout(header)
         hl.setContentsMargins(12, 6, 8, 6)
@@ -1685,6 +1735,12 @@ class Tracker(QtWidgets.QMainWindow):
         self.data_btn.setToolTip('How much space your data uses, storage limits and clean-up')
         self.data_btn.clicked.connect(self.show_data)
         hl.addWidget(self.data_btn)
+        self.theme_btn = QtWidgets.QPushButton()      # the whole window: light or dark
+        self.theme_btn.setToolTip('Switch the whole window between dark and light\n'
+                                  '(the map has its own setting under it; plots stay dark like an instrument)')
+        self.theme_btn.clicked.connect(lambda: self.set_app_theme('light' if theme.name == 'dark' else 'dark'))
+        self._theme_btn_text()
+        hl.addWidget(self.theme_btn)
         self._show_location()
         self._receiver_running(False)
 
@@ -1694,8 +1750,8 @@ class Tracker(QtWidgets.QMainWindow):
         lv.addWidget(header)
         self.pick_bar = QtWidgets.QFrame()
         self.pick_bar.setObjectName('pick')
-        self.pick_bar.setStyleSheet('QFrame#pick { background: #16324f; border: 1px solid %s; border-radius: 8px; }'
-                                    ' QFrame#pick QLabel { background: transparent; }' % ACCENT)
+        theme.style(self.pick_bar, 'QFrame#pick { background: %(PICK)s; border: 1px solid %(ACCENT)s; border-radius: 8px; }'
+                                   ' QFrame#pick QLabel { background: transparent; }')
         pl = QtWidgets.QHBoxLayout(self.pick_bar)
         pl.setContentsMargins(12, 6, 8, 6)
         pick_text = QtWidgets.QLabel(
@@ -1770,7 +1826,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.detail.setWordWrap(True)
         self.detail.setTextFormat(Qt.RichText)
         self.detail.setAlignment(Qt.AlignTop)
-        self.detail.setStyleSheet('background: %s; padding: 8px;' % PANEL)
+        theme.style(self.detail, 'background: %(PANEL)s; padding: 8px;')
         self.detail_scroll = QtWidgets.QScrollArea()     # the details can be longer than the space
         self.detail_scroll.setWidget(self.detail)
         self.detail_scroll.setWidgetResizable(True)
@@ -1851,7 +1907,7 @@ class Tracker(QtWidgets.QMainWindow):
     # ---- globe
     def show_globe(self):
         if self.globe is None:
-            self.globe = globe.GlobeWindow(self, (HOME_LAT, HOME_LON), load_tile_rgb)
+            self.globe = globe.GlobeWindow(self, (HOME_LAT, HOME_LON), self._globe_tile, self.map.map_theme)
             self.globe.view.satelliteClicked.connect(self.select)
             self.globe.view.satelliteClicked.connect(self.show_sat_info)
             self.globe.layout().insertWidget(0, self._sys_window_bar())
@@ -1859,6 +1915,34 @@ class Tracker(QtWidgets.QMainWindow):
         self.globe.view.set_scene(self.map.scene)
         self.globe.show()
         self.globe.raise_()
+
+    def _globe_tile(self, z, x, y):
+        """a map tile for the globe's Earth, in the map's theme"""
+        return load_tile_rgb(z, x, y, self.map.map_theme)
+
+    # ---- light / dark
+    def _theme_btn_text(self):
+        self.theme_btn.setText('\u2600  Light' if theme.name == 'dark' else '\u263e  Dark')
+
+    def set_app_theme(self, name, save=True):
+        """the whole window light or dark, straight away (and next time)"""
+        theme.set_theme(name)
+        apply_app_colours(QtWidgets.QApplication.instance())
+        self._theme_btn_text()
+        self.reload_lists()
+        self.refresh()
+        for w in QtWidgets.QApplication.topLevelWidgets():
+            w.update()
+        if save:
+            theme.save(theme.name, self.map.map_theme)
+
+    def set_map_theme(self, name, save=True):
+        """the map and the globe's Earth light or dark (and next time)"""
+        self.map.set_map_theme(name)
+        if self.globe is not None:
+            self.globe.view.set_theme(name, self._globe_tile)
+        if save:
+            theme.save(theme.name, name)
 
     # ---- sky plot
     def show_sky(self):
@@ -1922,11 +2006,11 @@ class Tracker(QtWidgets.QMainWindow):
     def _receiver_running(self, on):
         self.rx_btn.setText('■  Stop receiver' if on else '▶  Start receiver')
         color = '#d64550' if on else '#2e9e5b'
-        self.rx_btn.setStyleSheet('QPushButton { background: %s; border: none; color: white; font-weight: 700;'
-                                  ' padding: 7px 14px; } QPushButton:hover { background: %s; }'
-                                  ' QPushButton:disabled { background: #3a4150; color: #9aa1ad; }'
-                                  % (color, QtGui.QColor(color).lighter(115).name()))
-        self.rx_dot.setText('<span style="color:%s; font-size:16px">●</span>' % (ALERT if on else '#4a5263'))
+        theme.style(self.rx_btn, 'QPushButton { background: %s; border: none; color: white; font-weight: 700;'
+                                 ' padding: 7px 14px; } QPushButton:hover { background: %s; }'
+                                 ' QPushButton:disabled { background: %%(DISABLED_BG)s; color: %%(DISABLED_TEXT)s; }'
+                                 % (color, QtGui.QColor(color).lighter(115).name()))
+        self.rx_dot.setText('<span style="color:%s; font-size:16px">●</span>' % (ALERT if on else IDLE))
         self.rx_btn.setEnabled(True)
         self.rx_system.setEnabled(not on)        # switch systems while stopped
 
@@ -2087,11 +2171,11 @@ class Tracker(QtWidgets.QMainWindow):
             b.setCheckable(True)
             b.setMinimumHeight(height)
             col = QtGui.QColor(*systems.get(key)['colour']).name() if key else ACCENT
-            b.setStyleSheet('QPushButton { padding: 2px 4px; font-size: 11px; border: 1px solid %s; border-radius: 6px;'
-                            ' background: %s; color: %s; }'
-                            ' QPushButton:checked { background: %s; border: 2px solid %s; color: white; font-weight: 700; }'
-                            ' QPushButton:hover:!checked { border-color: %s; }'
-                            % (BORDER, SURFACE, TEXT, QtGui.QColor(col).darker(220).name(), col, col))
+            theme.style(b, 'QPushButton { padding: 2px 4px; font-size: 11px; border: 1px solid %%(BORDER)s;'
+                           ' border-radius: 6px; background: %%(SURFACE)s; color: %%(TEXT)s; }'
+                           ' QPushButton:checked { background: %s; border: 2px solid %s; color: white; font-weight: 700; }'
+                           ' QPushButton:hover:!checked { border-color: %s; }'
+                           % (QtGui.QColor(col).darker(180).name(), col, col))
             b.setToolTip('Show %s on the map, globe, sky plot and in the list'
                          % ('every satellite system' if key is None else systems.get(key)['label']))
             group.addButton(b, i)
@@ -2461,7 +2545,7 @@ class Tracker(QtWidgets.QMainWindow):
                 item.setForeground(QtGui.QColor(MUTED))
             else:
                 item.setText(('%.0f° up' % s['el'] if s['el'] > 0 else 'below') + '  ' + fmt_sigma(s['sigma']))
-                item.setBackground(QtGui.QColor(28, 84, 52) if s['el'] > 0 else QtGui.QBrush())
+                item.setBackground(QtGui.QColor(UP) if s['el'] > 0 else QtGui.QBrush())
                 item.setForeground(QtGui.QColor(TEXT))
             # the selected satellite: its name highlighted blue and the row in bold; the green
             # "above your horizon" cell keeps its colour
@@ -2641,7 +2725,7 @@ class Tracker(QtWidgets.QMainWindow):
                 passes[-1].append(f)
             else:
                 passes.append([f])
-        html = ('<div style="background:#3a1d22; padding:5px"><span style="font-size:13px; color:%s">'
+        html = ('<div style="background:%s; padding:5px">' % ALERT_BG + '<span style="font-size:13px; color:%s">'
                 '<b>%s positions received: %d</b></span> &nbsp;(%d pass%s)</div>'
                 % (ALERT, 'Ephemeris' if systems.of_name(name) is systems.ORBCOMM else 'Ring-alert',
                    len(fixes), len(passes), '' if len(passes) == 1 else 'es'))
@@ -2650,8 +2734,8 @@ class Tracker(QtWidgets.QMainWindow):
                  '<td align="right">Alt</td><td align="right">Signal</td></tr>')
         shown = 0
         for ps in reversed(passes):
-            html += ('<tr><td colspan="5" style="background:#262b35"><b>%s</b> &middot; %d fix%s</td></tr>'
-                     % (fmt_time(ps[0]['t']), len(ps), '' if len(ps) == 1 else 'es'))
+            html += ('<tr><td colspan="5" style="background:%s"><b>%s</b> &middot; %d fix%s</td></tr>'
+                     % (ROW_HEAD, fmt_time(ps[0]['t']), len(ps), '' if len(ps) == 1 else 'es'))
             for f in ps:
                 if shown >= 20:
                     break
@@ -2699,15 +2783,8 @@ def main():
     app.setApplicationName('Satellite Tracker')
     app.setWindowIcon(QtGui.QIcon(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icon.ico')))
     app.setStyle('Fusion')
-    pal = QtGui.QPalette()
-    for role, color in ((QtGui.QPalette.Window, BG), (QtGui.QPalette.WindowText, TEXT), (QtGui.QPalette.Base, PANEL),
-                        (QtGui.QPalette.AlternateBase, '#1f242c'), (QtGui.QPalette.Text, TEXT),
-                        (QtGui.QPalette.Button, SURFACE), (QtGui.QPalette.ButtonText, TEXT),
-                        (QtGui.QPalette.Highlight, ACCENT), (QtGui.QPalette.HighlightedText, '#ffffff'),
-                        (QtGui.QPalette.ToolTipBase, SURFACE), (QtGui.QPalette.ToolTipText, TEXT)):
-        pal.setColor(role, QtGui.QColor(color))
-    app.setPalette(pal)
-    app.setStyleSheet(STYLE)
+    theme.set_theme(theme.load()[0])
+    apply_app_colours(app)
     replay = [a[18:] for a in sys.argv if a.startswith('--test-receiver=')]   # testing without the SDR
     w = Tracker(replay[0] if replay else None)
     if '--start-receiver' in sys.argv:  # start receiving straight away (with the band chosen in Source)
@@ -2719,6 +2796,14 @@ def main():
         if at:
             w.scrub(datetime.datetime.fromisoformat(at[0][5:]).timestamp())
             w.timeline.show_range(w.t - 3 * 3600, w.t + 3600)
+        for a in sys.argv:                  # --theme=light / --map-theme=light (not saved)
+            if a.startswith('--theme='):
+                w.set_app_theme(a[8:], save=False)
+            elif a.startswith('--map-theme='):
+                w.map_theme_box.blockSignals(True)
+                w.map_theme_box.setCurrentIndex(w.map_theme_box.findData(a[12:]))
+                w.map_theme_box.blockSignals(False)
+                w.set_map_theme(a[12:], save=False)
         want = [a[9:] for a in sys.argv if a.startswith('--system=')]
         if want:
             w.sys_box.setCurrentIndex(w.sys_box.findData(want[0]))

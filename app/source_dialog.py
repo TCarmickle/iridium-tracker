@@ -3,6 +3,7 @@ from PyQt5 import QtCore, QtWidgets
 
 import sdr_settings as sdr
 import systems
+import theme
 
 NETWORK = 'rtl_tcp=192.168.1.10:1234'
 TIPS = {
@@ -50,7 +51,7 @@ class SourceDialog(QtWidgets.QDialog):
         form.addRow('Receive:', self.system)
         self.antenna = QtWidgets.QLabel()
         self.antenna.setWordWrap(True)
-        self.antenna.setStyleSheet('color: #ffb454;')
+        theme.style(self.antenna, 'color: %(WARN)s;')
         form.addRow('', self.antenna)
 
         # device
@@ -94,7 +95,7 @@ class SourceDialog(QtWidgets.QDialog):
         self.tuning_rows = [form.labelForField(self.rate), self.rate, form.labelForField(row),
                             self.center, self.center_auto]      # Iridium's: Orbcomm's are fixed
         self.coverage = QtWidgets.QLabel()
-        self.coverage.setStyleSheet('color: #8b93a1;')
+        theme.style(self.coverage, 'color: %(MUTED)s;')
         form.addRow('', self.coverage)
 
         # gain
