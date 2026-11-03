@@ -529,14 +529,15 @@ class GlobeView(QtWidgets.QWidget):
                 x, y, front, inview = sxs[k], sys_[k], sfront[k], sview[k]
                 if not inview:
                     continue
-                col = QtGui.QColor(230, 50, 60) if st['selected'] else (QtGui.QColor(40, 190, 90) if st['el'] > 0
-                                                                       else QtGui.QColor(150, 156, 168))
+                col = QtGui.QColor(40, 190, 90) if st['el'] > 0 else QtGui.QColor(150, 156, 168)
                 p.setOpacity(1.0 if front else 0.12)       # behind the Earth: just a hint
                 if st.get('live') and front:               # heard by your receiver in the last minute
                     p.setPen(QtGui.QPen(QtGui.QColor(0, 200, 0), 2))
                     p.setBrush(Qt.NoBrush)
                     p.drawEllipse(QPointF(x, y), 14, 14)
                 self._sprite(p, x, y, col, 1.2 if st['selected'] else 0.85, st.get('system', 'iridium'))
+                if st['selected']:
+                    it.draw_selection(p, x, y, 16.0)
                 if front and (st['selected'] or st['el'] > 0):
                     p.setPen(QtGui.QColor('#e6e9ef'))      # (space is dark in both themes)
                     p.drawText(QPointF(x + 12, y - 8), systems.short_name(st['name']))

@@ -17,7 +17,11 @@ position fix.
 (pocket_trk can also drive an RTL-SDR itself through SoapySDR, but the RTL-SDR's IQ is the mirror of what
 pocket_trk expects and it has no way to swap it, so the samples come from here.)
 Lines (from its log):
-  GCH: t sat sig cn0 doppler_hz lock_s     a tracked satellite, once a second (sat: G05, E11, C23 ...)
+  GCH: t sat sig cn0 doppler_hz lock_s [sync nav err lol]
+                                           a tracked satellite, once a second (sat: G05, E11, C23 ...);
+                                           sync = its data message's symbol / bit / frame sync and polarity
+                                           (e.g. 'SBF-'), then navigation frames decoded, frame errors and
+                                           times lock was lost (pocket_trk's counters)
   GEPH: t sat <pocket_trk $EPH fields>     a satellite's decoded broadcast ephemeris (when it changes)
   GPOS: t lat lon height_m nsat            a position fix from the satellites
 """
@@ -220,7 +224,11 @@ class Lines:
                     return
                 self.last_ch[sat] = rt
                 self.seen.add(sat)
-                emit('GCH: %.3f %s %s %.1f %.1f %.1f' % (when(rt), sat, sig, cn0, fd, lock))
+                extra = ''
+                if len(f) > 25:     # sync flags and counters ($CH fields 12-15 and 23-25)
+                    sync = ''.join(c if f[12 + k].strip() not in ('', '0') else '-' for k, c in enumerate('SBFR'))
+                    extra = ' %s %d %d %d' % (sync, int(f[23]), int(f[24]), int(f[25]))
+                emit('GCH: %.3f %s %s %.1f %.1f %.1f%s' % (when(rt), sat, sig, cn0, fd, lock, extra))
             elif f[0] == '$EPH' and len(f) > 4:
                 sat, fields = f[2], ','.join(f[3:])
                 if self.eph.get(sat) != fields:

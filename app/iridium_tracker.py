@@ -844,6 +844,11 @@ class Data:
                     self.live_doppler[(cap, name)] = []
                     self.doppler.setdefault(name, []).append(self.live_doppler[(cap, name)])
                 self.live_doppler[(cap, name)].append((t, catalog.GNSS_L1 + float(f[3])))
+                # its latest live signal (the details panel shows it while it is being tracked)
+                now = {'t': t, 'cn0': float(f[2]), 'dop': float(f[3]), 'lock': float(f[4]) if len(f) > 4 else 0.0}
+                if len(f) > 8:
+                    now.update(sync=f[5], nav=int(f[6]), err=int(f[7]), lol=int(f[8]))
+                i['now'] = now
                 if new:
                     events.append('%s  TRACKING  %s  (%.0f dB-Hz, Doppler %+.0f Hz)' % (fmt_clock(t), name, float(f[2]), float(f[3])))
             elif kind == 'GEPH' and len(f) >= 2:
@@ -960,6 +965,22 @@ def unmerc(wx, wy):
     lon = wx * 360 - 180
     lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * wy))))
     return lon, lat
+
+
+C_SELECT = QtGui.QColor(56, 217, 255)       # the selected satellite's corner brackets (map, globe, key)
+
+
+def draw_selection(p, x, y, r=17.0):
+    """corner brackets around the selected satellite (its body keeps its own colour: up / down)"""
+    p.save()
+    p.setPen(QtGui.QPen(C_SELECT, 2.2, Qt.SolidLine, Qt.RoundCap))
+    p.setBrush(Qt.NoBrush)
+    a = r * 0.45
+    for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+        cx, cy = x + sx * r, y + sy * r
+        p.drawLine(QPointF(cx, cy), QPointF(cx - sx * a, cy))
+        p.drawLine(QPointF(cx, cy), QPointF(cx, cy - sy * a))
+    p.restore()
 
 
 def draw_satellite(p, x, y, color, scale=1.0, system='iridium'):
@@ -1199,7 +1220,7 @@ class MapView(QtWidgets.QWidget):
             p.setFont(font)
             for s in sorted(sc['sats'], key=lambda s: s['selected']):
                 x, y = self.to_screen(*merc(s['lon'], s['lat']))
-                col = QtGui.QColor(230, 50, 60) if s['selected'] else (QtGui.QColor(40, 190, 90) if s['el'] > 0 else QtGui.QColor(120, 126, 138))
+                col = QtGui.QColor(40, 190, 90) if s['el'] > 0 else QtGui.QColor(120, 126, 138)
                 tip = ('<b>%s</b> (predicted from our own orbit)<br>%s<br>lat %+.2f  lon %+.2f  alt %.0f km<br>'
                        'uncertainty about &plusmn;%.0f km<br>from you: %s'
                        % (s['name'], s['ident'], s['lat'], s['lon'], s['alt'], s['sigma'],
@@ -1218,6 +1239,8 @@ class MapView(QtWidgets.QWidget):
                         p.setBrush(Qt.NoBrush)
                         p.drawEllipse(QPointF(x + o, y), 15, 15)
                     draw_satellite(p, x + o, y, col, 1.25 if s['selected'] else 0.9, s['system'])
+                    if s['selected']:
+                        draw_selection(p, x + o, y)
                     if s['selected'] or s['el'] > 0:
                         p.setPen(QtGui.QColor(theme.MAP_INK[self.map_theme]['text']))
                         p.drawText(QPointF(x + o + 12, y - 8), systems.short_name(s['name']))
@@ -1329,6 +1352,7 @@ class MapView(QtWidgets.QWidget):
                  ('sat', 'Predicted position (faded + dotted ring = uncertain)'),
                  ('view', 'green body = above your horizon now'),
                  ('live', 'green ring = your receiver heard it in the last minute'),
+                 ('select', 'blue brackets = the satellite you selected'),
                  ('orbcomm', 'orange-edged = Orbcomm, green-edged = ISS / ham (others: Iridium)'),
                  ('plane', 'Orbital plane (Iridium, our orbits), arrows = direction')]
         font = p.font()
@@ -1372,6 +1396,9 @@ class MapView(QtWidgets.QWidget):
             elif kind == 'plane':
                 p.setPen(QtGui.QPen(QtGui.QColor(*PLANE_COLORS[1]), 2.5))
                 p.drawLine(QPointF(x - 9, y), QPointF(x + 9, y))
+            elif kind == 'select':
+                draw_satellite(p, x, y, QtGui.QColor(40, 190, 90), 0.6)
+                draw_selection(p, x, y, 8.5)
             elif kind == 'live':
                 p.setPen(QtGui.QPen(QtGui.QColor(0, 200, 0), 2))
                 p.setBrush(Qt.NoBrush)
@@ -2641,12 +2668,13 @@ class Tracker(QtWidgets.QMainWindow):
                 i = self.data.info[self.selected]       # GNSS: tracked, broadcast orbit not decoded yet
                 why = self.data.no_orbit.get(self.selected, '')
                 self.detail.setText(
-                    '<h3 style="margin:0">%s</h3>%s<b>Tracked</b> on its own ranging code (every GNSS satellite has '
+                    '<h3 style="margin:0">%s</h3>%s%s'
+                    '<b>Tracked</b> on its own ranging code (every GNSS satellite has '
                     'its own), %d seconds in all.<br>Last heard %s &middot; best signal %.1f dB-Hz &middot; '
                     '%d Doppler curve%s'
                     '<br><span style="color:%s">Not on the map: %s. That takes about 30 s of steady tracking at '
                     'roughly 35 dB-Hz or better - give the antenna more open sky.</span>'
-                    % (self.selected, self._gnss_catalog_line(self.selected), i.get('frames', 0),
+                    % (self.selected, self._gnss_catalog_line(self.selected), self._gnss_live_html(i), i.get('frames', 0),
                        fmt_time(i['last']) if i['last'] else '-', i['best'],
                        len(self.data.doppler.get(self.selected, [])),
                        '' if len(self.data.doppler.get(self.selected, [])) == 1 else 's', MUTED,
@@ -2735,12 +2763,43 @@ class Tracker(QtWidgets.QMainWindow):
         return '<span style="color:%s">%s</span><br>' % (MUTED, 'Public catalog: ' + cat if cat else
                                                           'Not matched to the public catalog yet')
 
+    def _gnss_live_html(self, i):
+        """the satellite's signal right now (from the receiver, every second) - or when it was last tracked"""
+        now = i.get('now')
+        age = time.time() - now['t'] if now else None
+        if not now or not self.following or age > 10:
+            return ('<b>Live signal:</b> <span style="color:%s">not being tracked right now%s</span><hr>'
+                    % (MUTED, ' (last heard %s ago)' % fmt_age(age) if age is not None else ''))
+        level = max(0, min(10, int(round((now['cn0'] - 25) / 2))))      # 25 .. 45 dB-Hz
+        bar = '<span style="color:%s">%s</span><span style="color:%s">%s</span>' % (
+            GOOD if now['cn0'] >= 35 else ACCENT if now['cn0'] >= 30 else ALERT, '\u25ae' * level,
+            MUTED, '\u25af' * (10 - level))
+        html = ('<b>Live signal</b> <span style="color:%s">(updated every second)</span><br>'
+                '<b>%.1f dB-Hz</b> %s &nbsp;%s<br>'
+                'Doppler <b>%+.0f Hz</b> (%s) &middot; locked for %s<br>'
+                % (MUTED, now['cn0'], bar,
+                   'strong enough to read its orbit' if now['cn0'] >= 35 else
+                   'weak: its orbit may not decode' if now['cn0'] >= 30 else 'very weak',
+                   now['dop'], 'coming closer' if now['dop'] > 0 else 'moving away', fmt_age(now['lock'])))
+        sync = now.get('sync')
+        if sync:
+            # (bit sync and frame sync together = its data message is being read; the first flag stays 0)
+            steps = [('bits', sync[1] != '-'), ('frames', sync[2] != '-')]
+            ticks = ' '.join('<span style="color:%s">%s %s</span>' % (GOOD if ok else MUTED, '\u2714' if ok else '\u2026', n)
+                             for n, ok in steps)
+            reading = all(ok for _, ok in steps)
+            html += ('Data message: %s &nbsp;%s<br>'
+                     'Message frames decoded: <b>%d</b> &middot; errors %d &middot; lock lost %d\u00d7'
+                     % (ticks, '<b style="color:%s">reading it</b>' % GOOD if reading else
+                        '<span style="color:%s">lining up...</span>' % MUTED, now['nav'], now['err'], now['lol']))
+        return html + '<hr>'
+
     def _update_detail_gnss(self, s, i, o, nxt):
         """details of a GPS / Galileo satellite: tracked on its code, placed by its own broadcast orbit"""
         oi = o.info
         health = oi.get('health', 0)
         self.detail.setText(
-            '<h3 style="margin:0">%s</h3>%s'
+            '<h3 style="margin:0">%s</h3>%s%s'
             '<b>Tracked</b> on its own ranging code, %d seconds in all<br>'
             '<b>Best signal:</b> %.1f dB-Hz &nbsp; <b>Doppler curves:</b> %d<br>'
             '<b>Last heard:</b> %s<hr>'
@@ -2751,7 +2810,7 @@ class Tracker(QtWidgets.QMainWindow):
             '<b>At %s</b> (predicted):<br>lat %+.2f, lon %+.2f, altitude %.0f km<br>'
             'From you: %s<br>'
             '<b>Next pass:</b> %s'
-            % (s['name'], self._gnss_catalog_line(s['name']), i.get('frames', 0), i['best'],
+            % (s['name'], self._gnss_catalog_line(s['name']), self._gnss_live_html(i), i.get('frames', 0), i['best'],
                len(self.data.doppler.get(s['name'], [])), fmt_time(i['last']) if i['last'] else '-',
                fmt_time(oi['toe']), fmt_time(oi['last_obs']),
                'OK' if not health else '<b style="color:%s">marked unhealthy by the satellite</b>' % ALERT,
