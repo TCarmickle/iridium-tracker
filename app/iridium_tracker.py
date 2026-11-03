@@ -1731,29 +1731,10 @@ class Tracker(QtWidgets.QMainWindow):
         lv.addWidget(self.timeline)
         lv.addLayout(row)
 
-        # side panel: which systems to show (drives the Systems filter), then numbers about them
-        self.sys_buttons = QtWidgets.QButtonGroup(self)
-        self.sys_buttons.setExclusive(True)
-        sys_row = QtWidgets.QHBoxLayout()
-        sys_row.setSpacing(4)
-        for i in range(self.sys_box.count()):
-            key = self.sys_box.itemData(i)
-            b = QtWidgets.QPushButton()
-            b.setCheckable(True)
-            b.setMinimumHeight(38)
-            col = QtGui.QColor(*systems.get(key)['colour']).name() if key else ACCENT
-            b.setStyleSheet('QPushButton { padding: 2px 4px; font-size: 11px; border: 1px solid %s; border-radius: 6px;'
-                            ' background: %s; color: %s; }'
-                            ' QPushButton:checked { background: %s; border: 2px solid %s; color: white; font-weight: 700; }'
-                            ' QPushButton:hover:!checked { border-color: %s; }'
-                            % (BORDER, SURFACE, TEXT, QtGui.QColor(col).darker(220).name(), col, col))
-            b.setToolTip('Show %s on the map, globe, sky plot and in this list'
-                         % ('every satellite system' if key is None else systems.get(key)['label']))
-            self.sys_buttons.addButton(b, i)
-            sys_row.addWidget(b, 1)
-        self.sys_buttons.button(0).setChecked(True)
-        self.sys_buttons.idClicked.connect(self.sys_box.setCurrentIndex)
-        self.sys_box.currentIndexChanged.connect(lambda i: self.sys_buttons.button(i).setChecked(True))
+        # side panel: which systems to show (drives the Systems filter), then numbers about them.
+        # The Sky and Globe windows get the same buttons; they all drive (and follow) sys_box.
+        self.sys_groups = []
+        sys_row, self.sys_buttons = self._sys_bar(38)
         self.sys_box.hide()         # the buttons above the satellite list replace it
         self.stats = [StatBox() for _ in range(4)]
         stat_row = QtWidgets.QHBoxLayout()
@@ -1873,6 +1854,7 @@ class Tracker(QtWidgets.QMainWindow):
             self.globe = globe.GlobeWindow(self, (HOME_LAT, HOME_LON), load_tile_rgb)
             self.globe.view.satelliteClicked.connect(self.select)
             self.globe.view.satelliteClicked.connect(self.show_sat_info)
+            self.globe.layout().insertWidget(0, self._sys_window_bar())
         self.globe.view.home = (HOME_LAT, HOME_LON)
         self.globe.view.set_scene(self.map.scene)
         self.globe.show()
@@ -1882,6 +1864,8 @@ class Tracker(QtWidgets.QMainWindow):
     def show_sky(self):
         if self.sky is None:
             self.sky = skyplot.SkyDialog(self, self.data, from_home, self._run_start, self.shows)
+            self.sky.layout().insertWidget(0, self._sys_window_bar())
+            self.sys_box.currentIndexChanged.connect(self.sky.refresh)
         self.sky.show()
         self.sky.raise_()
         self.sky.refresh()
@@ -2090,6 +2074,54 @@ class Tracker(QtWidgets.QMainWindow):
         self._fill_summary(names)
         self.tle_note = 'Orbits: computed from your own observations only'
 
+    def _sys_bar(self, height):
+        """a row of system buttons (All / Iridium / ... with their satellite counts) tied to the Systems
+        filter: (layout, button group)"""
+        group = QtWidgets.QButtonGroup(self)
+        group.setExclusive(True)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(4)
+        for i in range(self.sys_box.count()):
+            key = self.sys_box.itemData(i)
+            b = QtWidgets.QPushButton()
+            b.setCheckable(True)
+            b.setMinimumHeight(height)
+            col = QtGui.QColor(*systems.get(key)['colour']).name() if key else ACCENT
+            b.setStyleSheet('QPushButton { padding: 2px 4px; font-size: 11px; border: 1px solid %s; border-radius: 6px;'
+                            ' background: %s; color: %s; }'
+                            ' QPushButton:checked { background: %s; border: 2px solid %s; color: white; font-weight: 700; }'
+                            ' QPushButton:hover:!checked { border-color: %s; }'
+                            % (BORDER, SURFACE, TEXT, QtGui.QColor(col).darker(220).name(), col, col))
+            b.setToolTip('Show %s on the map, globe, sky plot and in the list'
+                         % ('every satellite system' if key is None else systems.get(key)['label']))
+            group.addButton(b, i)
+            row.addWidget(b, 1)
+        group.button(max(0, self.sys_box.currentIndex())).setChecked(True)
+        group.idClicked.connect(self.sys_box.setCurrentIndex)
+        self.sys_box.currentIndexChanged.connect(lambda i, g=group: g.button(i).setChecked(True))
+        self.sys_groups.append(group)
+        if self.sys_groups[1:]:             # a new window's buttons: give them their counts straight away
+            self._label_sys_buttons()
+        return row, group
+
+    def _sys_window_bar(self):
+        """the system buttons for the Sky / Globe windows, in a strip of their own"""
+        row, _ = self._sys_bar(34)
+        w = QtWidgets.QWidget()
+        row.setContentsMargins(8, 6, 8, 0)
+        w.setLayout(row)
+        return w
+
+    def _label_sys_buttons(self):
+        """each system button: its name and how many of its satellites are listed"""
+        listed = self.data.tracked + self.data.doppler_only
+        for i in range(self.sys_box.count()):
+            key = self.sys_box.itemData(i)
+            n = sum(1 for x in listed if key is None or systems.of_name(x)['key'] == key)
+            label = 'All' if key is None else {'ham': 'ISS / ham'}.get(key, systems.get(key)['label'].split(' (')[0])
+            for g in self.sys_groups:
+                g.button(i).setText('%s\n%d' % (label, n))
+
     def _list_cells(self, n, i, want):
         """the three middle cells of a satellite's row: two texts and (text, number) for the numeric one"""
         d, sysk = self.data, i['system']
@@ -2138,12 +2170,7 @@ class Tracker(QtWidgets.QMainWindow):
     def _fill_summary(self, names):
         """the system buttons' counts, the number boxes and the note under them, for the systems shown"""
         d = self.data
-        listed = d.tracked + d.doppler_only
-        for i in range(self.sys_box.count()):
-            key = self.sys_box.itemData(i)
-            n = sum(1 for x in listed if key is None or systems.of_name(x)['key'] == key)
-            label = 'All' if key is None else {'ham': 'ISS / ham'}.get(key, systems.get(key)['label'].split(' (')[0])
-            self.sys_buttons.button(i).setText('%s\n%d' % (label, n))
+        self._label_sys_buttons()
         want = self.sys_box.currentData()
         orbit = sum(1 for x in names if x in d.orbits)
         heard = len(names) - orbit
@@ -2704,6 +2731,12 @@ def main():
                 for k in range(w.sat_info.tabs.count()):
                     w.sat_info.tabs.setCurrentIndex(k)
                     w.sat_info.grab().save(out.replace('.png', '-info%d.png' % k))
+            if '--windows' in sys.argv:            # and the Globe and Sky windows
+                w.show_globe()
+                w.show_sky()
+                QtCore.QTimer.singleShot(4000, lambda: (w.refresh(), w.globe.grab().save(out.replace('.png', '-globe.png')),
+                                                        w.sky.grab().save(out.replace('.png', '-sky.png')), app.quit()))
+                return
             app.quit()
         if sel:
             w.select(sel[0][9:].replace('_', ' '))

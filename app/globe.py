@@ -204,7 +204,9 @@ class GlobeView(QtWidgets.QWidget):
         W, H = max(1, w // k), max(1, h // k)
         sun = self.scene['sun'] if self.scene else (0.0, 0.0)
         night = bool(self.scene and self.scene.get('night'))
-        key = (round(self.lat0, 3), round(self.lon0, 3), round(self.dist, 4), round(self.tilt, 2), self.target_r,
+        fps = tuple((round(fp['lat'], 1), round(fp['lon'], 1), round(fp['radius'], 1), fp['selected'])
+                    for fp in (self.scene or {}).get('footprints', []))
+        key = (fps, round(self.lat0, 3), round(self.lon0, 3), round(self.dist, 4), round(self.tilt, 2), self.target_r,
                round(self.heading, 2), self.ground, round(self.pitch, 2), round(self.fov, 2), W, H, round(sun[0], 1), round(sun[1], 1), self.tex is not None, night)
         if key == self.earth_key:
             return self.earth
@@ -248,6 +250,14 @@ class GlobeView(QtWidgets.QWidget):
                 grid = (np.abs((lat + 90) % 30 - 15) > 14.2) | (np.abs((lon + 180) % 30 - 15) > 14.2)
                 rgb[grid] = (50, 70, 90)
             rgb = rgb * 1.35                # the map is dark-themed; lift it a little on the globe
+            # coverage footprints, like the map's: red for the selected satellite, orange for others
+            for fla, flo, frad, fsel in fps:
+                a, o = math.radians(fla), math.radians(flo)
+                centre = np.array([math.cos(a) * math.cos(o), math.cos(a) * math.sin(o), math.sin(a)], np.float32)
+                inside = p.astype(np.float32) @ centre > math.cos(math.radians(frad))
+                tint, k_fp = (np.array([255, 60, 60], np.float32), 0.3) if fsel else \
+                    (np.array([255, 160, 0], np.float32), 0.15)
+                rgb[inside] = rgb[inside] * (1 - k_fp) + tint * k_fp
             facing = np.clip(-np.einsum('ij,ij->i', p, dh), 0, 1)
             shade = 0.72 + 0.28 * facing    # a little darker towards the edge: looks round
             if night:
@@ -425,6 +435,10 @@ class GlobeView(QtWidgets.QWidget):
                 ring = [(la, lo) for la, lo in pl['ring']]
                 self._line(p, to_xyz(np.array([r[0] for r in ring]), np.array([r[1] for r in ring]), 781.0),
                            col, 2.5 if pl['selected'] else 1.6)
+            for fp in sc.get('footprints', []):
+                ring = np.array(it.circle_points(fp['lat'], fp['lon'], fp['radius']))
+                self._line(p, to_xyz(ring[:, 0], ring[:, 1], 0.0),
+                           QtGui.QColor(230, 60, 70) if fp['selected'] else QtGui.QColor(220, 130, 20), 1.5)
             for tr in sc.get('tracks', []):
                 for pts, col in ((tr.get('space_past', tr['past']), it.C_PAST),
                                  (tr.get('space_future', tr['future']), it.C_FUTURE)):
