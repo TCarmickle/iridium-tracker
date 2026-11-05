@@ -689,6 +689,8 @@ def main():
             continue
         if name in data and not redo:
             continue
+        if systems.of_capture(name).get('system') == 'meteor':
+            continue        # pictures, not frames: images.py makes them (receiver.py runs it after Stop)
         live = stem + '.live'
         if systems.of_capture(name) is not systems.IRIDIUM and name not in ready and os.path.exists(live) \
                 and time.time() - os.path.getmtime(live) < 20:

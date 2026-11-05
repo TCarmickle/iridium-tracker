@@ -39,6 +39,9 @@ conda environment that has the packages in `environment.yml`: `python app\start.
 |---|---|
 | `app\start.py` | entry point |
 | `app\iridium_tracker.py` | the window: map, timeline, satellite list |
+| `app\meteor_rx.py` | Meteor-M receiver: records the 137.9 MHz pass (256 kS/s 16-bit IQ) and reports its signal |
+| `app\images.py` | Satellite pictures: runs SatDump's `meteor_m2-x_lrpt` pipeline on a recorded pass, imports SatDump folders |
+| `app\images_view.py` | The Images section: passes, pictures, zoomable viewer, save |
 | `app\console.py` | Satellite Console: detailed line-by-line log on every band, a band choice, or receiving without the window |
 | `app\sdr_source.py` | runs gr-iridium's extractor with the device options and the spectrum tap (UDP) |
 | `app\sdr_settings.py` | SDR source settings, device discovery, extractor config |

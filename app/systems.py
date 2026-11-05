@@ -139,6 +139,31 @@ GLONASS_BAND = dict(GNSS_BAND, **{
     'listen_hz': 1602.0e6,
     'bands': [(1600.8, 1603.2, 'GLONASS L1 channels -2..+2 - under the noise', (190, 130, 255, 30))],
 })
+# Meteor-M (Russia's weather satellites): pictures of the Earth (LRPT, 137.9 MHz, backup 137.1 MHz).
+# The receiver records the pass (meteor_rx.py) and SatDump turns it into pictures afterwards (images.py);
+# they are shown in the Images section, not on the map. The SDR is tuned 200 kHz below 137.9 MHz so its centre
+# spike (strong on E4000 tuners) stays off the signal.
+METEOR = {
+    'key': 'meteor',
+    'system': 'meteor',
+    'label': 'Meteor-M weather pictures',
+    'prefix': 'METEOR',
+    'short': '',
+    'colour': (80, 200, 230),
+    'carrier_hz': 137.9e6,
+    'inc_hint': None,
+    'tle_group': None,
+    'band_hz': (137.85e6, 137.95e6),
+    'rate': 1024000, 'center_hz': 137700000,
+    'capture_prefix': 'meteor-',
+    'keep_kinds': ('MSIG:',),
+    'antenna': 'a whip about 21 in / 53 cm long (a quarter wave at 137.9 MHz - e.g. a telescopic one pulled out '
+               'that far), upright on something metal, outdoors with open sky',
+    'listen_hz': 137.9e6,
+    'channel_hz': 120e3,
+    'demod': 'fm',                   # the 72k-symbol signal: a steady hiss-like warble
+    'bands': [(137.846, 137.954, 'Meteor-M LRPT pictures (137.9 MHz)', (80, 200, 230, 40))],
+}
 # each system's signal measure and its scale for the strength colours and bars: (weak - barely decodes,
 # strong, unit). Iridium / Orbcomm / ham: the SNR of each burst, packet or frame (dB over the noise in its
 # channel); GNSS: C/N0 every second (dB-Hz: the signal against the noise in 1 Hz - 35 is enough for the orbit)
@@ -150,7 +175,8 @@ IRIDIUM['system'] = 'iridium'
 ORBCOMM['system'] = 'orbcomm'
 ORBCOMM.update(rate=1228800, center_hz=137500000)     # the decoder needs a multiple of 9600 S/s
 
-ORDER = [IRIDIUM, ORBCOMM, HAM2M, HAM70, GNSS_BAND, GLONASS_BAND]   # what the receiver can listen to (one at a time)
+METEOR['signal'] = (2.0, 12.0, 'dB')       # the pass's signal over the noise beside it (meteor_rx.py)
+ORDER = [IRIDIUM, ORBCOMM, HAM2M, HAM70, GNSS_BAND, GLONASS_BAND, METEOR]   # what the receiver can listen to (one at a time)
 DISPLAY = [IRIDIUM, ORBCOMM, HAM, GNSS]               # what the map, list and Systems filter group satellites by
 SYSTEMS = {s['key']: s for s in ORDER + DISPLAY}
 DEFAULT = 'iridium'

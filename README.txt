@@ -238,6 +238,28 @@ and messaging channels are shaded green, the phone channels blue.
   noise by the amount you set. Your choices are remembered.
 
 
+WEATHER PICTURES (the Images section)
+-------------------------------------
+Click "Images" at the top to switch from the tracker to the pictures received from the
+Meteor-M weather satellites (Russia; LRPT on 137.9 MHz, a pass every few hours, about 15 min).
+- To receive one: during a pass press "Receive a Meteor pass" (or choose "Meteor-M weather
+  pictures" as the receiver band and press Start receiver). The status line shows the signal
+  over the noise every couple of seconds - a few dB or more is good. Press Stop when the
+  satellite has set; a minute or two later the pictures appear in Images.
+- Antenna: a whip about 21 in / 53 cm long (a quarter wave at 137.9 MHz - a telescopic one
+  pulled out that far), upright on something metal, outdoors with open sky. The higher the
+  pass goes, the better the picture.
+- The pictures are made by SatDump (free, open source, GPL-3.0 - https://www.satdump.org):
+  install it with its Windows installer; the tracker finds it in C:\Program Files\SatDump.
+  While receiving, the pass is recorded (about 1 GB, deleted once its pictures are made; a
+  recording that gave no pictures is kept so "Make pictures again" can retry it).
+- Click a pass, then a picture: scroll to zoom, drag to move, double-click to fit. "Save as..."
+  copies it anywhere; "Open" opens it in your picture viewer.
+- Passes received with SatDump itself: "Import a SatDump folder..." copies their pictures in.
+- The Satellite Console shows the signal during a Meteor pass too (band 7).
+- Pictures are kept in data\images (one folder per pass).
+
+
 THE CONSOLE (more detail)
 -------------------------
 Double-click "Satellite Console.bat" for a line-by-line view of the receiver, like a radio log,
@@ -251,8 +273,8 @@ on whichever band it is on (shown at the top, with the frequency it is tuned to)
   decoded, and the receiver's own position fixes.
 - It watches whatever the tracker's receiver is doing, so you can run both together.
 - Or receive from the console without the tracker (close the tracker's receiver first):
-  press 1-6 to choose the band (Iridium, Orbcomm, ISS & ham 2 m, ham 70 cm, GPS L1,
-  GLONASS L1 - it starts on the tracker's last one), then R. Press R again or Q to stop;
+  press 1-7 to choose the band (Iridium, Orbcomm, ISS & ham 2 m, ham 70 cm, GPS L1,
+  GLONASS L1, Meteor-M pictures - it starts on the tracker's last one), then R. Press R again or Q to stop;
   the capture goes into the catalog. The choice is the console's only: the tracker keeps its own.
 - B turns beeps on/off (short = not decoded, long = decoded, extra long = a position).
   D shows/hides what was heard but not decoded.

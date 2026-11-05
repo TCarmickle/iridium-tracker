@@ -43,9 +43,12 @@ everything received is shown together, with a **Systems** filter.
   by each satellite in the list when that satellite is heard
 - **Choose your SDR** like SDR++'s source menu: any gr-osmosdr device (RTL-SDR, RTL-TCP, HackRF,
   Airspy, bladeRF, SoapySDR...), sample rate, frequency, gain, PPM, bias-T, IQ/DC correction
+- **Images**: weather pictures from the Meteor-M satellites (137.9 MHz LRPT) - receive a pass with the
+  tracker's own receiver, and [SatDump](https://www.satdump.org) (GPL-3.0, installed separately) turns it into
+  pictures you can zoom, pan and save; SatDump output folders can be imported too
 - **Satellite Console** (`Satellite Console.bat`): a line-by-line log of everything received on every band -
   Iridium frames and ring-alert positions, Orbcomm packets, ham frames, GNSS satellites tracked, their orbits
-  and position fixes - alongside the tracker, or receiving on its own on the band you choose (keys 1-6)
+  and position fixes - alongside the tracker, or receiving on its own on the band you choose (keys 1-7)
 - **Click the map to set your location**; the terrain height is looked up automatically
 - **Stays small**: raw recordings are cleaned up automatically (7 days / 1 GB by default), long-term
   storage is ~1-2% of a capture, the map cache is capped, and receiving stops before the disk fills

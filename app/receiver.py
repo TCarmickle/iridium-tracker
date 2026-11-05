@@ -12,6 +12,7 @@ so the decoder is stopped automatically once it uses more than LIMIT_GB.
 import ctypes
 import datetime
 import glob
+import json
 import os
 import re
 import subprocess
@@ -34,6 +35,8 @@ SOURCE = os.path.join(HERE, 'sdr_source.py')    # runs it with our device option
 ORBCOMM_RX = os.path.join(HERE, 'orbcomm_rx.py')  # Orbcomm: receiver + decoder in one process
 HAM_RX = os.path.join(HERE, 'ham_rx.py')          # ISS and ham CubeSats (2 m or 70 cm): the same
 GNSS_RX = os.path.join(HERE, 'gnss_rx.py')        # GPS / Galileo / BeiDou: records chunks for PocketSDR
+METEOR_RX = os.path.join(HERE, 'meteor_rx.py')    # Meteor-M pictures: records the pass; SatDump decodes it after
+IMAGES_PY = os.path.join(HERE, 'images.py')
 DAMAGED = ('RAW', 'ERR', 'OBAD', 'HSIG')        # frame kinds that were heard but could not be decoded
 LIMIT_GB = 2
 STATUS_EVERY = 10   # the decoder prints its totals every second; the log keeps one line in this many
@@ -209,7 +212,9 @@ class Receiver(QtCore.QObject):
         g, auto = sdr_settings.gain(s)
         prog = ([ORBCOMM_RX] if self.system is systems.ORBCOMM else [GNSS_RX] if self.system is systems.GNSS_BAND
                 else [GNSS_RX, '--constellation', 'glonass'] if self.system is systems.GLONASS_BAND
+                else [METEOR_RX, '--baseband', self.bits_path[:-5] + '.s16'] if self.system is systems.METEOR
                 else [HAM_RX, '--band', self.system['key']])
+        self.meteor_snr = None
         args = prog + ['--device', sdr_settings.device_args(s), '--rate', str(sdr_settings.sample_rate(s)),
                 '--center', str(sdr_settings.center_hz(s)), '--gain', '%g' % g, '--ppm', '%g' % s['ppm'],
                 '--start-file', self.start_path]
@@ -256,6 +261,11 @@ class Receiver(QtCore.QObject):
             self.stop('decoder used over %d GB of memory (too many false bursts) - raise the threshold' % LIMIT_GB)
             return
         e = int(time.time() - self.t_start)
+        if self.system is systems.METEOR:       # nothing is decoded until Stop: the signal is the news
+            self.status.emit('Receiving %s %d:%02d:%02d  ·  recording the pass  ·  signal %s  ·  pictures are made '
+                             'after Stop' % (self.system['label'], e // 3600, e // 60 % 60, e % 60,
+                                             '%+.1f dB' % self.meteor_snr if self.meteor_snr is not None else '-'))
+            return
         self.status.emit('Receiving %s %d:%02d:%02d  ·  %d decoded  ·  %d damaged  ·  %d positions%s'
                          % (self.system['label'], e // 3600, e // 60 % 60, e % 60, self.decoded_n, self.heard, self.fixes,
                             '  ·  ' + self.last_status if self.last_status else ''))
@@ -335,13 +345,19 @@ class Receiver(QtCore.QObject):
             return
         lines = (self.out_rest + data.replace('\r\n', '\n')).split('\n')
         self.out_rest = lines.pop()
-        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS): ', l)]
+        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS|MSIG): ', l)]
         if not lines:
             return
         with open(self.live_path, 'a', newline='') as f:
             f.write(''.join(l + '\r\n' for l in lines))
         for line in lines:
             kind = line.split(':', 1)[0]
+            if kind == 'MSIG':          # Meteor: its signal strength (not a frame)
+                try:
+                    self.meteor_snr = float(line.split()[2])
+                except (IndexError, ValueError):
+                    pass
+                continue
             self.frame.emit(kind, line)
             if kind in DAMAGED:
                 self.heard += 1
@@ -383,6 +399,13 @@ class Receiver(QtCore.QObject):
         self.parser.closeWriteChannel()       # let the parser finish what it was given
         QtCore.QTimer.singleShot(15000, lambda p=self.parser: p.state() != QtCore.QProcess.NotRunning and p.kill())
 
+    def _received_file(self):
+        """the file that shows whether anything was received: Iridium's raw bursts, Meteor's recording, the others'
+        decoded lines"""
+        if self.parser is not None:
+            return self.bits_path
+        return self.bits_path[:-5] + '.s16' if self.system is systems.METEOR else self.live_path
+
     def _clear_running(self):
         """receiving has ended (the SDR is free; the capture may still be going into the catalog)"""
         try:
@@ -394,7 +417,7 @@ class Receiver(QtCore.QObject):
         self._clear_running()
         if self.parser is not None:
             self._parser_output()
-        got = self.bits_path if self.parser is not None else self.live_path
+        got = self._received_file()
         size = os.path.getsize(got) if os.path.exists(got) else 0
         if size < 200:      # nothing was received: don't leave empty files behind
             self._remove_capture()
@@ -403,17 +426,32 @@ class Receiver(QtCore.QObject):
             self.status.emit('Receiver stopped%s - nothing was received' % (': ' + self.stop_reason if self.stop_reason else ''))
             return
         self.state = 'decoding'
-        self.status.emit('Stopped%s. Adding the capture to the catalog...' % (' (' + self.stop_reason + ')' if self.stop_reason else ''))
+        meteor = self.system is systems.METEOR
+        self.status.emit('Stopped%s. %s' % (' (' + self.stop_reason + ')' if self.stop_reason else '',
+                                            'Making the pictures with SatDump (a minute or two)...' if meteor else
+                                            'Adding the capture to the catalog...'))
         self.decoder = self._proc()
         self.decoder.finished.connect(self._decoder_finished)
         self.decoder.setStandardOutputFile(QtCore.QProcess.nullDevice())
         self.decoder.setStandardErrorFile(QtCore.QProcess.nullDevice())
-        self.decoder.start(PY, [os.path.join(HERE, 'catalog.py'), '--ready=' + self.capname])
+        self.decoder.start(PY, [IMAGES_PY, '--decode', self.capname] if meteor else
+                           [os.path.join(HERE, 'catalog.py'), '--ready=' + self.capname])
 
     def _decoder_finished(self, *_):
         self.state = 'idle'
         self.running.emit(False)
         ok = self.decoder.exitCode() == 0
+        if self.system is systems.METEOR:
+            import images
+            try:
+                meta = json.load(open(os.path.join(images.IMAGES, self.capname, 'pass.json')))
+                text = '%d pictures - see Images' % meta['images'] if meta.get('images') else meta.get('note', '')
+            except (OSError, ValueError):
+                text = 'the pictures could not be made (SatDump)'
+            self.status.emit('Meteor pass %s: %s%s' % (self.capname, text, ' - stopped: ' + self.stop_reason
+                                                         if self.stop_reason else ''))
+            self.decoded.emit()
+            return
         self.status.emit('Capture %s %s (%d decoded, %d positions)%s'
                          % (self.capname, 'added to the catalog' if ok else 'could not be decoded - run 2-decode.bat',
                             self.decoded_n, self.fixes, ' - stopped: ' + self.stop_reason if self.stop_reason else ''))
@@ -433,9 +471,10 @@ class Receiver(QtCore.QObject):
                 self.parser.waitForFinished(15000)
                 self._parser_output()
                 self.parser.kill()
-            got = self.bits_path if self.parser is not None else self.live_path
+            got = self._received_file()
             if os.path.exists(got) and os.path.getsize(got) >= 200:
-                subprocess.Popen([PY, os.path.join(HERE, 'catalog.py'), '--ready=' + self.capname],
+                subprocess.Popen([PY, IMAGES_PY, '--decode', self.capname] if self.system is systems.METEOR else
+                                 [PY, os.path.join(HERE, 'catalog.py'), '--ready=' + self.capname],
                                  cwd=HERE, creationflags=NO_WINDOW)
             else:
                 self._remove_capture()
@@ -443,7 +482,7 @@ class Receiver(QtCore.QObject):
     def _remove_capture(self):
         """delete the files of a run that received nothing - except its log, which says what the receiver
         heard (e.g. Orbcomm's per-channel levels), for working out why (storage removes it with other old files)"""
-        for ext in ('.bits', '.live', '.start', RUNNING):
+        for ext in ('.bits', '.live', '.start', '.s16', RUNNING):
             try:
                 os.remove(self.bits_path[:-5] + ext)
             except OSError:

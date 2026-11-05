@@ -751,6 +751,8 @@ class Data:
                 evs = self._read_live_ham(text, cap, newest, refit)
             elif systems.of_capture(cap).get('system') == 'gnss':
                 evs = self._read_live_gnss(text, cap, newest, refit)
+            elif systems.of_capture(cap).get('system') == 'meteor':
+                evs = []        # Meteor: only its signal strength while receiving; pictures in Images after Stop
             else:
                 evs = self._read_live(text, cap, catalog.capture_start(path[:-5])[0].timestamp(), newest, refit)
             if newest:
@@ -1877,6 +1879,20 @@ class Tracker(QtWidgets.QMainWindow):
         status_row = QtWidgets.QHBoxLayout()
         hv.addLayout(status_row)
         hl.addWidget(title)
+        # the two sections: the tracker (map, satellites) and the pictures received (Meteor-M weather images)
+        self.section_btns = []
+        for k, text in enumerate(('\U0001F6F0  Tracker', '\U0001F5BC  Images')):
+            b = QtWidgets.QPushButton(text)
+            b.setCheckable(True)
+            b.setChecked(k == 0)
+            b.clicked.connect(lambda _, k=k: self.show_section(k))
+            theme.style(b, 'QPushButton { padding: 4px 12px; } QPushButton:checked { background: %(SEL_BG)s; '
+                           'border: 1px solid %(ACCENT)s; color: %(TEXT)s; font-weight: 600; }')
+            b.setMinimumWidth(b.sizeHint().width() + 16)
+            self.section_btns.append(b)
+            hl.addWidget(b)
+        self.section_btns[1].setToolTip('Weather pictures from the Meteor-M satellites: receive a pass, view and '
+                                        'save the pictures')
         hl.addStretch(1)
         hl.addWidget(self.rx_btn)
         hl.addWidget(self.rx_system)
@@ -1920,7 +1936,6 @@ class Tracker(QtWidgets.QMainWindow):
         left = QtWidgets.QWidget()
         lv = QtWidgets.QVBoxLayout(left)
         lv.setContentsMargins(4, 4, 4, 4)
-        lv.addWidget(header)
         self.pick_bar = QtWidgets.QFrame()
         self.pick_bar.setObjectName('pick')
         theme.style(self.pick_bar, 'QFrame#pick { background: %(PICK)s; border: 1px solid %(ACCENT)s; border-radius: 8px; }'
@@ -2050,7 +2065,19 @@ class Tracker(QtWidgets.QMainWindow):
         split.setStretchFactor(0, 1)
         right.setMinimumWidth(380)
         split.setSizes([max(600, self.width() - 520), 520])
-        self.setCentralWidget(split)
+        # the header (receiver, sections) over both sections; the tracker and the Images section under it
+        self.sections = QtWidgets.QStackedWidget()
+        self.sections.addWidget(split)
+        import images_view
+        self.images_view = images_view.ImagesView(self)
+        self.sections.addWidget(self.images_view)
+        central = QtWidgets.QWidget()
+        cv = QtWidgets.QVBoxLayout(central)
+        cv.setContentsMargins(4, 4, 4, 0)
+        cv.setSpacing(2)
+        cv.addWidget(header)
+        cv.addWidget(self.sections, 1)
+        self.setCentralWidget(central)
         self.status = QtWidgets.QLabel()
         self.statusBar().addWidget(self.status, 1)
 
@@ -2256,6 +2283,16 @@ class Tracker(QtWidgets.QMainWindow):
             theme.save(theme.name, name)
 
     # ---- sky plot
+    def show_section(self, k):
+        """0: the tracker, 1: Images (the map's own buttons are hidden there)"""
+        self.sections.setCurrentIndex(k)
+        for i, b in enumerate(self.section_btns):
+            b.setChecked(i == k)
+        for b in (self.sky_btn, self.globe_btn, self.signal_btn):
+            b.setVisible(k == 0)
+        if k == 1:
+            self.images_view.refresh()
+
     def show_sky(self):
         if self.sky is None:
             self.sky = skyplot.SkyDialog(self, self.data, from_home, self._run_start, self.shows)

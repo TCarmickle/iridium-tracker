@@ -5,10 +5,10 @@ Iridium bursts, Orbcomm packets, ISS / ham frames, and GNSS (GPS, Galileo, WAAS,
                                         alongside the tracker)
   Satellite Console.bat --receive       receive from here, without the tracker (on the band chosen with
                                         --band, or the tracker's last band)
-  Satellite Console.bat --band gnss1    start with that band chosen (iridium, orbcomm, ham2m, ham70, gnss1, glo1)
+  Satellite Console.bat --band gnss1    start with that band chosen (iridium, orbcomm, ham2m, ham70, gnss1, glo1, meteor)
   Satellite Console.bat --capture NAME  print a finished capture, e.g. output-20261101-142243 or gnss-20261103-215314
 
-Keys while running:  R start/stop receiving here   1-6 choose the band to receive   B beeps on/off
+Keys while running:  R start/stop receiving here   1-7 choose the band to receive   B beeps on/off
                      D damaged / undecoded on/off   Q quit
 
 Only technical frames are described (which satellite, where, signal). Voice, pager, message and data
@@ -53,7 +53,7 @@ GREEN, GREY, CYAN, YELLOW, RED, MAGENTA, BOLD, RESET = ('\x1b[92m', '\x1b[90m', 
                                                         '\x1b[95m', '\x1b[1m', '\x1b[0m')
 GNSS_EVERY_S = 15   # a tracked GNSS satellite's line: once in this many seconds (its numbers come every second)
 GNSS_LOST_S = 10    # ...and it counts as lost after this long without one
-BANDS = systems.ORDER       # what keys 1-6 choose
+BANDS = systems.ORDER       # what keys 1-7 choose
 
 
 def enable_colours():
@@ -161,6 +161,7 @@ class Console(QtCore.QObject):
         self.first_t = self.last_t = None
         self.gnss_last = {}         # GNSS satellite -> (time of its newest numbers, time its line was last printed)
         self.gnss_orbits = set()
+        self.meteor_best, self.meteor_printed = None, 0
 
     # ---- the band
     def choose_band(self, k):
@@ -177,7 +178,9 @@ class Console(QtCore.QObject):
         print('%sBands (press the number, then R to receive here):%s' % (GREY, RESET))
         for k, b in enumerate(BANDS):
             print('%s  %s[%d] %-34s %s%s' % (BOLD if b is cur else GREY, '>' if b is cur else ' ', k + 1, b['label'],
-                                            '%.3f MHz' % (sdr_settings.center_hz(dict(sdr_settings.load(), system=b['key'])) / 1e6),
+                                            '%.3f MHz' % ((b['carrier_hz'] if b is systems.METEOR else    # (its signal;
+                                                           sdr_settings.center_hz(dict(sdr_settings.load(), system=b['key'])))
+                                                          / 1e6),        # the SDR tunes 200 kHz below it)
                                             RESET))
 
     # ---- what to follow
@@ -220,7 +223,7 @@ class Console(QtCore.QObject):
                 self.cap = None
         if self.cap is None and not self.rx.busy and not self.waiting_shown:
             print('%sWaiting for a receiver: press "Start receiver" in the tracker, or R to receive here on %s '
-                  '(1-6 to choose another band).%s' % (CYAN, self.band['label'], RESET))
+                  '(1-7 to choose another band).%s' % (CYAN, self.band['label'], RESET))
             self.waiting_shown = True
         if self.cap:
             self.waiting_shown = False
@@ -267,6 +270,8 @@ class Console(QtCore.QObject):
             return self._orbcomm(kind, line.split()[1:], quiet)
         if kind in ('HFR', 'HSIG'):
             return self._ham(kind, line.split()[1:], quiet)
+        if kind == 'MSIG':
+            return self._meteor(line.split()[1:], quiet)
         return self._iridium(line, quiet)
 
     def _damaged(self, when, value, unit, bar, what, quiet):
@@ -382,6 +387,26 @@ class Console(QtCore.QObject):
             print('%s[%s]  DECODED  %5.1f dB    %-24s frame from %s%s%s - callsign %s, %d bytes  %s%.4f MHz%s'
                   % (GREEN, when, snr, self._bar(snr, 'ham'), BOLD, who, RESET + GREEN, call, size, GREY, hz / 1e6, RESET))
             self.beep('ok')
+
+    def _meteor(self, f, quiet):
+        """MSIG t snr_db every 2 s: the Meteor signal over the noise beside it (shown every 10 s; pictures after Stop)"""
+        try:
+            t, snr = float(f[0]), float(f[1])
+        except (IndexError, ValueError):
+            return
+        self._seen(t)
+        self.kinds['signal'] += 1
+        best = getattr(self, 'meteor_best', None)
+        self.meteor_best = snr if best is None else max(best, snr)
+        if quiet or t - getattr(self, 'meteor_printed', 0) < 10:
+            return
+        self.meteor_printed = t
+        colour = CYAN if snr >= 6 else GREEN if snr >= 2 else GREY
+        what = ('strong - good pictures likely' if snr >= 6 else 'there - pictures possible' if snr >= 2
+                else 'nothing yet (before the pass, or too weak)')
+        print('%s[%s]  signal   %+5.1f dB    %-24s Meteor LRPT 137.9 MHz: %s%s'
+              % (colour, datetime.datetime.fromtimestamp(t).strftime('%H:%M:%S'), snr,
+                 self._bar(snr, 'meteor'), what, RESET))
 
     def _gnss(self, kind, f, quiet):
         """GCH t sat sig cn0 doppler lock [sync ...] every second per tracked satellite / GEPH t sat fields (its
@@ -521,6 +546,11 @@ class Console(QtCore.QObject):
     def summary(self):
         mins = (self.last_t - self.first_t) / 60 if self.first_t else 0
         gnss = self.cap_band is not None and self.cap_band.get('system') == 'gnss'
+        if self.cap_band is not None and self.cap_band.get('system') == 'meteor':
+            best = getattr(self, 'meteor_best', None)
+            print('%s--- %s: %.0f min recorded, best signal %s - the pictures are made after Stop (Images section '
+                  'in the tracker)%s' % (BOLD, self.cap, mins, '%+.1f dB' % best if best is not None else '-', RESET))
+            return
         if gnss:
             print('%s--- %s: %d satellites tracked, %d broadcast orbits, %d position fixes in %.0f min%s'
                   % (BOLD, self.cap, len(self.sats), len(self.gnss_orbits), len(self.fixes), mins, RESET))
@@ -574,7 +604,7 @@ def main():
     ap = argparse.ArgumentParser(description='%s - detailed live log of the receiver, on every band' % TITLE)
     ap.add_argument('--receive', action='store_true', help='run the receiver from here (not from the tracker)')
     ap.add_argument('--band', choices=[b['key'] for b in BANDS],
-                    help="the band to receive (default: the tracker's last one); keys 1-6 change it while running")
+                    help="the band to receive (default: the tracker's last one); keys 1-7 change it while running")
     ap.add_argument('--capture', help='print the frames of a finished capture')
     ap.add_argument('--beep', action='store_true', help='start with beeps on (short = not decoded, long = decoded, '
                                                         'extra long = a position)')
@@ -586,7 +616,7 @@ def main():
         print_capture(args.capture)
         return
     app = QtCore.QCoreApplication(sys.argv)
-    print('%sSATELLITE CONSOLE%s  -  R receive here  ·  1-6 band  ·  B beeps  ·  D damaged  ·  Q quit' % (BOLD, RESET))
+    print('%sSATELLITE CONSOLE%s  -  R receive here  ·  1-7 band  ·  B beeps  ·  D damaged  ·  Q quit' % (BOLD, RESET))
     print('%sGreen = decoded / tracked, cyan = a position, magenta = a GNSS orbit, grey = heard but not decoded.%s'
           % (GREY, RESET))
     c = Console(args)
