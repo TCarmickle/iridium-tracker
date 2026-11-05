@@ -78,6 +78,36 @@ def save_ui(**values):
     json.dump(allset, open(_path(), 'w'), indent=1)
 
 
+# ---- remembered sizes: where the user dragged each divider (settings.json 'ui' 'splitters')
+_split_timers = {}
+
+
+def restore_splitter(splitter, key, default):
+    """set a splitter's sizes to the ones the user last chose (or default)"""
+    sizes = load_ui().get('splitters', {}).get(key)
+    if not (isinstance(sizes, list) and len(sizes) == splitter.count() and all(isinstance(v, int) and v >= 0
+                                                                               for v in sizes) and sum(sizes)):
+        sizes = default
+    splitter.setSizes(list(sizes))
+
+
+def remember_splitter(splitter, key, default):
+    """restore a splitter's sizes now, and save them (a moment after) whenever its divider is dragged"""
+    from PyQt5 import QtCore
+    restore_splitter(splitter, key, default)
+    timer = QtCore.QTimer(splitter)
+    timer.setSingleShot(True)
+    timer.timeout.connect(lambda: save_splitter(splitter, key))
+    _split_timers[key] = timer
+    splitter.splitterMoved.connect(lambda *_: timer.start(400))
+
+
+def save_splitter(splitter, key):
+    sizes = splitter.sizes()
+    if sum(sizes):
+        save_ui(splitters=dict(load_ui().get('splitters', {}), **{key: [int(v) for v in sizes]}))
+
+
 def load():
     """(window theme, map theme) saved last time - dark by default"""
     ui = load_ui()

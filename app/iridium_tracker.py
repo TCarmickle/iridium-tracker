@@ -1729,6 +1729,12 @@ class Tracker(QtWidgets.QMainWindow):
         self.setWindowTitle('Satellite Tracker')
         avail = QtWidgets.QApplication.primaryScreen().availableGeometry()
         self.resize(int(min(1700, avail.width() * 0.95)), int(min(1000, avail.height() * 0.92)))
+        geo = theme.load_ui().get('window')       # the size and place you left it at (and maximised or not)
+        if geo:
+            try:
+                self.restoreGeometry(QtCore.QByteArray.fromBase64(geo.encode()))
+            except (TypeError, ValueError):
+                pass
         self.data = Data()
         self.t = time.time()
         self.playing, self.following = False, True
@@ -1984,7 +1990,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.map_split.addWidget(self.spectrum)
         self.map_split.setStretchFactor(0, 3)
         self.map_split.setStretchFactor(1, 2)
-        self.map_split.setSizes([560, 330])
+        theme.remember_splitter(self.map_split, 'map_spectrum', [560, 330])     # (where you last dragged it)
         self.spec_btn.toggled.connect(self.spectrum.setVisible)
         lv.addWidget(self.map_split, 1)
         lv.addWidget(self.timeline)
@@ -2064,7 +2070,7 @@ class Tracker(QtWidgets.QMainWindow):
         split.addWidget(right)
         split.setStretchFactor(0, 1)
         right.setMinimumWidth(380)
-        split.setSizes([max(600, self.width() - 520), 520])
+        theme.remember_splitter(split, 'tracker_list', [max(600, self.width() - 520), 520])
         # the header (receiver, sections) over both sections; the tracker and the Images section under it
         self.sections = QtWidgets.QStackedWidget()
         self.sections.addWidget(split)
@@ -2291,13 +2297,14 @@ class Tracker(QtWidgets.QMainWindow):
         # the spectrum / waterfall / sound panel goes with the section shown (one panel, one set of settings)
         visible = self.spec_btn.isChecked()
         self.spectrum.view.pan_retune = None        # (dragging along the band: the Radio section only)
+        self.spectrum.view.set_section(('tracker', 'images', 'radio')[k])     # (its own trace / waterfall split)
         if k == 1:
             self.images_view.take_spectrum(self.spectrum)
         elif k == 2:
             self.radio_view.take_spectrum(self.spectrum)
         elif self.map_split.indexOf(self.spectrum) < 0:
             self.map_split.insertWidget(1, self.spectrum)
-            self.map_split.setSizes([560, 330])
+            theme.restore_splitter(self.map_split, 'map_spectrum', [560, 330])
         self.spectrum.setVisible(visible)
         self.sections.setCurrentIndex(k)
         for i, b in enumerate(self.section_btns):
@@ -2511,6 +2518,7 @@ class Tracker(QtWidgets.QMainWindow):
                 self.events.insertItem(0, '%s  Re-analyzing all captures...' % fmt_clock(time.time()))
 
     def closeEvent(self, e):
+        theme.save_ui(window=bytes(self.saveGeometry().toBase64()).decode())   # (dividers save as they are dragged)
         self.receiver.shutdown()
         for win in (self.sky, self.globe, self.sat_info, self.signal_win):      # separate windows: close them too
             if win is not None:

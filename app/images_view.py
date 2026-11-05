@@ -197,6 +197,11 @@ class ImagesView(QtWidgets.QWidget):
         self.vsplit = QtWidgets.QSplitter(Qt.Vertical)
         self.vsplit.addWidget(split)
         self.vsplit.setStretchFactor(0, 3)
+        self.vsave = QtCore.QTimer(self)        # the pictures / spectrum divider: saved a moment after a drag
+        self.vsave.setSingleShot(True)
+        self.vsave.timeout.connect(lambda: self.vsplit.count() == 2 and
+                                   theme.save_splitter(self.vsplit, 'images_spectrum'))
+        self.vsplit.splitterMoved.connect(lambda *_: self.vsave.start(400))
 
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
@@ -219,14 +224,14 @@ class ImagesView(QtWidgets.QWidget):
         self.vsplit.insertWidget(1, panel)
         self.vsplit.setStretchFactor(1, 2)
         h = max(500, self.vsplit.height())
-        self.vsplit.setSizes([h - 300, 300])
+        theme.restore_splitter(self.vsplit, 'images_spectrum', [h - 300, 300])    # (where you last dragged it)
 
     def showEvent(self, e):
         super().showEvent(e)
         if not self.sized:
             self.sized = True
             w = max(900, self.width())
-            self.split.setSizes([290, 2 * THUMB + 70, w - 290 - 2 * THUMB - 70])
+            theme.remember_splitter(self.split, 'images_panels', [290, 2 * THUMB + 70, w - 290 - 2 * THUMB - 70])
 
     @staticmethod
     def _heading(text):

@@ -248,6 +248,10 @@ reaches (about 24 MHz to 2.3 GHz): FM radio, NOAA Weather Radio, aircraft, ham, 
 - If another band is being received (Iridium, GPS...) and you tune outside its slice - digits,
   typing or a quick pick - it stops that band (its capture is kept as usual) and starts Radio
   at the new frequency.
+- Sizes are yours to set, in every section: drag the bar with the frequency scale (the grips
+  at its ends) up or down to give the spectrum line or the waterfall more room, and drag the
+  dividers between panels. The window's size and place, every divider, and the spectrum /
+  waterfall split (one for each section) are remembered for next time.
 - Drag the spectrum sideways to slide along the band (drag left = up in frequency); the SDR
   moves when you let go. The labels under the spectrum show what is where (FM radio, aircraft,
   marine, NOAA Weather Radio, ham bands, TV, cell phones, ADS-B, GPS...).

@@ -16,6 +16,8 @@ BG, PANEL, GRID, TEXT, MUTED = '#0e1116', '#14171c', '#262b35', '#e6e9ef', '#8b9
 ROWS = 500          # waterfall history (about 30 s at 15 frames/s)
 DECAY_DB = 3.0      # the peak line falls this much per frame after a burst (fast rise, slow fall)
 TUNE_STEP_HZ = 1000  # the mouse wheel over the trace moves the tuned frequency in these steps
+TRACE_MIN, TRACE_MAX = 0.12, 0.88   # how small / large the trace may be dragged (share of the height)
+AXIS_H = 18         # the frequency scale between the trace and the waterfall (also the bar to drag)
 
 # where things are in each system's band (MHz)
 BANDS = [(lo, hi, name, QtGui.QColor(*rgba), 0) for s in systems.ORDER for lo, hi, name, rgba in s['bands']]
@@ -67,6 +69,12 @@ class SpectrumView(QtWidgets.QWidget):
         self.passband = None        # ...and what is heard around it: (low, high) Hz from listen_hz
         self.pan_retune = None      # Radio: dragging the (unzoomed) spectrum moves the SDR - called with the shift (Hz)
         self.pan_df = 0.0           # ...the shift of the drag in progress
+        # how much of the height the trace gets (the waterfall the rest): dragged on the bar between them, and
+        # remembered for each section the panel is shown in (see set_section)
+        self.section = 'tracker'
+        self.trace_frac = 0.42
+        self.set_section('tracker')
+        self.split_drag = False
         self.dirty = False
         t = QtCore.QTimer(self)
         t.timeout.connect(self._repaint)
@@ -166,11 +174,36 @@ class SpectrumView(QtWidgets.QWidget):
         f0, f1 = self._span()
         return f0 + x / max(1, w) * (f1 - f0)
 
+    # ---- the bar between the trace and the waterfall (the frequency scale): drag it up or down
+    @staticmethod
+    def _fracs():
+        import theme
+        got = theme.load_ui().get('spectrum_trace_frac', {})
+        return got if isinstance(got, dict) else {}
+
+    def set_section(self, name):
+        """the panel is now shown in this section ('tracker', 'images', 'radio'): its own trace / waterfall split"""
+        self.section = name
+        default = {'radio': 0.38, 'images': 0.45}.get(name, 0.42)
+        try:
+            frac = float(self._fracs().get(name, default))
+        except (TypeError, ValueError):
+            frac = default
+        self.trace_frac = min(max(frac, TRACE_MIN), TRACE_MAX)
+        self.dirty = True
+
+    def _top_h(self):
+        return int(self.height() * self.trace_frac)
+
+    def _on_split(self, y):
+        top = self._top_h()
+        return top - 2 <= y <= top + AXIS_H + 2
+
     # ---- mouse
     def wheelEvent(self, e):
         if not self.n:
             return
-        if e.pos().y() < int(self.height() * 0.42):     # over the trace: step the tuned listening frequency
+        if e.pos().y() < self._top_h():     # over the trace: step the tuned listening frequency
             self._tune_wheel(e)
             return
         # over the waterfall: zoom (the trace and the waterfall together)
@@ -230,12 +263,17 @@ class SpectrumView(QtWidgets.QWidget):
         return min(max(bw, 100.0), 250e3)
 
     def mousePressEvent(self, e):
-        self.edge_drag = self._edge_at(e.pos().x()) if e.button() == Qt.LeftButton else None
-        self.drag = None if self.edge_drag else (e.pos().x(), self._span())
+        self.split_drag = e.button() == Qt.LeftButton and self.n > 0 and self._on_split(e.pos().y())
+        self.edge_drag = None if self.split_drag or e.button() != Qt.LeftButton else self._edge_at(e.pos().x())
+        self.drag = None if self.edge_drag or self.split_drag else (e.pos().x(), self._span())
         self.press_x = e.pos().x()
 
     def mouseMoveEvent(self, e):
         self.mouse = e.pos()
+        if self.split_drag:                         # the bar between trace and waterfall: resizing them
+            self.trace_frac = min(max(e.pos().y() / max(1, self.height()), TRACE_MIN), TRACE_MAX)
+            self.dirty = True
+            return
         if getattr(self, 'edge_drag', None):        # pressed on an edge, not released yet: widening / narrowing it
             bw = self._drag_width(e.pos().x())
             lo, hi = self.passband
@@ -243,7 +281,8 @@ class SpectrumView(QtWidgets.QWidget):
             self.dirty = True
             return
         if not e.buttons():
-            self.setCursor(Qt.SizeHorCursor if self._edge_at(e.pos().x()) else Qt.ArrowCursor)
+            self.setCursor(Qt.SizeVerCursor if self.n and self._on_split(e.pos().y()) else
+                           Qt.SizeHorCursor if self._edge_at(e.pos().x()) else Qt.ArrowCursor)
         if self.drag and e.buttons() & Qt.LeftButton and self.view:
             x0, (f0, f1) = self.drag
             df = (e.pos().x() - x0) / max(1, self.width()) * (f1 - f0)
@@ -255,6 +294,11 @@ class SpectrumView(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, e):
         self.drag = None
+        if self.split_drag:
+            self.split_drag = False
+            import theme
+            theme.save_ui(spectrum_trace_frac=dict(self._fracs(), **{self.section: round(self.trace_frac, 3)}))
+            return
         if getattr(self, 'edge_drag', None):
             self.edge_drag = None
             lo, hi = self.passband
@@ -293,8 +337,8 @@ class SpectrumView(QtWidgets.QWidget):
             p.drawText(self.rect(), Qt.AlignCenter, 'Start the receiver to see the spectrum and waterfall.\n'
                        '(It shows the same samples the decoder is working on - only one program can use the SDR.)')
             return
-        top_h = int(h * 0.42)
-        axis_h = 18
+        top_h = self._top_h()
+        axis_h = AXIS_H
         wf_top = top_h + axis_h
         a, b = self._bins()
         f0, f1 = self._span()
@@ -374,12 +418,19 @@ class SpectrumView(QtWidgets.QWidget):
                        '%s  release to move to %.4f MHz' % ('◀' if self.pan_df > 0 else '▶', to / 1e6))
 
         # waterfall
-        rows = min(ROWS, h - wf_top)
+        area = h - wf_top
+        rows = min(ROWS, area)
         if rows > 0:
             img_data = np.ascontiguousarray(self.lut[self.water[:rows, a:b]])
             img = QtGui.QImage(img_data.data, b - a, rows, (b - a) * 4, QtGui.QImage.Format_RGB32)
-            p.drawImage(QtCore.QRectF(0, wf_top, w, rows), img)
+            p.drawImage(QtCore.QRectF(0, wf_top, w, area), img)     # (stretched when taller than its history)
         p.fillRect(QtCore.QRectF(0, top_h, w, axis_h), QtGui.QColor(PANEL))
+        # the grip: this bar can be dragged up or down to give the trace or the waterfall more room
+        hot = self.split_drag or (self.mouse is not None and self._on_split(self.mouse.y()))
+        p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 60) if hot else QtGui.QColor(MUTED), 1.5))
+        for dy in (5, 9, 13):
+            p.drawLine(QPointF(8, top_h + dy), QPointF(22, top_h + dy))
+            p.drawLine(QPointF(w - 22, top_h + dy), QPointF(w - 8, top_h + dy))
         f = np.ceil(f0 / fstep) * fstep
         p.setPen(QtGui.QColor(MUTED))
         while f <= f1:
@@ -398,7 +449,7 @@ class SpectrumView(QtWidgets.QWidget):
                 if my < top_h and self.trace is not None:
                     what = '%.4f MHz   peak %.1f dB   average %.1f dB' % (fm / 1e6, self.trace[i], self.avg[i])
                 else:
-                    row = int((my - wf_top) / max(1, rows) * rows)
+                    row = int((my - wf_top) / max(1, area) * rows)     # (the image may be stretched)
                     db = self.water_db[min(max(row, 0), ROWS - 1), i]
                     what = '%.4f MHz   %.1f dB   %.1f s ago' % (fm / 1e6, db, row / 15)
                 p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 90), 1, Qt.DotLine))
