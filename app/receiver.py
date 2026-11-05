@@ -11,6 +11,7 @@ so the decoder is stopped automatically once it uses more than LIMIT_GB.
 """
 import ctypes
 import datetime
+import glob
 import os
 import re
 import subprocess
@@ -37,6 +38,39 @@ DAMAGED = ('RAW', 'ERR', 'OBAD', 'HSIG')        # frame kinds that were heard bu
 LIMIT_GB = 2
 STATUS_EVERY = 10   # the decoder prints its totals every second; the log keeps one line in this many
 NO_WINDOW = 0x08000000   # CREATE_NO_WINDOW
+
+
+RUNNING = '.running'     # <capture>.running: written while a receiver is on, holding its program's process ID
+
+
+def _alive(pid):
+    h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        return bool(ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h)
+
+
+def active_capture():
+    """(capture name, process ID) of the capture some receiver - this program's, the tracker's or the console's - is
+    receiving right now, or None. Decided by its .running marker, not by how recently files changed (a capture
+    that has just stopped looks fresh for a while); a marker left by a program that ended without removing it
+    (a crash) is removed here."""
+    for path in sorted(glob.glob(os.path.join(paths.CAPTURES, '*' + RUNNING)), key=os.path.getmtime, reverse=True):
+        try:
+            pid = int(open(path).read().split()[0])
+        except (OSError, ValueError, IndexError):
+            pid = 0
+        if pid and _alive(pid):
+            return os.path.basename(path)[:-len(RUNNING)], pid
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return None
 
 
 def private_bytes(pid):
@@ -107,6 +141,11 @@ class Receiver(QtCore.QObject):
         need = storage.settings()['min_free_gb']
         if storage.free_gb() < need:
             self.status.emit('Not starting: less than %.1f GB free on the disk holding %s' % (need, paths.DATA))
+            return
+        other = active_capture()
+        if other and other[1] != os.getpid():
+            self.status.emit('Not starting: another receiver is running (%s, %s) - stop it first (only one program '
+                             'can use the SDR)' % (other[0], systems.of_capture(other[0])['label']))
             return
         self.stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         self.sdr = sdr_settings.load()
@@ -186,6 +225,11 @@ class Receiver(QtCore.QObject):
         self._started()
 
     def _started(self):
+        try:
+            with open(self.bits_path[:-5] + RUNNING, 'w') as f:
+                f.write('%d' % os.getpid())
+        except OSError:
+            pass
         self.bits_pos = 0
         self.disk_check = time.time()
         self.bits_rest = self.out_rest = ''
@@ -339,7 +383,15 @@ class Receiver(QtCore.QObject):
         self.parser.closeWriteChannel()       # let the parser finish what it was given
         QtCore.QTimer.singleShot(15000, lambda p=self.parser: p.state() != QtCore.QProcess.NotRunning and p.kill())
 
+    def _clear_running(self):
+        """receiving has ended (the SDR is free; the capture may still be going into the catalog)"""
+        try:
+            os.remove(self.bits_path[:-5] + RUNNING)
+        except (OSError, AttributeError):
+            pass
+
     def _parser_finished(self, *_):
+        self._clear_running()
         if self.parser is not None:
             self._parser_output()
         got = self.bits_path if self.parser is not None else self.live_path
@@ -373,6 +425,7 @@ class Receiver(QtCore.QObject):
         if self.state == 'running':
             subprocess.run(['taskkill', '/PID', str(self.extractor.processId()), '/T', '/F'],
                            capture_output=True, creationflags=NO_WINDOW)
+            self._clear_running()
             self.timer.stop()
             if self.parser is not None:
                 self._feed_bits(datetime.datetime.now(datetime.timezone.utc))
@@ -390,7 +443,7 @@ class Receiver(QtCore.QObject):
     def _remove_capture(self):
         """delete the files of a run that received nothing - except its log, which says what the receiver
         heard (e.g. Orbcomm's per-channel levels), for working out why (storage removes it with other old files)"""
-        for ext in ('.bits', '.live', '.start'):
+        for ext in ('.bits', '.live', '.start', RUNNING):
             try:
                 os.remove(self.bits_path[:-5] + ext)
             except OSError:

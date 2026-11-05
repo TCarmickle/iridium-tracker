@@ -62,7 +62,6 @@ FAINT_SIGMA_KM = 150  # draw it faded beyond this uncertainty
 IRIDIUM_FLOOR_KM = 12.0     # what an Iridium orbit from ring-alert positions is off by while heard
 IRIDIUM_DRIFT_KM_H = 2.5    # ...and how fast that grows once it's no longer heard (km per hour)
 FIT_DAYS = 7          # orbits are fitted to each satellite's most recent week of observations
-HEARTBEAT_S = 45      # a receiver's decoder log is written every 10 s; this long without a change = stopped
 PLANE_MAX_SIGMA_KM = 300  # a satellite's orbit plane must be known this well to place its plane
 PLANE_JOIN_DEG = 5.0      # a satellite without a slot number joins a plane whose node is this close
 PLANE_SPACING_DEG = 31.6  # Iridium's planes, numbered 1-6 in order, are this far apart (design value)
@@ -2839,20 +2838,22 @@ class Tracker(QtWidgets.QMainWindow):
         unit = {'iridium': 'burst', 'orbcomm': 'packet', 'ham': 'frame', 'gnss': 'tracking update'}.get(
             systems.of_capture(d.live_cap or '')['system'], 'signal')
         burst = ('last %s %s ago' % (unit, fmt_age(now - d.last_burst))) if d.last_burst else 'no %ss yet' % unit
-        writing = now - d.heartbeat < HEARTBEAT_S
+        # another program receiving: by its marker file, not by how fresh the files are (a capture that has
+        # just stopped looks fresh for a while)
+        other = receiver.active_capture()
+        writing = other is not None and other[1] != os.getpid()
         if self.receiver.state == 'running':        # this window's receiver: it knows its own state
             live = 'LIVE: receiving %s  (%s)' % (d.live_cap, burst)
         elif self.receiver.busy:
             live = 'Receiver finishing - adding the capture to the catalog'
         elif writing:
-            live = 'LIVE: another receiver is writing %s  (%s)' % (d.live_cap, burst)
+            live = 'LIVE: another receiver is writing %s  (%s)' % (other[0], burst)
         else:
             live = 'Receiver not running'
         if not self.receiver.busy:
-            outside = writing and not (d.live_cap or '').endswith(str(self.receiver.stamp))   # not our own last run
-            if outside:
+            if writing:
                 self.rx_status.setText('Another receiver is running (%s) - stop it (Satellite Console or another '
-                                       'tracker window) before starting the receiver here' % self.data.live_cap)
+                                       'tracker window) before starting the receiver here' % other[0])
             elif not self.receiver.stamp or self.rx_status.text().startswith('Another receiver'):
                 self.rx_status.setText(self._source_text())     # (after a run here, its result message stays up)
         self.status.setText('%s    |    %s    |    %s' % (live, self.tle_note, 'You: %.4f, %.4f' % (HOME_LAT, HOME_LON) if catalog.HOME else 'Location not set'))

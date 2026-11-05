@@ -51,7 +51,6 @@ IRIDIUM_KINDS = {
 }
 GREEN, GREY, CYAN, YELLOW, RED, MAGENTA, BOLD, RESET = ('\x1b[92m', '\x1b[90m', '\x1b[96m', '\x1b[93m', '\x1b[91m',
                                                         '\x1b[95m', '\x1b[1m', '\x1b[0m')
-STALE_S = 120       # a live file this quiet means its receiver has stopped
 GNSS_EVERY_S = 15   # a tracked GNSS satellite's line: once in this many seconds (its numbers come every second)
 GNSS_LOST_S = 10    # ...and it counts as lost after this long without one
 BANDS = systems.ORDER       # what keys 1-6 choose
@@ -182,10 +181,6 @@ class Console(QtCore.QObject):
                                             RESET))
 
     # ---- what to follow
-    def newest_live(self):
-        lives = [p for pre in systems.capture_prefixes() for p in glob.glob(os.path.join(paths.CAPTURES, pre + '*.live'))]
-        return max(lives, key=os.path.getmtime) if lives else None
-
     def follow(self, live):
         self.cap = os.path.basename(live)[:-5]
         self.cap_band = systems.of_capture(self.cap)
@@ -209,9 +204,9 @@ class Console(QtCore.QObject):
         self.keys()
         if self.rx.busy:        # receiving from here: follow our own capture once it has frames
             target = self.rx.live_path       # (its decoder status shows before any frame is decoded)
-        else:                   # watching: the capture the tracker is writing right now
-            live = self.newest_live()
-            target = live if live and time.time() - os.path.getmtime(live) < STALE_S else None
+        else:                   # watching: the capture another receiver (the tracker's) is receiving right now
+            act = rx.active_capture()
+            target = os.path.join(paths.CAPTURES, act[0] + '.live') if act else None
         if target and (self.cap is None or os.path.basename(target)[:-5] != self.cap):
             self.follow(target)
         if self.cap:
@@ -219,9 +214,8 @@ class Console(QtCore.QObject):
             self._read(path)
             self._read_log(path[:-5] + '.log')
             self._gnss_lost()
-            if not self.rx.busy and (not os.path.exists(path) or time.time() - os.path.getmtime(path) > STALE_S) \
-                    and not self.waiting_shown:
-                print('%s--- the receiver stopped (nothing new for %d s) ---%s' % (YELLOW, STALE_S, RESET))
+            if not self.rx.busy and target is None and not self.waiting_shown:
+                print('%s--- the receiver stopped ---%s' % (YELLOW, RESET))
                 self.summary()
                 self.cap = None
         if self.cap is None and not self.rx.busy and not self.waiting_shown:
@@ -507,9 +501,10 @@ class Console(QtCore.QObject):
                     self.rx.stop()
                 elif self.rx.busy:
                     print('%s[receiver] still finishing the last capture...%s' % (YELLOW, RESET))
-                elif self.cap and time.time() - os.path.getmtime(os.path.join(paths.CAPTURES, self.cap + '.live')) < STALE_S:
-                    print('%sThe tracker is already receiving (%s) - stop it there first (only one program can use '
-                          'the SDR).%s' % (RED, self.cap_band['label'], RESET))
+                elif rx.active_capture():
+                    other = rx.active_capture()[0]
+                    print('%sAnother receiver is running (%s, %s) - stop it in the tracker first (only one program '
+                          'can use the SDR).%s' % (RED, systems.of_capture(other)['label'], other, RESET))
                 else:
                     self.start_here()
             elif k in '123456789' and int(k) <= len(BANDS):
