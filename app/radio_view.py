@@ -13,7 +13,8 @@ import systems
 import theme
 
 DIGITS = 10                 # up to 9.999 999 999 GHz
-MIN_HZ, MAX_HZ = 24e6, 2300e6
+MIN_HZ, MAX_HZ = 0.0, 3000e6            # what the digits go to
+SDR_LO, SDR_HI = 24e6, 2300e6           # what tuners like the R820T / E4000 reach (radio_rx.py keeps it in here)
 PRESETS = [                 # (label, MHz, mode, bandwidth kHz)
     ('FM broadcast radio', 100.0, 'wfm', 180),
     ('NOAA Weather Radio', 162.475, 'nfm', 12.5),
@@ -211,6 +212,11 @@ class RadioView(QtWidgets.QWidget):
         lay.addWidget(self.note)
         lay.addLayout(self.area, 1)
 
+        self.pending_hz = None          # Radio starts here once the band being received has stopped
+        self.switch_note = ''
+        self.want_hz = None             # Radio started for this frequency: set once the SDR is there
+        self.pending_mode = None        # a quick pick's (mode, bandwidth), set once Radio is on
+        self.range_note = None          # a frequency asked for beyond what the SDR reaches
         self.save_timer = QtCore.QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.timeout.connect(self._save)
@@ -224,6 +230,7 @@ class RadioView(QtWidgets.QWidget):
 
     def take_spectrum(self, panel):
         self.area.addWidget(panel, 1)
+        panel.view.pan_retune = self._pan           # (Tracker.show_section clears it in the other sections)
 
     # ---- the receiver
     def _on_radio(self):
@@ -233,8 +240,9 @@ class RadioView(QtWidgets.QWidget):
     def _rx_changed(self, on):
         r = self.tracker.receiver
         self.player.force_system = 'radio' if on and getattr(r, 'system', None) is systems.RADIO else None
-        if self.player.force_system:
-            self.set_frequency(self.freq.hz)
+        # Radio just started: hold on to this frequency until the spectrum shows the SDR really is there (frames
+        # from the band before can still arrive, and would otherwise move the channel back into that band)
+        self.want_hz = min(max(self.freq.hz, SDR_LO), SDR_HI) if self.player.force_system else None
         self._sync()
 
     def _start_stop(self):
@@ -244,6 +252,10 @@ class RadioView(QtWidgets.QWidget):
             return
         if r.busy:
             return
+        self._start_radio()
+
+    def _start_radio(self):
+        tr = self.tracker
         self._save()
         i = tr.rx_system.findData(systems.RADIO['key'])
         if tr.rx_system.currentIndex() != i:
@@ -255,6 +267,9 @@ class RadioView(QtWidgets.QWidget):
     def set_frequency(self, hz):
         """listen at hz: within the received slice the channel moves; on Radio the SDR follows when it leaves it"""
         hz = float(min(max(hz, MIN_HZ), MAX_HZ))
+        self.range_note = hz if not SDR_LO <= hz <= SDR_HI else None      # (asked for; the SDR stops at its end)
+        hz = min(max(hz, SDR_LO), SDR_HI)
+        self.want_hz = None
         self.freq.set_value(hz)
         r, v = self.tracker.receiver, self.panel.view
         if self.panel.sound.currentIndex() != 2:        # the sound on Tuned (the channel can be heard)
@@ -270,15 +285,42 @@ class RadioView(QtWidgets.QWidget):
                 v.listen_hz = hz
                 self.player.set_mode('tuned', hz)
             self.save_timer.start(1500)
-        elif r.state == 'running':                      # another band: only within its slice
+        elif r.state == 'running':                      # another band: within its slice, or over to Radio
             if center is not None and abs(hz - center) <= rate / 2:
                 v.listen_hz = hz
                 self.player.set_mode('tuned', hz)
+            else:
+                self._switch_to(hz)
+        elif r.busy:                                    # (finishing a capture: Radio starts once it is done)
+            self.pending_hz = hz
         else:
             self.player.listen_hz = hz
             self.save_timer.start(1500)
         v.dirty = True
         self._sync()
+
+    def _switch_to(self, hz):
+        """the frequency is outside the band being received: stop that band (its capture is kept as usual) and
+        start Radio there once the receiver is free"""
+        r = self.tracker.receiver
+        self.pending_hz = hz
+        self.switch_note = 'Stopping %s to go to %.4f MHz (its capture is kept)...' % (r.system['label'], hz / 1e6)
+        r.stop()
+
+    def _pan(self, shift):
+        """the spectrum was dragged along the band (Radio section, not zoomed): move everything by shift Hz"""
+        v = self.panel.view
+        hz = (v.listen_hz if v.listen_hz is not None else self.freq.hz) + shift
+        if self._on_radio() and v.n:
+            hz = float(min(max(hz, SDR_LO), SDR_HI))
+            self.freq.set_value(hz)
+            self.player.listen_hz = hz
+            v.listen_hz = hz
+            self.player.tune_center(min(max(v.center + shift, SDR_LO), SDR_HI))
+            self.save_timer.start(1500)
+            v.dirty = True
+        else:
+            self.set_frequency(hz)
 
     def _typed(self):
         try:
@@ -295,7 +337,10 @@ class RadioView(QtWidgets.QWidget):
             return
         mhz, mode, bw = data
         self.set_frequency(mhz * 1e6)
-        self.player.set_demod(demod=mode, bandwidth=bw * 1e3)
+        if self.pending_hz is not None or self.want_hz is not None:
+            self.pending_mode = (mode, bw * 1e3)    # switching to Radio: its mode once Radio is on (else the band
+        else:                                       # being stopped would remember it as its own)
+            self.player.set_demod(demod=mode, bandwidth=bw * 1e3)
 
     def _save(self):
         s = sdr_settings.load()
@@ -330,25 +375,55 @@ class RadioView(QtWidgets.QWidget):
     def _sync(self):
         """follow tuning done elsewhere (a click or the wheel on the spectrum), and say what is going on"""
         r, v = self.tracker.receiver, self.panel.view
-        if v.listen_hz is not None and (self._on_radio() or r.state == 'running') and not self.freq.underMouse():
+        if self.pending_hz is not None:             # switching over to Radio: start once the receiver is free
+            if not r.busy:
+                hz, self.pending_hz, self.switch_note = self.pending_hz, None, ''
+                self.freq.set_value(hz)
+                self._start_radio()
+            else:
+                self.freq.set_value(self.pending_hz)
+                self.start_btn.setText('Switching to Radio...')
+                self.start_btn.setEnabled(False)
+                self.note.setText(self.switch_note or 'Finishing the last capture, then Radio starts...')
+                return
+        if self.want_hz is not None and self._on_radio():
+            self.freq.set_value(self.want_hz)
+            if v.n and abs(v.center - (self.want_hz + systems.RADIO_OFFSET_HZ)) < v.rate * 0.4:   # the SDR is there
+                hz, self.want_hz = self.want_hz, None
+                self.player.listen_hz = hz
+                v.listen_hz = hz
+                self.player.set_mode('tuned', hz)
+                if self.panel.sound.currentIndex() != 2:
+                    self.panel.sound.setCurrentIndex(2)
+                v.dirty = True
+        elif v.listen_hz is not None and (self._on_radio() or r.state == 'running') and not self.freq.underMouse():
             self.freq.set_value(v.listen_hz)
+        if self.pending_mode and self.want_hz is None and self._on_radio() and self.player.system == 'radio':
+            mode, bw = self.pending_mode
+            self.pending_mode = None
+            self.player.set_demod(demod=mode, bandwidth=bw)
         if self._on_radio():
             self.start_btn.setText('■  Stop radio')
             s = systems.of_frequency(self.freq.hz)
+            mhz = max(self.freq.hz / 1e6, 1.0)
             hint = ('antenna: %s' % s['antenna']) if s is not systems.RADIO else \
-                'antenna: a quarter wave is about %.0f cm (%.1f in) at this frequency' % (
-                    7125 / (self.freq.hz / 1e6), 7125 / (self.freq.hz / 1e6) / 2.54)
-            self.note.setText('Listening. Turn the volume up on the spectrum bar. Scroll the big digits, click the '
-                              'spectrum, or drag the yellow band\'s edges to change the bandwidth.  ·  ' + hint)
+                'antenna: a quarter wave is about %.0f cm (%.1f in) at this frequency' % (7125 / mhz, 7125 / mhz / 2.54)
+            text = ('Listening. Turn the volume up on the spectrum bar. Scroll the big digits, click or drag the '
+                    'spectrum, or drag the yellow band\'s edges to change the bandwidth.  ·  ' + hint)
         elif r.state == 'running':
             self.start_btn.setText('Stop %s' % r.system['label'])
-            self.note.setText('The receiver is on %s: you can listen anywhere in its slice (click the spectrum). '
-                              'To tune anywhere, stop it and press Start radio.' % r.system['label'])
+            text = ('The receiver is on %s: click the spectrum to listen anywhere in its slice. Tune outside it '
+                    '(digits, typing, quick picks) and it switches to Radio.' % r.system['label'])
         elif r.busy:
             self.start_btn.setText('Receiver finishing...')
-            self.note.setText('')
+            text = ''
         else:
             self.start_btn.setText('▶  Start radio')
-            self.note.setText('Choose a frequency (scroll the digits, type it, or pick one), then Start radio. '
-                              'Close SDR++ and SatDump first - only one program can use the SDR.')
+            text = ('Choose a frequency (scroll the digits, type it, or pick one), then Start radio. '
+                    'Close SDR++ and SatDump first - only one program can use the SDR.')
+        if self.range_note is not None:
+            text = ('%.3f MHz is %s what this SDR can receive (about 24 MHz to 2.3 GHz; E4000 tuners from about '
+                    '52 MHz), so it is at %.0f MHz, the nearest it gets.' % (
+                        self.range_note / 1e6, 'below' if self.range_note < SDR_LO else 'above', self.freq.hz / 1e6))
+        self.note.setText(text)
         self.start_btn.setEnabled(not r.busy or r.state == 'running')

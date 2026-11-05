@@ -198,8 +198,30 @@ RADIO = {
     'listen_hz': 100.0e6,
     'channel_hz': 180e3,
     'demod': 'wfm',
-    'bands': [],
+    'bands': [],                     # (its band plan is RADIO_PLAN, drawn on its own row)
 }
+# what is where across the radio spectrum (North America; MHz): shown on the spectrum's second label row, the narrow
+# ones that sit inside a wider one on a third. Below ~24 MHz (~52 MHz for E4000 tuners) the SDR can't receive.
+PLAN_COL = (150, 160, 180, 18)
+RADIO_PLAN = [  # (lo, hi, name, row)
+    (0.53, 1.7, 'AM broadcast', 1), (26.965, 27.405, 'CB radio', 1), (28.0, 29.7, '10 m ham', 1),
+    (50.0, 54.0, '6 m ham', 1), (54.0, 88.0, 'TV (VHF low)', 1), (88.0, 108.0, 'FM broadcast radio', 1),
+    (108.0, 118.0, 'aircraft navigation (VOR / ILS)', 1), (118.0, 137.0, 'aircraft voice (AM)', 1),
+    (121.45, 121.55, 'air emergency 121.5', 2), (137.0, 138.0, 'weather & satellite downlinks', 1),
+    (144.0, 148.0, '2 m ham', 1), (146.5, 146.54, 'calling 146.52', 2), (150.8, 156.0, 'business / public safety', 1),
+    (156.0, 162.025, 'marine VHF', 1), (156.775, 156.825, 'marine ch 16', 2),
+    (162.4, 162.55, 'NOAA Weather Radio', 2), (174.0, 216.0, 'TV (VHF high)', 1),
+    (225.0, 400.0, 'military aircraft (AM)', 1), (400.0, 406.0, 'weather balloons (radiosondes)', 1),
+    (406.0, 406.1, 'emergency beacons', 2), (420.0, 450.0, '70 cm ham', 1), (433.05, 434.79, '433 MHz remotes / sensors', 2),
+    (450.0, 470.0, 'business / public safety (UHF)', 1), (462.55, 467.725, 'FRS / GMRS walkie-talkies', 2),
+    (470.0, 608.0, 'TV (UHF)', 1), (698.0, 806.0, 'cell phones (700 MHz)', 1), (806.0, 824.0, 'public safety 800', 1),
+    (824.0, 894.0, 'cell phones (850 MHz)', 1), (902.0, 928.0, '915 MHz sensors / LoRa', 1),
+    (960.0, 1215.0, 'aircraft (DME, transponders)', 1), (1089.0, 1091.0, 'ADS-B 1090', 2),
+    (1164.0, 1215.0, 'GNSS L5', 2), (1215.0, 1300.0, 'GNSS L2 / 23 cm ham', 1), (1525.0, 1559.0, 'Inmarsat', 1),
+    (1559.0, 1610.0, 'GNSS L1 (GPS, Galileo, GLONASS)', 1), (1610.0, 1626.5, 'Iridium / Globalstar', 1),
+    (1670.0, 1710.0, 'weather satellites (HRPT, GOES)', 1), (1850.0, 1990.0, 'cell phones (PCS)', 1),
+    (2400.0, 2483.5, 'Wi-Fi / Bluetooth', 1),
+]
 ORDER = [IRIDIUM, ORBCOMM, HAM2M, HAM70, GNSS_BAND, GLONASS_BAND, METEOR, RADIO]   # what the receiver can listen to (one at a time)
 DISPLAY = [IRIDIUM, ORBCOMM, HAM, GNSS]               # what the map, list and Systems filter group satellites by
 SYSTEMS = {s['key']: s for s in ORDER + DISPLAY}

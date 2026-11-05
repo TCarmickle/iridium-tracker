@@ -18,7 +18,9 @@ DECAY_DB = 3.0      # the peak line falls this much per frame after a burst (fas
 TUNE_STEP_HZ = 1000  # the mouse wheel over the trace moves the tuned frequency in these steps
 
 # where things are in each system's band (MHz)
-BANDS = [(lo, hi, name, QtGui.QColor(*rgba)) for s in systems.ORDER for lo, hi, name, rgba in s['bands']]
+BANDS = [(lo, hi, name, QtGui.QColor(*rgba), 0) for s in systems.ORDER for lo, hi, name, rgba in s['bands']]
+# ...and the general radio band plan, on label rows of its own under the satellite systems' ones
+BANDS += [(lo, hi, name, QtGui.QColor(*systems.PLAN_COL), row) for lo, hi, name, row in systems.RADIO_PLAN]
 
 
 def colormap():
@@ -63,6 +65,8 @@ class SpectrumView(QtWidgets.QWidget):
         self.mouse = None
         self.listen_hz = None       # tuned sound: the channel being listened to (Hz), drawn as a marker
         self.passband = None        # ...and what is heard around it: (low, high) Hz from listen_hz
+        self.pan_retune = None      # Radio: dragging the (unzoomed) spectrum moves the SDR - called with the shift (Hz)
+        self.pan_df = 0.0           # ...the shift of the drag in progress
         self.dirty = False
         t = QtCore.QTimer(self)
         t.timeout.connect(self._repaint)
@@ -244,6 +248,9 @@ class SpectrumView(QtWidgets.QWidget):
             x0, (f0, f1) = self.drag
             df = (e.pos().x() - x0) / max(1, self.width()) * (f1 - f0)
             self._set_view(f0 - df, f1 - df)
+        elif self.drag and e.buttons() & Qt.LeftButton and self.pan_retune is not None and self.n:
+            x0, (f0, f1) = self.drag            # Radio, not zoomed: dragging slides along the band
+            self.pan_df = (e.pos().x() - x0) / max(1, self.width()) * (f1 - f0)
         self.dirty = True
 
     def mouseReleaseEvent(self, e):
@@ -253,6 +260,13 @@ class SpectrumView(QtWidgets.QWidget):
             lo, hi = self.passband
             self.bandwidthPicked.emit(hi - lo)
             return
+        if self.pan_df and abs(e.pos().x() - getattr(self, 'press_x', -99)) >= 4:
+            shift, self.pan_df = -self.pan_df, 0.0      # dragged right = towards lower frequencies, like a map
+            self.dirty = True
+            if self.pan_retune is not None:
+                self.pan_retune(shift)
+            return
+        self.pan_df = 0.0
         if self.n and self.listen_hz is not None and abs(e.pos().x() - getattr(self, 'press_x', -99)) < 4:
             self.listen_hz = self.f_of(e.pos().x(), self.width())      # a click (not a drag): listen here
             self.listenPicked.emit(self.listen_hz)
@@ -286,16 +300,22 @@ class SpectrumView(QtWidgets.QWidget):
         f0, f1 = self._span()
 
         # band sections and grid behind the trace
-        for lo, hi, name, col in BANDS:
+        for lo, hi, name, col, row in BANDS:
             x0, x1 = self.x_of(lo * 1e6, w), self.x_of(hi * 1e6, w)
             if x1 < 0 or x0 > w:
                 continue
-            p.fillRect(QtCore.QRectF(max(0, x0), 0, min(w, x1) - max(0, x0), top_h), col)
+            if row:                 # the band plan: a thin bar under its label, not a tint over the whole trace
+                y = 2 + 14 * row
+                p.fillRect(QtCore.QRectF(max(0, x0), y + 13, max(1.0, min(w, x1) - max(0, x0)), 2),
+                           QtGui.QColor(150, 160, 180, 110))
+            else:
+                y = 2
+                p.fillRect(QtCore.QRectF(max(0, x0), 0, min(w, x1) - max(0, x0), top_h), col)
             p.setPen(QtGui.QColor(MUTED))
             lx = max(x0, 48) + 4
             room = min(w, x1) - lx - 4
             if room > 40:       # shorten the name to fit its section, or leave it out
-                p.drawText(QtCore.QRectF(lx, 2, room, 14), Qt.AlignLeft | Qt.AlignVCenter,
+                p.drawText(QtCore.QRectF(lx, y, room, 14), Qt.AlignLeft | Qt.AlignVCenter,
                            p.fontMetrics().elidedText(name, Qt.ElideRight, int(room)))
         p.setPen(QtGui.QPen(QtGui.QColor(GRID), 1))
         lo_db, hi_db = self.db_lo, self.db_hi
@@ -346,6 +366,12 @@ class SpectrumView(QtWidgets.QWidget):
             p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 60), 1.5))
             p.drawLine(QPointF(lx, 0), QPointF(lx, h))
             p.drawText(QPointF(min(lx + 6, w - 150), top_h - 6), '\U0001F50A %.4f MHz' % (self.listen_hz / 1e6))
+        if self.pan_df:                       # Radio: a drag along the band in progress
+            to = (self.listen_hz if self.listen_hz is not None else self.center) - self.pan_df
+            p.fillRect(QtCore.QRectF(w / 2 - 170, top_h / 2 - 16, 340, 32), QtGui.QColor(20, 24, 30, 220))
+            p.setPen(QtGui.QColor(255, 210, 60))
+            p.drawText(QtCore.QRectF(w / 2 - 170, top_h / 2 - 16, 340, 32), Qt.AlignCenter,
+                       '%s  release to move to %.4f MHz' % ('◀' if self.pan_df > 0 else '▶', to / 1e6))
 
         # waterfall
         rows = min(ROWS, h - wf_top)
@@ -378,7 +404,7 @@ class SpectrumView(QtWidgets.QWidget):
                 p.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 90), 1, Qt.DotLine))
                 p.drawLine(QPointF(mx, 0), QPointF(mx, h))
                 p.setPen(QtGui.QColor(TEXT))
-                p.drawText(QPointF(min(mx + 8, w - 220), 30), what)
+                p.drawText(QPointF(min(mx + 8, w - 220), 62), what)     # (under the band-label rows)
         if not self.live:
             p.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 120))
             p.setPen(QtGui.QColor(TEXT))

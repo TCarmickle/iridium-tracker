@@ -2290,6 +2290,7 @@ class Tracker(QtWidgets.QMainWindow):
         """0: the tracker, 1: Images, 2: Radio (the map's own buttons are hidden in the others; the spectrum comes along)"""
         # the spectrum / waterfall / sound panel goes with the section shown (one panel, one set of settings)
         visible = self.spec_btn.isChecked()
+        self.spectrum.view.pan_retune = None        # (dragging along the band: the Radio section only)
         if k == 1:
             self.images_view.take_spectrum(self.spectrum)
         elif k == 2:

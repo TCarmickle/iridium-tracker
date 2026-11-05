@@ -245,6 +245,14 @@ reaches (about 24 MHz to 2.3 GHz): FM radio, NOAA Weather Radio, aircraft, ham, 
 - The big digits are the frequency: scroll over any digit to step it (each digit is its own
   place - 1 MHz, 100 kHz, 10 kHz ... 1 Hz), or click its top half (up) / bottom half (down).
   Or type it in MHz and press Enter, or pick one from "Quick picks".
+- If another band is being received (Iridium, GPS...) and you tune outside its slice - digits,
+  typing or a quick pick - it stops that band (its capture is kept as usual) and starts Radio
+  at the new frequency.
+- Drag the spectrum sideways to slide along the band (drag left = up in frequency); the SDR
+  moves when you let go. The labels under the spectrum show what is where (FM radio, aircraft,
+  marine, NOAA Weather Radio, ham bands, TV, cell phones, ADS-B, GPS...).
+- The digits go from 0 Hz up, but the SDR receives about 24 MHz - 2.3 GHz (E4000 tuners from
+  about 52 MHz); outside that it stays at the nearest end and says so.
 - Press "Start radio" (this uses the receiver on the Radio band). Turn the volume up on the
   spectrum bar. When the frequency leaves the slice the SDR is receiving (2 MHz wide), the
   SDR moves with it.
