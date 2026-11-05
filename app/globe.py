@@ -43,6 +43,87 @@ SKY = {'dark': ((7, 9, 10), (25, 45, 80)),            # standing-here sky: overh
 SETTLE_MS = 180                 # after the last zoom/drag step, re-render at full resolution
 
 
+# ---- the sky around the Earth: stars, the Sun, the Moon (positions for the scene's time)
+STAR_SEED, N_STARS, N_MILKY = 7, 3000, 6000
+SUN_R_PX, MOON_R_PX = 10.0, 11.0        # drawn sizes (both about 0.5 deg really: a little bigger, to be seen)
+FAR = 2000.0                            # the Sun and the stars: this many Earth radii away (as good as infinity)
+
+
+def _days_j2000(t):
+    return 2440587.5 + t / 86400.0 - 2451545.0
+
+
+def _eci_to_ecef(v, t):
+    """inertial (equator / equinox) directions -> Earth-fixed, by the sidereal angle at unix time t"""
+    g = math.radians((280.46061837 + 360.98564736629 * _days_j2000(t)) % 360)
+    c, s = math.cos(g), math.sin(g)
+    v = np.atleast_2d(v)
+    return np.stack([c * v[:, 0] + s * v[:, 1], -s * v[:, 0] + c * v[:, 1], v[:, 2]], -1)
+
+
+def moon_position(t):
+    """(Earth-fixed position in Earth radii, illuminated fraction 0..1) of the Moon at unix time t - the low-
+    precision series of the Astronomical Almanac (good to a few tenths of a degree)"""
+    d = _days_j2000(t)
+    L = math.radians(218.316 + 13.176396 * d)
+    M = math.radians(134.963 + 13.064993 * d)
+    F = math.radians(93.272 + 13.229350 * d)
+    lon = L + math.radians(6.289) * math.sin(M)
+    lat = math.radians(5.128) * math.sin(F)
+    dist = (385001.0 - 20905.0 * math.cos(M)) / R_EARTH
+    eps = math.radians(23.439 - 0.0000004 * d)
+    x, y, z = math.cos(lat) * math.cos(lon), math.cos(lat) * math.sin(lon), math.sin(lat)
+    eci = np.array([x, y * math.cos(eps) - z * math.sin(eps), y * math.sin(eps) + z * math.cos(eps)])
+    return _eci_to_ecef(eci, t)[0] * dist
+
+
+def sun_direction(scene):
+    lat, lon = (scene or {}).get('sun', (0.0, 0.0))
+    return to_xyz(lat, lon, 0.0)
+
+
+_STARS = None
+
+
+def stars():
+    """(inertial unit vectors, brightness 0..1, tint 0..1) of a fixed star field: random bright stars all over,
+    and many faint ones crowded towards the Milky Way's plane (the galactic equator)"""
+    global _STARS
+    if _STARS is None:
+        rng = np.random.default_rng(STAR_SEED)
+        v = rng.normal(size=(N_STARS, 3))
+        v /= np.linalg.norm(v, axis=1)[:, None]
+        bright = rng.power(0.35, N_STARS)               # few bright, many faint
+        # the Milky Way: around the galactic plane (its north pole at RA 192.86, Dec 27.13 deg)
+        ra, dec = math.radians(192.86), math.radians(27.13)
+        pole = np.array([math.cos(dec) * math.cos(ra), math.cos(dec) * math.sin(ra), math.sin(dec)])
+        a = np.cross(pole, [0.0, 0.0, 1.0])
+        a /= np.linalg.norm(a)
+        b = np.cross(pole, a)
+        ang = rng.uniform(0, 2 * math.pi, N_MILKY)
+        off = rng.normal(0, 0.11, N_MILKY) * (1 + 0.8 * np.cos(ang - 4.6) ** 2)    # wider towards its centre
+        mv = np.cos(ang)[:, None] * a + np.sin(ang)[:, None] * b + off[:, None] * pole
+        mv /= np.linalg.norm(mv, axis=1)[:, None]
+        v = np.vstack([v, mv])
+        bright = np.concatenate([bright, rng.uniform(0.05, 0.32, N_MILKY)])
+        tint = rng.uniform(0, 1, len(v))
+        _STARS = (v, bright, tint)
+    return _STARS
+
+
+def polygon(x, y):
+    """a QPolygonF straight from NumPy x / y arrays (much quicker than making a QPointF per point)"""
+    n = len(x)
+    poly = QtGui.QPolygonF(n)
+    if n:
+        buf = poly.data()
+        buf.setsize(n * 16)
+        arr = np.frombuffer(buf, np.float64).reshape(n, 2)
+        arr[:, 0] = x
+        arr[:, 1] = y
+    return poly
+
+
 def to_xyz(lat, lon, alt_km=0.0):
     """Earth-fixed position in Earth radii"""
     la, lo = np.radians(lat), np.radians(lon)
@@ -400,7 +481,21 @@ class GlobeView(QtWidgets.QWidget):
         """a 3D polyline: solid where it's in front of the Earth, faint where behind"""
         if len(xyz) < 2:
             return
-        sx, sy, front, inview = self.project(np.asarray(xyz))
+        self._line_projected(p, *self.project(np.asarray(xyz)), colour, width, faint_alpha)
+
+    def _lines(self, p, items, faint_alpha=35):
+        """many 3D polylines [(xyz, colour, width)], projected all at once (tracks: dozens of them every frame)"""
+        items = [it for it in items if len(it[0]) >= 2]
+        if not items:
+            return
+        sx, sy, front, inview = self.project(np.concatenate([it[0] for it in items]))
+        i = 0
+        for xyz, colour, width in items:
+            j = i + len(xyz)
+            self._line_projected(p, sx[i:j], sy[i:j], front[i:j], inview[i:j], colour, width, faint_alpha)
+            i = j
+
+    def _line_projected(self, p, sx, sy, front, inview, colour, width, faint_alpha=35):
         for vis, alpha, wd in ((False, faint_alpha, 1.0), (True, colour.alpha(), width)):
             if alpha <= 0:
                 continue
@@ -414,7 +509,7 @@ class GlobeView(QtWidgets.QWidget):
                 continue
             d = np.diff(np.concatenate([[0], seg.astype(np.int8), [0]]))
             for a, b in zip(np.flatnonzero(d == 1), np.flatnonzero(d == -1)):
-                p.drawPolyline(QtGui.QPolygonF([QPointF(x, y) for x, y in zip(sx[a:b + 1].tolist(), sy[a:b + 1].tolist())]))
+                p.drawPolyline(polygon(sx[a:b + 1], sy[a:b + 1]))
 
     def _sprite(self, p, x, y, colour, scale, system):
         """a satellite icon, drawn once per look (colour, size, system) and then just stamped - dozens of
@@ -446,6 +541,107 @@ class GlobeView(QtWidgets.QWidget):
         dirs = (N * np.cos(az) + E * np.sin(az)) * np.cos(el) + U * np.sin(el)
         return U * EYE_R + 0.5 * dirs
 
+    def _track_lines(self, sc, it):
+        """the tracks as 3D lines [(xyz, colour, width)] - worked out once per scene (the tracker sends a new
+        one every second or so; the globe redraws far more often than that while it is moved)"""
+        if getattr(self, '_tracks_for', None) is not sc:
+            out = []
+            for tr in sc.get('tracks', []):
+                for pts, col in ((tr.get('space_past', tr['past']), it.C_PAST),
+                                 (tr.get('space_future', tr['future']), it.C_FUTURE)):
+                    for seg in _segments(pts):
+                        out.append((to_xyz(seg[:, 0], seg[:, 1], tr.get('alt_km', 781.0)), QtGui.QColor(col),
+                                    2.5 if tr['selected'] else 1.8))
+            self._tracks_for, self._tracks = sc, out
+        return self._tracks
+
+    # ---- stars, the Sun and the Moon
+    def _sky_dirs_to_screen(self, dirs):
+        """(x, y, in front of the camera) for directions to things far away (stars): only the camera's turn
+        matters, not where it is"""
+        pos, right, up, fwd, f = self._camera()
+        z = dirs @ fwd
+        ok = z > 1e-3
+        zs = np.where(ok, z, 1.0)
+        return self.width() / 2 + f * (dirs @ right) / zs, self._centre_y() - f * (dirs @ up) / zs, ok
+
+    def _draw_stars(self, p, t, alpha=1.0):
+        """the star field (turning with the sky); in the standing view only above the horizon"""
+        v, bright, tint = stars()
+        dirs = _eci_to_ecef(v, t)
+        x, y, ok = self._sky_dirs_to_screen(dirs)
+        w, h = self.width(), self.height()
+        ok &= (x >= 0) & (x < w) & (y >= 0) & (y < h)
+        if self.ground:
+            pos = self._camera()[0]
+            ok &= dirs @ (pos / np.linalg.norm(pos)) > 0.02        # above the horizon
+        for lo, hi, size in ((0.0, 0.25, 1.0), (0.25, 0.6, 1.4), (0.6, 0.85, 1.9), (0.85, 1.01, 2.6)):
+            sel = ok & (bright >= lo) & (bright < hi)
+            if not sel.any():
+                continue
+            for warm in (False, True):          # a few warm (yellowish) stars among the blue-white ones
+                s2 = sel & ((tint > 0.8) if warm else (tint <= 0.8))
+                if not s2.any():
+                    continue
+                a = int(min(255, (115 + 170 * (lo + hi) / 2) * alpha))
+                col = QtGui.QColor(255, 226, 190, a) if warm else QtGui.QColor(215, 228, 255, a)
+                p.setPen(QtGui.QPen(col, size, Qt.SolidLine, Qt.RoundCap))
+                p.drawPoints(polygon(x[s2], y[s2]))
+
+    def _draw_sun_moon(self, p, sc, t):
+        """the Sun (with its glare) and the Moon (lit on the side facing the Sun), where they really are - hidden
+        when the Earth is in the way"""
+        sun = np.asarray(sun_direction(sc), float).reshape(3)
+        moon = moon_position(t)
+        sx, sy, svis, sview = self.project(np.array([sun * FAR, moon]))
+        if svis[0]:
+            x, y = sx[0], sy[0]
+            glow = QtGui.QRadialGradient(QPointF(x, y), SUN_R_PX * 12)
+            glow.setColorAt(0.0, QtGui.QColor(255, 244, 214, 190))
+            glow.setColorAt(0.12, QtGui.QColor(255, 226, 160, 95))
+            glow.setColorAt(0.45, QtGui.QColor(255, 200, 120, 18))
+            glow.setColorAt(1.0, QtGui.QColor(255, 200, 120, 0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QtGui.QBrush(glow))
+            p.drawEllipse(QPointF(x, y), SUN_R_PX * 12, SUN_R_PX * 12)
+            p.setBrush(QtGui.QColor(255, 250, 235))
+            p.drawEllipse(QPointF(x, y), SUN_R_PX, SUN_R_PX)
+            self.hits.append((x, y, None, '<b>The Sun</b><br>overhead at %.1f&deg;, %.1f&deg;' % tuple(sc.get('sun', (0, 0)))))
+        if svis[1]:
+            x, y = sx[1], sy[1]
+            r = MOON_R_PX
+            # which way the Sun is from the Moon, on screen, and how much of the Moon it lights
+            to_sun = sun * FAR - moon
+            mx, my, _, _ = self.project(np.array([moon + to_sun / np.linalg.norm(to_sun) * 0.5]))
+            ang = math.degrees(math.atan2(my[0] - y, mx[0] - x))
+            lit = (1 - float(moon / np.linalg.norm(moon) @ sun)) / 2          # 0 new (towards the Sun) .. 1 full
+            halo = QtGui.QRadialGradient(QPointF(x, y), r * 3.2)       # a soft halo, brighter the fuller it is
+            halo.setColorAt(0.3, QtGui.QColor(220, 225, 235, int(30 + 60 * lit)))
+            halo.setColorAt(1.0, QtGui.QColor(220, 225, 235, 0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QtGui.QBrush(halo))
+            p.drawEllipse(QPointF(x, y), r * 3.2, r * 3.2)
+            p.save()
+            p.translate(x, y)
+            p.rotate(ang)
+            p.setPen(Qt.NoPen)
+            p.setBrush(QtGui.QColor(60, 64, 72))            # the dark side (a little earthshine)
+            p.drawEllipse(QPointF(0, 0), r, r)
+            disc = QtGui.QPainterPath()
+            disc.addEllipse(QPointF(0, 0), r, r)
+            half = QtGui.QPainterPath()
+            half.addRect(QtCore.QRectF(0, -r, r, 2 * r))
+            half = disc.intersected(half)                   # the half towards the Sun
+            ell = QtGui.QPainterPath()
+            ex = r * abs(1 - 2 * lit)                       # the terminator's ellipse
+            ell.addEllipse(QPointF(0, 0), ex, r)
+            shape = half.united(ell) if lit > 0.5 else half.subtracted(ell)
+            p.setBrush(QtGui.QColor(232, 232, 222))
+            p.drawPath(shape)
+            p.restore()
+            dist_km = np.linalg.norm(moon) * R_EARTH
+            self.hits.append((x, y, None, '<b>The Moon</b><br>%.0f%% lit<br>%.0f km away' % (lit * 100, dist_km)))
+
     def _draw_compass(self, p):
         """standing view: lines 30 and 60 degrees up, and the compass points along the horizon"""
         az = np.arange(0, 361, 3.0)
@@ -475,13 +671,23 @@ class GlobeView(QtWidgets.QWidget):
         w, h = self.width(), self.height()
         p.fillRect(self.rect(), QtGui.QColor('#07090d'))
         moving = bool(self.drag and self.drag[6]) or time.time() < self.fast_until
+        sc = self.scene
+        t = (sc or {}).get('t') or time.time()
+        if not self.ground:
+            self._draw_stars(p, t)              # behind everything (the Earth covers them)
         img = self._render_earth(fast=moving)
         p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform)
         p.drawImage(QtCore.QRectF(0, 0, w, h), img)
         self.hits = []
+        if self.ground and sc:                  # standing here: the stars come out when the Sun is well down
+            pos = self._camera()[0]
+            sun_el = float(sun_direction(sc) @ (pos / np.linalg.norm(pos)))
+            if sun_el < -0.05:
+                self._draw_stars(p, t, alpha=min(1.0, (-0.05 - sun_el) / 0.15))
+        if sc:
+            self._draw_sun_moon(p, sc, t)
         if self.ground:
             self._draw_compass(p)
-        sc = self.scene
         if sc:
             import iridium_tracker as it      # colours shared with the map
             for pl in sc.get('planes', []):
@@ -494,12 +700,7 @@ class GlobeView(QtWidgets.QWidget):
                 ring = np.array(it.circle_points(fp['lat'], fp['lon'], fp['radius']))
                 self._line(p, to_xyz(ring[:, 0], ring[:, 1], 0.0),
                            QtGui.QColor(230, 60, 70) if fp['selected'] else QtGui.QColor(220, 130, 20), 1.5)
-            for tr in sc.get('tracks', []):
-                for pts, col in ((tr.get('space_past', tr['past']), it.C_PAST),
-                                 (tr.get('space_future', tr['future']), it.C_FUTURE)):
-                    for seg in _segments(pts):
-                        self._line(p, to_xyz(seg[:, 0], seg[:, 1], tr.get('alt_km', 781.0)), QtGui.QColor(col),
-                                   2.5 if tr['selected'] else 1.8)
+            self._lines(p, self._track_lines(sc, it))       # (all the tracks in one go)
             # measured positions (the satellite's own report), at their real height - all projected at once
             fixes = sc.get('fixes', [])
             if fixes:

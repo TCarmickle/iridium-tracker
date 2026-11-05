@@ -3104,7 +3104,7 @@ class Tracker(QtWidgets.QMainWindow):
             planes.append(dict(pl, ring=list(zip(lat.tolist(), lon.tolist())), selected=sel))
 
         self.map.scene = {'sats': sats, 'planes': planes, 'tracks': tracks, 'footprints': footprints, 'fixes': fixes, 'fix_lines': fix_lines,
-                          'sun': sun_position(t), 'night': self.night_chk.isChecked()}
+                          'sun': sun_position(t), 'night': self.night_chk.isChecked(), 't': t}
         self.map.update()
         if self.globe is not None and self.globe.isVisible():
             self.globe.view.set_scene(self.map.scene)
