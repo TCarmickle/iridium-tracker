@@ -176,7 +176,31 @@ ORBCOMM['system'] = 'orbcomm'
 ORBCOMM.update(rate=1228800, center_hz=137500000)     # the decoder needs a multiple of 9600 S/s
 
 METEOR['signal'] = (2.0, 12.0, 'dB')       # the pass's signal over the noise beside it (meteor_rx.py)
-ORDER = [IRIDIUM, ORBCOMM, HAM2M, HAM70, GNSS_BAND, GLONASS_BAND, METEOR]   # what the receiver can listen to (one at a time)
+# Radio: no satellites, no decoding - just listening anywhere the SDR can tune (the Radio section, like SDR++).
+# The SDR sits RADIO_OFFSET_HZ above the frequency listened to, so its centre spike stays off it; it moves when
+# the frequency leaves the slice. It is last in ORDER: frequencies outside every other band belong to it.
+RADIO_OFFSET_HZ = 250e3
+RADIO = {
+    'key': 'radio',
+    'system': 'radio',
+    'label': 'Radio',
+    'prefix': None,
+    'short': '',
+    'colour': (255, 210, 60),
+    'carrier_hz': None,
+    'inc_hint': None,
+    'tle_group': None,
+    'band_hz': (24e6, 2300e6),       # what tuners like the E4000 / R820T reach
+    'rate': 2048000,
+    'capture_prefix': 'radio-',
+    'keep_kinds': (),
+    'antenna': 'the one made for the frequency you tune to (a quarter wave: 7125 / MHz centimetres)',
+    'listen_hz': 100.0e6,
+    'channel_hz': 180e3,
+    'demod': 'wfm',
+    'bands': [],
+}
+ORDER = [IRIDIUM, ORBCOMM, HAM2M, HAM70, GNSS_BAND, GLONASS_BAND, METEOR, RADIO]   # what the receiver can listen to (one at a time)
 DISPLAY = [IRIDIUM, ORBCOMM, HAM, GNSS]               # what the map, list and Systems filter group satellites by
 SYSTEMS = {s['key']: s for s in ORDER + DISPLAY}
 DEFAULT = 'iridium'
@@ -212,12 +236,22 @@ def of_capture(cap_name):
 
 
 def of_frequency(hz):
-    """the system whose band a frequency is in (or next to)"""
+    """the system whose band a frequency is in (or next to); anywhere else: Radio"""
     for s in ORDER:
+        if s is RADIO:
+            continue
         lo, hi = s['band_hz']
         if lo - 5e6 <= hz <= hi + 5e6:
             return s
-    return IRIDIUM
+    return RADIO
+
+
+def band_tag(s):
+    """'1.6 GHz', '137 MHz' - or 'any frequency' for Radio (for band lists)"""
+    if s is RADIO:
+        return 'any frequency'
+    lo = s['band_hz'][0]
+    return '%.1f GHz' % (lo / 1e9) if lo > 1e9 else '%.0f MHz' % (lo / 1e6)
 
 
 def short_name(name):

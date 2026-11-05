@@ -43,6 +43,9 @@ everything received is shown together, with a **Systems** filter.
   by each satellite in the list when that satellite is heard
 - **Choose your SDR** like SDR++'s source menu: any gr-osmosdr device (RTL-SDR, RTL-TCP, HackRF,
   Airspy, bladeRF, SoapySDR...), sample rate, frequency, gain, PPM, bias-T, IQ/DC correction
+- **Radio**: listen anywhere from ~24 MHz to 2.3 GHz like SDR++ - full-size spectrum and waterfall, big
+  frequency digits you scroll or click, NFM / WFM / AM / USB / LSB / CW, and a bandwidth you set with a slider or
+  by dragging the edges of the channel on the spectrum; the SDR follows the frequency
 - **Images**: weather pictures from the Meteor-M satellites (137.9 MHz LRPT) - receive a pass with the
   tracker's own receiver, and [SatDump](https://www.satdump.org) (GPL-3.0, installed separately) turns it into
   pictures you can zoom, pan and save; SatDump output folders can be imported too

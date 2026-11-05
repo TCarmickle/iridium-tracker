@@ -238,6 +238,25 @@ and messaging channels are shaded green, the phone channels blue.
   noise by the amount you set. Your choices are remembered.
 
 
+RADIO (the Radio section - listen anywhere, like SDR++)
+--------------------------------------------------------
+Click "Radio" at the top for a big spectrum and waterfall and a tuner for any frequency the SDR
+reaches (about 24 MHz to 2.3 GHz): FM radio, NOAA Weather Radio, aircraft, ham, marine...
+- The big digits are the frequency: scroll over any digit to step it (each digit is its own
+  place - 1 MHz, 100 kHz, 10 kHz ... 1 Hz), or click its top half (up) / bottom half (down).
+  Or type it in MHz and press Enter, or pick one from "Quick picks".
+- Press "Start radio" (this uses the receiver on the Radio band). Turn the volume up on the
+  spectrum bar. When the frequency leaves the slice the SDR is receiving (2 MHz wide), the
+  SDR moves with it.
+- Mode: NFM (voice, weather radio), WFM (FM broadcast), AM (aircraft), USB / LSB (ham sideband),
+  CW (Morse). Bandwidth: the slider or the box - or drag the edges of the yellow band on the
+  spectrum, in any section: grab an edge (the pointer turns into arrows) and drag it out or in.
+- Click the spectrum to listen there; the scroll wheel over the spectrum line steps 1 kHz
+  (10 kHz with Shift); over the waterfall it zooms.
+- While another band is being received (Iridium, GPS...), the Radio section can listen anywhere
+  in that band's slice; to go anywhere else, stop it and press Start radio.
+
+
 WEATHER PICTURES (the Images section)
 -------------------------------------
 Click "Images" at the top to switch from the tracker to the pictures received from the

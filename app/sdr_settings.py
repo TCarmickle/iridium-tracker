@@ -39,6 +39,9 @@ DEFAULTS = {
     'glo1_auto_gain': False,
     'meteor_gain': 40.0,        # Meteor-M pictures (a whip: its signal is weak, low in the noise)
     'meteor_auto_gain': False,
+    'radio_gain': 30.0,         # Radio (any frequency): strong broadcast stations overload higher gains
+    'radio_auto_gain': False,
+    'radio_freq_mhz': 100.0,    # the frequency the Radio section listens to (remembered)
 }
 # the decoder needs sample_rate / decimation to be a multiple of 250 kHz
 RATES = [2000000, 2250000, 2500000, 3000000, 4000000, 5000000, 6000000, 8000000, 10000000, 12500000, 20000000]
@@ -99,7 +102,10 @@ def gain(s):
 def center_hz(s):
     """the tuning frequency. Iridium: as set, or automatic - the widest slice of the band the rate
     allows, keeping the top (the ring-alert and messaging channels at 1626.0-1626.5 MHz) inside.
-    Other bands: fixed (Orbcomm 137.5 MHz, the middle of its channels; the ham bands, see systems.py)."""
+    Other bands: fixed (Orbcomm 137.5 MHz, the middle of its channels; the ham bands, see systems.py).
+    Radio: just above the frequency listened to (systems.RADIO_OFFSET_HZ: the centre spike stays off it)."""
+    if s.get('system') == 'radio':
+        return int(round(s['radio_freq_mhz'] * 1e6 + systems.RADIO_OFFSET_HZ))
     if fixed_tuning(s):
         return systems.get(s['system'])['center_hz']
     if s['center_mhz'] > 0:

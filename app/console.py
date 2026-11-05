@@ -53,7 +53,7 @@ GREEN, GREY, CYAN, YELLOW, RED, MAGENTA, BOLD, RESET = ('\x1b[92m', '\x1b[90m', 
                                                         '\x1b[95m', '\x1b[1m', '\x1b[0m')
 GNSS_EVERY_S = 15   # a tracked GNSS satellite's line: once in this many seconds (its numbers come every second)
 GNSS_LOST_S = 10    # ...and it counts as lost after this long without one
-BANDS = systems.ORDER       # what keys 1-7 choose
+BANDS = [b for b in systems.ORDER if b is not systems.RADIO]   # what keys 1-7 choose (Radio needs the tracker's sound)
 
 
 def enable_colours():

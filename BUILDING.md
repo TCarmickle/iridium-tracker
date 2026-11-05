@@ -39,6 +39,8 @@ conda environment that has the packages in `environment.yml`: `python app\start.
 |---|---|
 | `app\start.py` | entry point |
 | `app\iridium_tracker.py` | the window: map, timeline, satellite list |
+| `app\radio_rx.py` | Radio receiver: spectrum and sound only, retuned while running (TUNE on the sound socket) |
+| `app\radio_view.py` | The Radio section: frequency digits, mode, bandwidth, the full-size spectrum |
 | `app\meteor_rx.py` | Meteor-M receiver: records the 137.9 MHz pass (256 kS/s 16-bit IQ) and reports its signal |
 | `app\images.py` | Satellite pictures: runs SatDump's `meteor_m2-x_lrpt` pipeline on a recorded pass, imports SatDump folders |
 | `app\images_view.py` | The Images section: passes, pictures, zoomable viewer, save |

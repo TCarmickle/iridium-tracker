@@ -36,6 +36,8 @@ def colormap():
 class SpectrumView(QtWidgets.QWidget):
     framesChanged = QtCore.pyqtSignal()
     listenPicked = QtCore.pyqtSignal(float)     # a click chose the frequency to listen to (Hz)
+    bandwidthPicked = QtCore.pyqtSignal(float)  # an edge of the tuned channel was dragged: its new width (Hz)
+    EDGE_PX = 6                                 # this close to an edge of the yellow band grabs it
 
     def __init__(self):
         super().__init__()
@@ -200,12 +202,44 @@ class SpectrumView(QtWidgets.QWidget):
             self.view = (f0, f0 + span)
         self.dirty = True
 
+    def _edge_at(self, x):
+        """'lo' / 'hi' if x is on an edge of the tuned channel's yellow band, else None"""
+        if self.listen_hz is None or not self.n or not self.passband:
+            return None
+        w = self.width()
+        lo, hi = self.passband
+        for name, f in (('lo', self.listen_hz + lo), ('hi', self.listen_hz + hi)):
+            if f != self.listen_hz and abs(self.x_of(f, w) - x) <= self.EDGE_PX:
+                return name
+        return None
+
+    def _drag_width(self, x):
+        """the channel width for an edge dragged to x: both sides move together, except one-sided USB / LSB"""
+        f = self.f_of(x, self.width())
+        lo, hi = self.passband
+        if lo == 0:                     # USB: the band is above the tuned frequency
+            bw = f - self.listen_hz
+        elif hi == 0:                   # LSB: below it
+            bw = self.listen_hz - f
+        else:
+            bw = 2 * abs(f - self.listen_hz)
+        return min(max(bw, 100.0), 250e3)
+
     def mousePressEvent(self, e):
-        self.drag = (e.pos().x(), self._span())
+        self.edge_drag = self._edge_at(e.pos().x()) if e.button() == Qt.LeftButton else None
+        self.drag = None if self.edge_drag else (e.pos().x(), self._span())
         self.press_x = e.pos().x()
 
     def mouseMoveEvent(self, e):
         self.mouse = e.pos()
+        if getattr(self, 'edge_drag', None):        # pressed on an edge, not released yet: widening / narrowing it
+            bw = self._drag_width(e.pos().x())
+            lo, hi = self.passband
+            self.passband = (0.0, bw) if lo == 0 else (-bw, 0.0) if hi == 0 else (-bw / 2, bw / 2)
+            self.dirty = True
+            return
+        if not e.buttons():
+            self.setCursor(Qt.SizeHorCursor if self._edge_at(e.pos().x()) else Qt.ArrowCursor)
         if self.drag and e.buttons() & Qt.LeftButton and self.view:
             x0, (f0, f1) = self.drag
             df = (e.pos().x() - x0) / max(1, self.width()) * (f1 - f0)
@@ -214,6 +248,11 @@ class SpectrumView(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, e):
         self.drag = None
+        if getattr(self, 'edge_drag', None):
+            self.edge_drag = None
+            lo, hi = self.passband
+            self.bandwidthPicked.emit(hi - lo)
+            return
         if self.n and self.listen_hz is not None and abs(e.pos().x() - getattr(self, 'press_x', -99)) < 4:
             self.listen_hz = self.f_of(e.pos().x(), self.width())      # a click (not a drag): listen here
             self.listenPicked.emit(self.listen_hz)
@@ -412,6 +451,7 @@ class SpectrumPanel(QtWidgets.QWidget):
         self.sound.currentIndexChanged.connect(self._sound_mode)
         self.volume.valueChanged.connect(lambda v: player.set_volume(v / 100))
         self.view.listenPicked.connect(lambda hz: player.set_mode('tuned', hz))
+        self.view.bandwidthPicked.connect(lambda bw: player.set_demod(bandwidth=bw))
         self.audio_btn.setMenu(self._audio_menu(player))
         player.demodChanged.connect(self._show_demod)
         self._show_demod()
@@ -529,10 +569,14 @@ class SpectrumPanel(QtWidgets.QWidget):
         v = self.view
         if self.player is not None and v.n and self.player.center != v.center:
             self.player.center = v.center
-            if systems.of_frequency(v.center)['key'] != self.player.system:      # another band: its own mode
+            band = systems.get(self.player.force_system) if self.player.force_system else systems.of_frequency(v.center)
+            if band['key'] != self.player.system:      # another band: its own mode
                 self.player.set_band(v.center)
             if abs(self.player.listen_hz - v.center) > v.rate / 2:      # a different band: its own channel
-                self.player.listen_hz = systems.of_frequency(v.center)['listen_hz']
+                f = band['listen_hz']
+                if abs(f - v.center) > v.rate / 2:      # (Radio, or a band's channel outside this slice)
+                    f = v.center - systems.RADIO_OFFSET_HZ
+                self.player.listen_hz = f
                 if v.listen_hz is not None:
                     v.listen_hz = self.player.listen_hz
             self.player.set_mode(self.player.mode)

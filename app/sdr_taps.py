@@ -47,10 +47,15 @@ class UdpSpectrum(gr.sync_block):
         gr.sync_block.__init__(self, 'udp_spectrum', in_sig=[(np.float32, FFT_SIZE)], out_sig=None)
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.addr = ('127.0.0.1', port)
-        self.head = struct.pack('<4sdd', b'IRS2', float(center), float(rate))
+        self.rate = float(rate)
+        self.set_center(center)
         self.per_frame = max(1, int(rate / FFT_SIZE / FRAME_RATE))
         self.norm = 10 * np.log10(np.sum(win) ** 2)     # a full-scale tone reads 0 dB
         self._clear()
+
+    def set_center(self, center):
+        """the SDR was retuned (Radio): frames from now on carry the new centre"""
+        self.head = struct.pack('<4sdd', b'IRS2', float(center), self.rate)
 
     def _clear(self):
         self.peak = np.zeros(FFT_SIZE, np.float32)
@@ -80,8 +85,9 @@ class UdpSpectrum(gr.sync_block):
 class UdpAudio(gr.sync_block):
     """normalises the audio, sends it to the tracker in 20 ms packets, and takes mode commands back"""
 
-    def __init__(self, port, apply, demod, bandwidth):
+    def __init__(self, port, apply, demod, bandwidth, on_tune=None):
         gr.sync_block.__init__(self, 'udp_audio', in_sig=[np.float32], out_sig=None)
+        self.on_tune = on_tune          # Radio: TUNE <centre Hz> retunes the SDR
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setblocking(False)
         self.addr = ('127.0.0.1', port)
@@ -99,6 +105,12 @@ class UdpAudio(gr.sync_block):
             except (BlockingIOError, OSError):
                 return
             f = data.split()
+            if len(f) == 2 and f[0] == b'TUNE' and self.on_tune is not None:
+                try:
+                    self.on_tune(float(f[1]))
+                except (ValueError, RuntimeError) as e:
+                    print('Tuning failed: %s' % e, file=sys.stderr)
+                continue
             if len(f) in (3, 5) and f[0] == b'CTRL' and f[1] in (b'off', b'wide', b'tuned'):
                 try:
                     offset = float(f[2])
@@ -180,7 +192,7 @@ def channel_taps(demod, bandwidth, fs):
     return _complex(firdes.low_pass(1, fs, bandwidth / 2, trans))
 
 
-def add_audio(tb, src, port, rate, channel_hz=36e3, demod='am'):
+def add_audio(tb, src, port, rate, channel_hz=36e3, demod='am', on_tune=None):
     """attach the sound tap: 'tuned' hears one channel, demodulated as one of DEMODS with a bandwidth that
     the tracker can change while running (channel_hz and demod are the start values: AM for bursts like
     Iridium's, FM for constant-envelope signals like Orbcomm's); 'wide' is the envelope of everything.
@@ -244,7 +256,7 @@ def add_audio(tb, src, port, rate, channel_hz=36e3, demod='am'):
 
     demod = demod_name(demod)
     demod, channel_hz = apply('off', 0.0, demod, channel_hz)
-    sink = UdpAudio(port, apply, demod, channel_hz)
+    sink = UdpAudio(port, apply, demod, channel_hz, on_tune)
     tb.connect(src, xlate)
     tb.connect(xlate, *wfm)
     if narrow is not None:

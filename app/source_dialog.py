@@ -40,9 +40,7 @@ class SourceDialog(QtWidgets.QDialog):
         # which system: one SDR listens to one band at a time
         self.system = QtWidgets.QComboBox()
         for s in systems.ORDER:
-            lo, hi = s['band_hz']
-            self.system.addItem('%s  (%s)' % (s['label'], '%.1f GHz' % (lo / 1e9) if lo > 1e9 else '%.0f MHz' % (lo / 1e6)),
-                                s['key'])
+            self.system.addItem('%s  (%s)' % (s['label'], systems.band_tag(s)), s['key'])
         self.system.setCurrentIndex(max(0, self.system.findData(self.s['system'])))
         self.system.setToolTip('One SDR receives one satellite system at a time. Every system you have received '
                                'is still shown on the map and in the list.')

@@ -127,9 +127,20 @@ class SoundPlayer(QtCore.QObject):
             self.out.setVolume(self.volume)
         self._command()
 
+    force_system = None     # set while the receiver is on Radio: its mode stays, wherever it is tuned
+
     def set_band(self, center):
         """the receiver is on a (new) band: use its system's last mode, or its own default"""
-        self._use_system(systems.of_frequency(center))
+        self._use_system(systems.get(self.force_system) if self.force_system else systems.of_frequency(center))
+
+    def tune_center(self, center):
+        """Radio: move the SDR itself (the tuned frequency left the received slice); False if nobody to tell"""
+        if self.decoder is None:
+            return False
+        self.center = float(center)
+        self.sock.writeDatagram(b'TUNE %d' % int(round(center)), *self.decoder)
+        self._command()         # the tuned channel's offset from the new centre
+        return True
 
     def _use_system(self, s):
         self.changed = time.time()

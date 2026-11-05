@@ -37,6 +37,7 @@ HAM_RX = os.path.join(HERE, 'ham_rx.py')          # ISS and ham CubeSats (2 m or
 GNSS_RX = os.path.join(HERE, 'gnss_rx.py')        # GPS / Galileo / BeiDou: records chunks for PocketSDR
 METEOR_RX = os.path.join(HERE, 'meteor_rx.py')    # Meteor-M pictures: records the pass; SatDump decodes it after
 IMAGES_PY = os.path.join(HERE, 'images.py')
+RADIO_RX = os.path.join(HERE, 'radio_rx.py')      # Radio: spectrum and sound anywhere, retuned while it runs
 DAMAGED = ('RAW', 'ERR', 'OBAD', 'HSIG')        # frame kinds that were heard but could not be decoded
 LIMIT_GB = 2
 STATUS_EVERY = 10   # the decoder prints its totals every second; the log keeps one line in this many
@@ -213,6 +214,7 @@ class Receiver(QtCore.QObject):
         prog = ([ORBCOMM_RX] if self.system is systems.ORBCOMM else [GNSS_RX] if self.system is systems.GNSS_BAND
                 else [GNSS_RX, '--constellation', 'glonass'] if self.system is systems.GLONASS_BAND
                 else [METEOR_RX, '--baseband', self.bits_path[:-5] + '.s16'] if self.system is systems.METEOR
+                else [RADIO_RX] if self.system is systems.RADIO
                 else [HAM_RX, '--band', self.system['key']])
         self.meteor_snr = None
         args = prog + ['--device', sdr_settings.device_args(s), '--rate', str(sdr_settings.sample_rate(s)),
@@ -261,6 +263,10 @@ class Receiver(QtCore.QObject):
             self.stop('decoder used over %d GB of memory (too many false bursts) - raise the threshold' % LIMIT_GB)
             return
         e = int(time.time() - self.t_start)
+        if self.system is systems.RADIO:
+            self.status.emit('Radio on  %d:%02d:%02d  ·  tune in the Radio section%s'
+                             % (e // 3600, e // 60 % 60, e % 60, '  ·  ' + self.last_status if self.last_status else ''))
+            return
         if self.system is systems.METEOR:       # nothing is decoded until Stop: the signal is the news
             self.status.emit('Receiving %s %d:%02d:%02d  ·  recording the pass  ·  signal %s  ·  pictures are made '
                              'after Stop' % (self.system['label'], e // 3600, e // 60 % 60, e % 60,
@@ -417,6 +423,16 @@ class Receiver(QtCore.QObject):
         self._clear_running()
         if self.parser is not None:
             self._parser_output()
+        if self.system is systems.RADIO:        # listening only: nothing to keep
+            self._remove_capture()
+            try:
+                os.remove(self.log_path)
+            except OSError:
+                pass
+            self.state = 'idle'
+            self.running.emit(False)
+            self.status.emit('Radio stopped%s' % (': ' + self.stop_reason if self.stop_reason else ''))
+            return
         got = self._received_file()
         size = os.path.getsize(got) if os.path.exists(got) else 0
         if size < 200:      # nothing was received: don't leave empty files behind

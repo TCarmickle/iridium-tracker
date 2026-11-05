@@ -751,7 +751,7 @@ class Data:
                 evs = self._read_live_ham(text, cap, newest, refit)
             elif systems.of_capture(cap).get('system') == 'gnss':
                 evs = self._read_live_gnss(text, cap, newest, refit)
-            elif systems.of_capture(cap).get('system') == 'meteor':
+            elif systems.of_capture(cap).get('system') in ('meteor', 'radio'):
                 evs = []        # Meteor: only its signal strength while receiving; pictures in Images after Stop
             else:
                 evs = self._read_live(text, cap, catalog.capture_start(path[:-5])[0].timestamp(), newest, refit)
@@ -1833,9 +1833,7 @@ class Tracker(QtWidgets.QMainWindow):
                                'program can use the SDR. When you stop, the capture is added to the catalog.')
         self.rx_system = QtWidgets.QComboBox()       # which system to receive (also in Source)
         for sy in systems.ORDER:
-            lo = sy['band_hz'][0]
-            self.rx_system.addItem('%s  %s' % (sy['label'], '%.1f GHz' % (lo / 1e9) if lo > 1e9 else '%.0f MHz' % (lo / 1e6)),
-                                   sy['key'])
+            self.rx_system.addItem('%s  %s' % (sy['label'], systems.band_tag(sy)), sy['key'])
         self.rx_system.setCurrentIndex(max(0, self.rx_system.findData(sdr_settings.load()['system'])))
         self.rx_system.currentIndexChanged.connect(self._rx_system_changed)
         self._rx_system_tip()
@@ -1881,7 +1879,7 @@ class Tracker(QtWidgets.QMainWindow):
         hl.addWidget(title)
         # the two sections: the tracker (map, satellites) and the pictures received (Meteor-M weather images)
         self.section_btns = []
-        for k, text in enumerate(('\U0001F6F0  Tracker', '\U0001F5BC  Images')):
+        for k, text in enumerate(('\U0001F6F0  Tracker', '\U0001F5BC  Images', '\U0001F4FB  Radio')):
             b = QtWidgets.QPushButton(text)
             b.setCheckable(True)
             b.setChecked(k == 0)
@@ -1893,6 +1891,8 @@ class Tracker(QtWidgets.QMainWindow):
             hl.addWidget(b)
         self.section_btns[1].setToolTip('Weather pictures from the Meteor-M satellites: receive a pass, view and '
                                         'save the pictures')
+        self.section_btns[2].setToolTip('Listen anywhere the SDR reaches, like SDR++: big spectrum and waterfall, '
+                                        'frequency digits, mode and bandwidth')
         hl.addStretch(1)
         hl.addWidget(self.rx_btn)
         hl.addWidget(self.rx_system)
@@ -2071,6 +2071,9 @@ class Tracker(QtWidgets.QMainWindow):
         import images_view
         self.images_view = images_view.ImagesView(self)
         self.sections.addWidget(self.images_view)
+        import radio_view
+        self.radio_view = radio_view.RadioView(self)
+        self.sections.addWidget(self.radio_view)
         central = QtWidgets.QWidget()
         cv = QtWidgets.QVBoxLayout(central)
         cv.setContentsMargins(4, 4, 4, 0)
@@ -2284,11 +2287,13 @@ class Tracker(QtWidgets.QMainWindow):
 
     # ---- sky plot
     def show_section(self, k):
-        """0: the tracker, 1: Images (the map's own buttons are hidden there; the spectrum comes along)"""
+        """0: the tracker, 1: Images, 2: Radio (the map's own buttons are hidden in the others; the spectrum comes along)"""
         # the spectrum / waterfall / sound panel goes with the section shown (one panel, one set of settings)
         visible = self.spec_btn.isChecked()
         if k == 1:
             self.images_view.take_spectrum(self.spectrum)
+        elif k == 2:
+            self.radio_view.take_spectrum(self.spectrum)
         elif self.map_split.indexOf(self.spectrum) < 0:
             self.map_split.insertWidget(1, self.spectrum)
             self.map_split.setSizes([560, 330])
