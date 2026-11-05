@@ -69,6 +69,12 @@ def model_eci(p, t0, t):
 
 
 class Orbit:
+    # what the fit's covariance leaves out (set per system by the app; 0 = the covariance alone, as the fit uses
+    # it): a floor for what the measurements themselves are off by, and a drift away from the observed span -
+    # the model has no drag or short-period terms, so the satellite slowly runs ahead / behind along its orbit
+    floor_km = 0.0
+    drift_km_h = 0.0
+
     def __init__(self, p, t0, cov, info):
         self.p, self.t0, self.cov, self.info = np.asarray(p, float), t0, cov, info
 
@@ -83,7 +89,13 @@ class Orbit:
         a = self.p[4]
         var_u = c[2, 2] + 2 * dt * c[2, 3] + dt * dt * c[3, 3]
         var_plane = c[0, 0] + c[1, 1]
-        return a * np.sqrt(np.maximum(var_u, 0) + var_plane) + 1.0
+        fit = a * np.sqrt(np.maximum(var_u, 0) + var_plane) + 1.0
+        if not (self.floor_km or self.drift_km_h):
+            return fit
+        t = dt + self.t0
+        lo, hi = self.info.get('first_obs', self.t0), self.info.get('last_obs', self.t0)
+        away_h = np.maximum(np.maximum(lo - t, t - hi), 0.0) / 3600.0
+        return np.sqrt(fit ** 2 + self.floor_km ** 2 + (self.drift_km_h * away_h) ** 2)
 
     def plane_at(self, t):
         """(node, inclination) in radians of the orbit plane at time t (inertial frame)"""

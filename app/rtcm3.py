@@ -188,6 +188,10 @@ def decode_glonass(payload, now=None):
     day = math.floor(msk / 86400) * 86400
     toe = day + tb - 3 * 3600.0
     toe += 86400 * round((now - toe) / 86400)
+    import gnss
+    toe = gnss.glo_check_toe(toe, now)         # (now: when it was received)
+    if toe is None:
+        return None
     fields = {'toe': toe, 'x': x, 'y': y, 'z': z, 'vx': vx, 'vy': vy, 'vz': vz, 'ax': ax, 'ay': ay, 'az': az,
               'taun': taun, 'gamn': gamn, 'fcn': fcn, 'slot': slot, 'glo': True, 'health': bn}
     return 'R%02d' % slot, 'G1CA', fields

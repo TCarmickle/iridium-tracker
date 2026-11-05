@@ -364,6 +364,22 @@ class SBASOrbit:
 GLO_MU, GLO_J2, GLO_RE, GLO_OMGE = 3.9860044e14, 1.0826257e-3, 6378136.0, 7.292115e-5
 GLO_FIELDS = ['toe', 'x', 'y', 'z', 'vx', 'vy', 'vz', 'ax', 'ay', 'az', 'taun', 'gamn', 'fcn', 'slot']
 GLO_STEP_S = 30.0
+GLO_TB_SLIP_S = 32 * 900.0        # see glo_check_toe
+GLO_TB_TOL_S = 5400.0
+
+
+def glo_check_toe(toe, received):
+    """the reference time tb of a GLONASS broadcast, checked against when it was received: a broadcast is for the
+    next quarter / half hour, so tb is within minutes of reception. Some come out of the decoder exactly 8 h late
+    (tb's 32 bit set: seen for every broadcast sent 15:00-24:00 Moscow time, while position and velocity are
+    right - checked against the public orbits to 1-3 km); those are put back. Anything else that doesn't fit
+    -> None (not used)"""
+    d = (toe - received + 43200.0) % 86400.0 - 43200.0
+    if abs(d) <= GLO_TB_TOL_S:
+        return received + d
+    if abs(d - GLO_TB_SLIP_S) <= GLO_TB_TOL_S:
+        return received + d - GLO_TB_SLIP_S
+    return None
 GLO_SPAN_S = 8 * 3600.0           # integrated this far either side of tb (a little over half an orbit... and more)
 
 
@@ -421,8 +437,12 @@ class GlonassOrbit:
     @classmethod
     def from_fields(cls, text, sat, received):
         """'GLO,toe,x,y,z,vx,vy,vz,ax,ay,az,taun,gamn,fcn,slot' (a GEPH line's fields) -> GlonassOrbit"""
-        v = [float(x) for x in text.split(',')[1:]]
-        return cls(dict(zip(GLO_FIELDS, v)), sat, received)
+        g = dict(zip(GLO_FIELDS, [float(x) for x in text.split(',')[1:]]))
+        toe = glo_check_toe(g['toe'], float(received))     # (also repairs ones saved before the check existed)
+        if toe is None:
+            raise ValueError('its broadcast time does not match when it was received')
+        g['toe'] = toe
+        return cls(g, sat, received)
 
     def _state(self, t):
         t = np.clip(np.atleast_1d(np.asarray(t, float)), self.ts[0], self.ts[-1])

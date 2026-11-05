@@ -59,6 +59,8 @@ MIN_EL = 8.2          # Iridium serves phones down to about 8 degrees elevation
 MAX_SIGMA_KM = 1500   # hide a satellite once our orbit for it is more uncertain than this
 OMEGA_EARTH = 7.2921151467e-5   # Earth rotation, rad/s
 FAINT_SIGMA_KM = 150  # draw it faded beyond this uncertainty
+IRIDIUM_FLOOR_KM = 12.0     # what an Iridium orbit from ring-alert positions is off by while heard
+IRIDIUM_DRIFT_KM_H = 2.5    # ...and how fast that grows once it's no longer heard (km per hour)
 FIT_DAYS = 7          # orbits are fitted to each satellite's most recent week of observations
 HEARTBEAT_S = 45      # a receiver's decoder log is written every 10 s; this long without a change = stopped
 PLANE_MAX_SIGMA_KM = 300  # a satellite's orbit plane must be known this well to place its plane
@@ -482,6 +484,10 @@ class Data:
                                       carrier=sys_['carrier_hz'], inc_hint=sys_['inc_hint'])
         self.orbits.pop(n, None)
         self.no_orbit.pop(n, None)
+        if orbit and sys_ is systems.IRIDIUM:
+            # the +- the map shows, calibrated against the public orbits (Nov 2026, 65 satellites, up to 3 days
+            # unheard): with these 2/3 of the real errors fall inside it and 98% inside three times it
+            orbit.floor_km, orbit.drift_km_h = IRIDIUM_FLOOR_KM, IRIDIUM_DRIFT_KM_H
         if orbit:
             self.orbits[n] = orbit
         else:
