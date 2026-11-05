@@ -192,12 +192,18 @@ class ImagesView(QtWidgets.QWidget):
         self.split = split
         self.sized = False              # (sizes are set the first time the section is shown: its width is known)
 
+        # under the pictures: the tracker's live spectrum, waterfall and sound (the same panel, moved here while
+        # this section is shown - see Tracker.show_section)
+        self.vsplit = QtWidgets.QSplitter(Qt.Vertical)
+        self.vsplit.addWidget(split)
+        self.vsplit.setStretchFactor(0, 3)
+
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
         lay.addWidget(intro)
         lay.addLayout(top_btns)
         lay.addWidget(self.satdump_lbl)
-        lay.addWidget(split, 1)
+        lay.addWidget(self.vsplit, 1)
 
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.refresh)
@@ -207,6 +213,13 @@ class ImagesView(QtWidgets.QWidget):
         self.refresh()
         self._rx_text()
         self._viewer_buttons()
+
+    def take_spectrum(self, panel):
+        """show the tracker's spectrum / waterfall panel under the pictures"""
+        self.vsplit.insertWidget(1, panel)
+        self.vsplit.setStretchFactor(1, 2)
+        h = max(500, self.vsplit.height())
+        self.vsplit.setSizes([h - 300, 300])
 
     def showEvent(self, e):
         super().showEvent(e)

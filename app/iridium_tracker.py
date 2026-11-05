@@ -2284,7 +2284,15 @@ class Tracker(QtWidgets.QMainWindow):
 
     # ---- sky plot
     def show_section(self, k):
-        """0: the tracker, 1: Images (the map's own buttons are hidden there)"""
+        """0: the tracker, 1: Images (the map's own buttons are hidden there; the spectrum comes along)"""
+        # the spectrum / waterfall / sound panel goes with the section shown (one panel, one set of settings)
+        visible = self.spec_btn.isChecked()
+        if k == 1:
+            self.images_view.take_spectrum(self.spectrum)
+        elif self.map_split.indexOf(self.spectrum) < 0:
+            self.map_split.insertWidget(1, self.spectrum)
+            self.map_split.setSizes([560, 330])
+        self.spectrum.setVisible(visible)
         self.sections.setCurrentIndex(k)
         for i, b in enumerate(self.section_btns):
             b.setChecked(i == k)
