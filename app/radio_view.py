@@ -207,7 +207,26 @@ class RadioView(QtWidgets.QWidget):
         self.area.setContentsMargins(0, 0, 0, 0)
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(4, 4, 4, 4)
+        # the bookmarks bar: your saved frequencies
+        save_mark = QtWidgets.QPushButton('★  Save frequency')
+        save_mark.setToolTip('Save the frequency you are on (with its mode and bandwidth) to the bar -\n'
+                             'click it any time later, in this session or the next, to go straight back')
+        save_mark.clicked.connect(self._add_bookmark)
+        bar_box = QtWidgets.QWidget()
+        self.mark_row = QtWidgets.QHBoxLayout(bar_box)
+        self.mark_row.setContentsMargins(0, 0, 0, 0)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(bar_box)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFixedHeight(38)
+        marks = QtWidgets.QHBoxLayout()
+        marks.addWidget(save_mark)
+        marks.addWidget(scroll, 1)
+
         lay.addLayout(top)
+        lay.addLayout(marks)
         lay.addLayout(modes)
         lay.addWidget(self.note)
         lay.addLayout(self.area, 1)
@@ -225,6 +244,8 @@ class RadioView(QtWidgets.QWidget):
         sync = QtCore.QTimer(self)
         sync.timeout.connect(self._sync)
         sync.start(250)
+        self.bookmarks = self.load_bookmarks()
+        self._show_bookmarks()
         self._show_demod()
         self._rx_changed(tracker.receiver.state == 'running')
 
@@ -336,11 +357,117 @@ class RadioView(QtWidgets.QWidget):
         if not data:
             return
         mhz, mode, bw = data
-        self.set_frequency(mhz * 1e6)
-        if self.pending_hz is not None or self.want_hz is not None:
-            self.pending_mode = (mode, bw * 1e3)    # switching to Radio: its mode once Radio is on (else the band
-        else:                                       # being stopped would remember it as its own)
-            self.player.set_demod(demod=mode, bandwidth=bw * 1e3)
+        self.go(mhz * 1e6, mode, bw * 1e3)
+
+    def go(self, hz, mode=None, bandwidth=None):
+        """go to a frequency with its mode (a quick pick or a bookmark): starts Radio if nothing is receiving"""
+        self.set_frequency(hz)
+        r = self.tracker.receiver
+        if mode and self._on_radio() and self.pending_hz is None and self.want_hz is None:
+            self.player.set_demod(demod=mode, bandwidth=bandwidth)
+            return
+        if mode:            # once Radio is on (else the band being left would remember it as its own)
+            self.pending_mode = (mode, bandwidth)
+        if not r.busy and self.pending_hz is None:
+            self._start_radio()
+
+    # ---- bookmarks: your saved frequencies (settings.json 'ui' 'radio_bookmarks'), a bar of buttons
+    @staticmethod
+    def load_bookmarks():
+        marks = theme.load_ui().get('radio_bookmarks', [])
+        out = []
+        for m in marks if isinstance(marks, list) else []:
+            try:
+                out.append({'name': str(m['name']), 'hz': float(m['hz']), 'mode': str(m.get('mode') or 'nfm'),
+                            'bandwidth': float(m.get('bandwidth') or sound.MODE_BW.get(m.get('mode'), 12.5e3))})
+            except (KeyError, TypeError, ValueError):
+                pass
+        return out
+
+    def _store_bookmarks(self):
+        theme.save_ui(radio_bookmarks=self.bookmarks)
+        self._show_bookmarks()
+
+    def _add_bookmark(self):
+        hz = round(self.freq.hz)
+        mode = self.player.demod if self._on_radio() else (self.pending_mode or (self.player.demod,))[0]
+        bw = self.player.bandwidth if self._on_radio() else (self.pending_mode or (None, self.player.bandwidth))[1]
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, 'Save this frequency', '%.4f MHz, %s - a name for it:' % (hz / 1e6, mode.upper()),
+            text='%.3f %s' % (hz / 1e6, mode.upper()))
+        if not ok:
+            return
+        name = name.strip() or '%.3f' % (hz / 1e6)
+        self.bookmarks = [m for m in self.bookmarks if abs(m['hz'] - hz) >= 1 or m['mode'] != mode]
+        self.bookmarks.append({'name': name, 'hz': float(hz), 'mode': mode, 'bandwidth': float(bw)})
+        self._store_bookmarks()
+
+    def _show_bookmarks(self):
+        """the bar: one button per bookmark (the one you are on lit up); right-click a button for more"""
+        while self.mark_row.count():
+            item = self.mark_row.takeAt(0)
+            old = item.widget()
+            if old is not None:
+                old.hide()                      # (gone now - deleteLater alone leaves it drawn for a moment)
+                old.setParent(None)
+                old.deleteLater()
+        for i, m in enumerate(self.bookmarks):
+            b = QtWidgets.QPushButton('★ %s' % m['name'])
+            b.setCheckable(True)
+            b.setToolTip('%.4f MHz  ·  %s  ·  %.1f kHz wide\nClick: go there.  Right-click: rename, update, '
+                         'move or delete.' % (m['hz'] / 1e6, m['mode'].upper(), m['bandwidth'] / 1e3))
+            theme.style(b, 'QPushButton { padding: 3px 10px; } QPushButton:checked { background: %(SEL_BG)s; '
+                           'border: 1px solid %(ACCENT)s; color: %(TEXT)s; font-weight: 600; }')
+            b.clicked.connect(lambda _, m=m: self.go(m['hz'], m['mode'], m['bandwidth']))
+            b.setContextMenuPolicy(Qt.CustomContextMenu)
+            b.customContextMenuRequested.connect(lambda pos, i=i, b=b: self._bookmark_menu(i, b.mapToGlobal(pos)))
+            self.mark_row.addWidget(b)
+        if not self.bookmarks:
+            hint = QtWidgets.QLabel('No saved frequencies yet - tune somewhere and press "★ Save frequency".')
+            theme.style(hint, 'color: %(MUTED)s;')
+            self.mark_row.addWidget(hint)
+        self.mark_row.addStretch(1)
+        self.panel.view.bookmarks = [(m['hz'], m['name']) for m in self.bookmarks]
+        self.panel.view.dirty = True
+        self._light_bookmark()
+
+    def _light_bookmark(self):
+        for i in range(self.mark_row.count()):
+            b = self.mark_row.itemAt(i).widget()
+            if isinstance(b, QtWidgets.QPushButton) and i < len(self.bookmarks):
+                b.setChecked(abs(self.bookmarks[i]['hz'] - self.freq.hz) < 1)
+
+    def _bookmark_menu(self, i, pos):
+        m = self.bookmarks[i]
+        menu = QtWidgets.QMenu(self)
+        rename = menu.addAction('Rename...')
+        update = menu.addAction('Update to the frequency and mode now (%.4f MHz %s)' % (
+            self.freq.hz / 1e6, self.player.demod.upper()))
+        menu.addSeparator()
+        left = menu.addAction('Move left')
+        right = menu.addAction('Move right')
+        left.setEnabled(i > 0)
+        right.setEnabled(i < len(self.bookmarks) - 1)
+        menu.addSeparator()
+        delete = menu.addAction('Delete')
+        act = menu.exec_(pos)
+        if act is rename:
+            name, ok = QtWidgets.QInputDialog.getText(self, 'Rename', 'Name:', text=m['name'])
+            if ok and name.strip():
+                m['name'] = name.strip()
+        elif act is update:
+            m.update(hz=float(round(self.freq.hz)), mode=self.player.demod, bandwidth=float(self.player.bandwidth))
+        elif act in (left, right):
+            j = i - 1 if act is left else i + 1
+            self.bookmarks[i], self.bookmarks[j] = self.bookmarks[j], self.bookmarks[i]
+        elif act is delete:
+            if QtWidgets.QMessageBox.question(self, 'Delete', 'Delete the saved frequency "%s" (%.4f MHz)?'
+                                              % (m['name'], m['hz'] / 1e6)) != QtWidgets.QMessageBox.Yes:
+                return
+            del self.bookmarks[i]
+        else:
+            return
+        self._store_bookmarks()
 
     def _save(self):
         s = sdr_settings.load()
@@ -398,6 +525,7 @@ class RadioView(QtWidgets.QWidget):
                 v.dirty = True
         elif v.listen_hz is not None and (self._on_radio() or r.state == 'running') and not self.freq.underMouse():
             self.freq.set_value(v.listen_hz)
+        self._light_bookmark()
         if self.pending_mode and self.want_hz is None and self._on_radio() and self.player.system == 'radio':
             mode, bw = self.pending_mode
             self.pending_mode = None

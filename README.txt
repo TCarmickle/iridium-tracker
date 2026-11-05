@@ -245,6 +245,11 @@ reaches (about 24 MHz to 2.3 GHz): FM radio, NOAA Weather Radio, aircraft, ham, 
 - The big digits are the frequency: scroll over any digit to step it (each digit is its own
   place - 1 MHz, 100 kHz, 10 kHz ... 1 Hz), or click its top half (up) / bottom half (down).
   Or type it in MHz and press Enter, or pick one from "Quick picks".
+- Your own favourites: "★ Save frequency" saves where you are (with its mode and bandwidth)
+  to the bar under the digits, with a name you choose. Click one any time - this session or
+  the next - to go straight there (it starts Radio if nothing is receiving). Right-click one
+  to rename it, update it to where you are now, move it left / right, or delete it. Saved
+  frequencies in view are starred on the spectrum.
 - If another band is being received (Iridium, GPS...) and you tune outside its slice - digits,
   typing or a quick pick - it stops that band (its capture is kept as usual) and starts Radio
   at the new frequency.

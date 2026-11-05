@@ -69,6 +69,7 @@ class SpectrumView(QtWidgets.QWidget):
         self.passband = None        # ...and what is heard around it: (low, high) Hz from listen_hz
         self.pan_retune = None      # Radio: dragging the (unzoomed) spectrum moves the SDR - called with the shift (Hz)
         self.pan_df = 0.0           # ...the shift of the drag in progress
+        self.bookmarks = []         # the Radio section's saved frequencies: [(Hz, name)], marked on the trace
         # how much of the height the trace gets (the waterfall the rest): dragged on the bar between them, and
         # remembered for each section the panel is shown in (see set_section)
         self.section = 'tracker'
@@ -410,6 +411,13 @@ class SpectrumView(QtWidgets.QWidget):
             p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 60), 1.5))
             p.drawLine(QPointF(lx, 0), QPointF(lx, h))
             p.drawText(QPointF(min(lx + 6, w - 150), top_h - 6), '\U0001F50A %.4f MHz' % (self.listen_hz / 1e6))
+        for hz, name in self.bookmarks:       # saved frequencies in view: a star and the name
+            bx = self.x_of(hz, w)
+            if 0 <= bx <= w:
+                p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 60, 110), 1, Qt.DotLine))
+                p.drawLine(QPointF(bx, top_h - 34), QPointF(bx, top_h))
+                p.setPen(QtGui.QColor(255, 210, 60, 200))
+                p.drawText(QPointF(min(bx + 3, w - 120), top_h - 24), '★ ' + name)
         if self.pan_df:                       # Radio: a drag along the band in progress
             to = (self.listen_hz if self.listen_hz is not None else self.center) - self.pan_df
             p.fillRect(QtCore.QRectF(w / 2 - 170, top_h / 2 - 16, 340, 32), QtGui.QColor(20, 24, 30, 220))
