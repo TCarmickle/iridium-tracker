@@ -253,6 +253,16 @@ reaches (about 24 MHz to 2.3 GHz): FM radio, NOAA Weather Radio, aircraft, ham, 
 - If another band is being received (Iridium, GPS...) and you tune outside its slice - digits,
   typing or a quick pick - it stops that band (its capture is kept as usual) and starts Radio
   at the new frequency.
+- The main view (Tracker section): the buttons above the map - Map, Globe, Sky, Signal - choose
+  what fills it. "Pop out" puts the view shown there into a window of its own (the header's
+  Sky / Globe / Signal buttons open theirs as windows too, as before); closing a window brings
+  the view back. The main view you chose and each window's size and place are remembered.
+- The waveform and the waterfall each have a pop-out button on the spectrum bar (in every
+  section), and the timeline has one at the end of its controls. A popped-out waveform or
+  waterfall works like the one in the window: click to tune, drag the yellow band's edges...
+- The waveform's dB scale (its left edge) can be dragged: its top half moves the top of the
+  range (drag down to bring the top down), its bottom half the bottom; the wheel there zooms
+  the range. That turns Auto range off - tick it again to go back.
 - Sizes are yours to set, in every section: drag the bar with the frequency scale (the grips
   at its ends) up or down to give the spectrum line or the waterfall more room, and drag the
   dividers between panels. The window's size and place, every divider, and the spectrum /

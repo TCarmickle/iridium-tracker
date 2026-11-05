@@ -50,6 +50,7 @@ import sound  # noqa: E402
 import orbitfit  # noqa: E402  (orbits from our own observations)
 import receiver  # noqa: E402  (the SDR receiver and decoder, run from here)
 import location_dialog  # noqa: E402
+import popout  # noqa: E402  (pop-out windows, the main view)
 
 UTC = datetime.timezone.utc
 HOME_LAT, HOME_LON, HOME_H = catalog.HOME or (0.0, 0.0, 0.0)   # set_home() changes it while running
@@ -1985,16 +1986,36 @@ class Tracker(QtWidgets.QMainWindow):
         bar.setLayout(opts)
         mp.addWidget(bar)
         mp.addWidget(self.map, 1)
+        # the main view: the map, or the globe, sky or signal in its place (each can also be popped out)
+        self.deck = popout.ViewDeck([
+            ('map', '\U0001F5FA  Map', '2D map', lambda: map_pane),
+            ('globe', '\U0001F30D  Globe', 'Globe', self._make_globe),
+            ('sky', '✦  Sky', 'Sky plot', self._make_sky),
+            ('signal', '\U0001F4F6  Signal', 'Signal', self._make_signal),
+        ], shown=self._view_shown)
         self.map_split = QtWidgets.QSplitter(Qt.Vertical)
-        self.map_split.addWidget(map_pane)
+        self.map_split.addWidget(self.deck)
         self.map_split.addWidget(self.spectrum)
         self.map_split.setStretchFactor(0, 3)
         self.map_split.setStretchFactor(1, 2)
         theme.remember_splitter(self.map_split, 'map_spectrum', [560, 330])     # (where you last dragged it)
         self.spec_btn.toggled.connect(self.spectrum.setVisible)
         lv.addWidget(self.map_split, 1)
-        lv.addWidget(self.timeline)
-        lv.addLayout(row)
+        # the timeline and its controls: can be popped out too
+        self.timeline_box = QtWidgets.QWidget()
+        tb = QtWidgets.QVBoxLayout(self.timeline_box)
+        tb.setContentsMargins(0, 0, 0, 0)
+        tb.addWidget(self.timeline)
+        tb.addLayout(row)
+        tl_pop = QtWidgets.QToolButton()
+        tl_pop.setText(popout.POP)
+        tl_pop.setToolTip('Pop the timeline out into a window of its own (close it to bring it back)')
+        tl_pop.clicked.connect(self.pop_timeline)
+        row.addWidget(tl_pop)
+        self.timeline_win = None
+        self.timeline_note = None
+        lv.addWidget(self.timeline_box)
+        self.left_layout = lv
 
         # side panel: which systems to show (drives the Systems filter), then numbers about them.
         # The Sky and Globe windows get the same buttons; they all drive (and follow) sys_box.
@@ -2092,6 +2113,8 @@ class Tracker(QtWidgets.QMainWindow):
 
         self.reload_lists()
         self.go_live()
+        main = theme.load_ui().get('main_view', 'map')        # the main view you had last time
+        self.deck.show_view(main if main in self.deck.views else 'map')
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(100)
@@ -2131,21 +2154,24 @@ class Tracker(QtWidgets.QMainWindow):
         return None
 
     # ---- globe
+    def _make_globe(self):
+        """the globe (made once): shown in the main view or in its own window"""
+        self.globe = globe.GlobeWindow(self, (HOME_LAT, HOME_LON), self._globe_tile, self.map.map_theme)
+        self.globe.setWindowFlags(Qt.Widget)
+        self.globe.view.satelliteClicked.connect(self.select)
+        self.globe.sysbar = self._sys_window_bar()
+        self.globe.layout().insertWidget(0, self.globe.sysbar)
+        self.globe.layout().insertWidget(1, self._globe_options())
+        self.globe.view.corner = self._map_switches(self.globe.view)[0]
+        self.globe_info = QtWidgets.QLabel()
+        self.globe_info.setTextFormat(Qt.RichText)
+        self.globe_info.setContentsMargins(10, 4, 10, 6)
+        self.globe.layout().addWidget(self.globe_info)
+        return self.globe
+
     def show_globe(self):
-        if self.globe is None:
-            self.globe = globe.GlobeWindow(self, (HOME_LAT, HOME_LON), self._globe_tile, self.map.map_theme)
-            self.globe.view.satelliteClicked.connect(self.select)
-            self.globe.layout().insertWidget(0, self._sys_window_bar())
-            self.globe.layout().insertWidget(1, self._globe_options())
-            self.globe.view.corner = self._map_switches(self.globe.view)[0]
-            self.globe_info = QtWidgets.QLabel()
-            self.globe_info.setTextFormat(Qt.RichText)
-            self.globe_info.setContentsMargins(10, 4, 10, 6)
-            self.globe.layout().addWidget(self.globe_info)
-        self.globe.view.home = (HOME_LAT, HOME_LON)
-        self.globe.view.set_scene(self.map.scene)
-        self.globe.show()
-        self.globe.raise_()
+        """the Globe button: the globe in a window of its own"""
+        self.deck.pop_out('globe')
 
     def _map_switches(self, parent):
         """the map's two switches, for the top right corner of a map or globe: light / dark map and day / night
@@ -2224,15 +2250,18 @@ class Tracker(QtWidgets.QMainWindow):
             txt += '<br><b>%s</b>: not on the globe now (no orbit, or too uncertain at this time)' % self.selected
         return txt
 
+    def _make_signal(self):
+        """the Signal view (made once): live bars of how strongly each satellite is heard"""
+        self.signal_win = signalview.SignalWindow(self)
+        self.signal_win.setWindowFlags(Qt.Widget)
+        self.signal_win.sysbar = self._sys_window_bar()
+        self.signal_win.layout().insertWidget(0, self.signal_win.sysbar)
+        self.sys_box.currentIndexChanged.connect(lambda _: self.signal_win.refresh())
+        return self.signal_win
+
     def show_signal(self):
-        """the Signal window: live bars of how strongly each satellite is heard"""
-        if self.signal_win is None:
-            self.signal_win = signalview.SignalWindow(self)
-            self.signal_win.layout().insertWidget(0, self._sys_window_bar())
-            self.sys_box.currentIndexChanged.connect(lambda _: self.signal_win.refresh())
-        self.signal_win.show()
-        self.signal_win.raise_()
-        self.signal_win.refresh()
+        """the Signal button: the Signal view in a window of its own"""
+        self.deck.pop_out('signal')
 
     def _coverage_switch(self, on):
         """coverage areas on (as they were: the selected satellite's, or all in view) or off"""
@@ -2314,14 +2343,61 @@ class Tracker(QtWidgets.QMainWindow):
         if k == 1:
             self.images_view.refresh()
 
+    def _make_sky(self):
+        """the sky plot (made once)"""
+        self.sky = skyplot.SkyDialog(self, self.data, from_home, self._run_start, self.shows)
+        self.sky.setWindowFlags(Qt.Widget)
+        self.sky.sysbar = self._sys_window_bar()
+        self.sky.layout().insertWidget(0, self.sky.sysbar)
+        self.sys_box.currentIndexChanged.connect(self.sky.refresh)
+        return self.sky
+
     def show_sky(self):
-        if self.sky is None:
-            self.sky = skyplot.SkyDialog(self, self.data, from_home, self._run_start, self.shows)
-            self.sky.layout().insertWidget(0, self._sys_window_bar())
-            self.sys_box.currentIndexChanged.connect(self.sky.refresh)
-        self.sky.show()
-        self.sky.raise_()
-        self.sky.refresh()
+        """the Sky button: the sky plot in a window of its own"""
+        self.deck.pop_out('sky')
+
+    def _view_shown(self, key):
+        """a view came on screen (main view or its window): bring it up to date. The system buttons inside the
+        globe / sky / signal are for their own windows - in the main view the side panel's are right there."""
+        w = self.deck.content.get(key)
+        if hasattr(w, 'sysbar'):
+            w.sysbar.setVisible(key in self.deck.windows)
+        if key == 'globe':
+            self.globe.view.home = (HOME_LAT, HOME_LON)
+            self.globe.view.set_scene(self.map.scene)
+        elif key == 'sky':
+            self.sky.refresh()
+        elif key == 'signal':
+            self.signal_win.refresh()
+
+    def pop_timeline(self):
+        """the timeline and its controls in a window of their own (closing it brings them back)"""
+        if self.timeline_win is not None:
+            self.timeline_win.raise_()
+            return
+        i = self.left_layout.indexOf(self.timeline_box)
+        self.left_layout.removeWidget(self.timeline_box)
+        self.timeline_note = popout.placeholder('The timeline is in its own window.', self._dock_timeline)
+        self.timeline_note.setMaximumHeight(48)
+        self.left_layout.insertWidget(i, self.timeline_note)
+        self.timeline_win = popout.PopWindow('timeline', 'Timeline', self.timeline_box, size=(1100, 170))
+        self.timeline_win.closed.connect(lambda: self._dock_timeline(from_window=True))
+        self.timeline_win.show()
+
+    def _dock_timeline(self, from_window=False):
+        win, self.timeline_win = self.timeline_win, None
+        if win is None:
+            return
+        i = self.left_layout.indexOf(self.timeline_note)
+        self.timeline_note.hide()
+        self.left_layout.removeWidget(self.timeline_note)
+        self.timeline_note.deleteLater()
+        self.timeline_note = None
+        self.left_layout.insertWidget(i, self.timeline_box)
+        self.timeline_box.show()
+        if not from_window:
+            win.close()
+        win.deleteLater()
 
     def _run_start(self):
         """start of the run being received now, or of the latest one"""
@@ -2520,9 +2596,12 @@ class Tracker(QtWidgets.QMainWindow):
     def closeEvent(self, e):
         theme.save_ui(window=bytes(self.saveGeometry().toBase64()).decode())   # (dividers save as they are dragged)
         self.receiver.shutdown()
-        for win in (self.sky, self.globe, self.sat_info, self.signal_win):      # separate windows: close them too
-            if win is not None:
-                win.close()
+        self.deck.close_windows()           # popped-out views (they go back in, remembering where their windows were)
+        self.spectrum.close_windows()
+        if self.timeline_win is not None:
+            self.timeline_win.close()
+        if self.sat_info is not None:       # the satellite info window
+            self.sat_info.close()
         super().closeEvent(e)
 
     # ---- lists

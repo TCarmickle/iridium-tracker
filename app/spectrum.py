@@ -41,6 +41,7 @@ class SpectrumView(QtWidgets.QWidget):
     framesChanged = QtCore.pyqtSignal()
     listenPicked = QtCore.pyqtSignal(float)     # a click chose the frequency to listen to (Hz)
     bandwidthPicked = QtCore.pyqtSignal(float)  # an edge of the tuned channel was dragged: its new width (Hz)
+    rangePicked = QtCore.pyqtSignal(float, float)   # the dB scale was dragged: its new (bottom, top)
     EDGE_PX = 6                                 # this close to an edge of the yellow band grabs it
 
     def __init__(self):
@@ -76,6 +77,9 @@ class SpectrumView(QtWidgets.QWidget):
         self.trace_frac = 0.42
         self.set_section('tracker')
         self.split_drag = False
+        self.part = 'both'          # what this view draws: 'both', just the 'trace' or just the 'water'fall
+        self.frames = 0
+        self.db_drag = None         # dragging the dB scale: ('hi' or 'lo', y pressed, dB range then)
         self.dirty = False
         t = QtCore.QTimer(self)
         t.timeout.connect(self._repaint)
@@ -194,15 +198,41 @@ class SpectrumView(QtWidgets.QWidget):
         self.dirty = True
 
     def _top_h(self):
+        if self.part == 'trace':            # the waveform alone: all of the height (the scale under it)
+            return self.height() - AXIS_H
+        if self.part == 'water':            # the waterfall alone: the scale at the top
+            return 0
         return int(self.height() * self.trace_frac)
 
     def _on_split(self, y):
+        if self.part != 'both':
+            return False
         top = self._top_h()
         return top - 2 <= y <= top + AXIS_H + 2
+
+    # ---- the dB scale (left edge of the waveform): drag its top half to move the top of the range, its bottom
+    # half to move the bottom (finer control of the waveform - turns Auto range off); the wheel there zooms it
+    DB_AXIS_W = 46
+
+    def _on_db_axis(self, x, y):
+        return self.n and self.part != 'water' and x <= self.DB_AXIS_W and 0 <= y < self._top_h()
+
+    def _set_db(self, lo, hi):
+        if hi - lo < 6:
+            return
+        self.auto = False
+        self.set_range(lo, hi)
+        self.rangePicked.emit(self.db_lo, self.db_hi)
 
     # ---- mouse
     def wheelEvent(self, e):
         if not self.n:
+            return
+        if self._on_db_axis(e.pos().x(), e.pos().y()):     # over the dB scale: zoom the range about the mouse
+            top = self._top_h()
+            db = self.db_hi - e.pos().y() / max(1, top) * (self.db_hi - self.db_lo)
+            k = 0.85 if e.angleDelta().y() > 0 else 1 / 0.85
+            self._set_db(db - (db - self.db_lo) * k, db + (self.db_hi - db) * k)
             return
         if e.pos().y() < self._top_h():     # over the trace: step the tuned listening frequency
             self._tune_wheel(e)
@@ -264,6 +294,11 @@ class SpectrumView(QtWidgets.QWidget):
         return min(max(bw, 100.0), 250e3)
 
     def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self._on_db_axis(e.pos().x(), e.pos().y()):
+            self.db_drag = ('hi' if e.pos().y() < self._top_h() / 2 else 'lo', e.pos().y(), self.db_lo, self.db_hi)
+            self.drag = self.edge_drag = None
+            self.split_drag = False
+            return
         self.split_drag = e.button() == Qt.LeftButton and self.n > 0 and self._on_split(e.pos().y())
         self.edge_drag = None if self.split_drag or e.button() != Qt.LeftButton else self._edge_at(e.pos().x())
         self.drag = None if self.edge_drag or self.split_drag else (e.pos().x(), self._span())
@@ -271,6 +306,15 @@ class SpectrumView(QtWidgets.QWidget):
 
     def mouseMoveEvent(self, e):
         self.mouse = e.pos()
+        if self.db_drag:                            # the dB scale: pull the top (or bottom) of the range
+            end, y0, lo0, hi0 = self.db_drag
+            ddb = (e.pos().y() - y0) / max(1, self._top_h()) * (hi0 - lo0)
+            if end == 'hi':
+                self._set_db(lo0, max(hi0 - ddb, lo0 + 6))     # drag down: the top comes down
+            else:
+                self._set_db(min(lo0 - ddb, hi0 - 6), hi0)     # drag up: the bottom comes up
+            self.dirty = True
+            return
         if self.split_drag:                         # the bar between trace and waterfall: resizing them
             self.trace_frac = min(max(e.pos().y() / max(1, self.height()), TRACE_MIN), TRACE_MAX)
             self.dirty = True
@@ -282,7 +326,8 @@ class SpectrumView(QtWidgets.QWidget):
             self.dirty = True
             return
         if not e.buttons():
-            self.setCursor(Qt.SizeVerCursor if self.n and self._on_split(e.pos().y()) else
+            self.setCursor(Qt.SizeVerCursor if self.n and (self._on_split(e.pos().y()) or
+                                                          self._on_db_axis(e.pos().x(), e.pos().y())) else
                            Qt.SizeHorCursor if self._edge_at(e.pos().x()) else Qt.ArrowCursor)
         if self.drag and e.buttons() & Qt.LeftButton and self.view:
             x0, (f0, f1) = self.drag
@@ -295,6 +340,9 @@ class SpectrumView(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, e):
         self.drag = None
+        if self.db_drag:
+            self.db_drag = None
+            return
         if self.split_drag:
             self.split_drag = False
             import theme
@@ -344,7 +392,9 @@ class SpectrumView(QtWidgets.QWidget):
         a, b = self._bins()
         f0, f1 = self._span()
 
-        # band sections and grid behind the trace
+        # band sections and grid behind the trace (kept inside the trace's own area)
+        p.save()
+        p.setClipRect(QtCore.QRectF(0, 0, w, top_h))
         for lo, hi, name, col, row in BANDS:
             x0, x1 = self.x_of(lo * 1e6, w), self.x_of(hi * 1e6, w)
             if x1 < 0 or x0 > w:
@@ -397,6 +447,7 @@ class SpectrumView(QtWidgets.QWidget):
             p.setPen(QtGui.QPen(QtGui.QColor(150, 210, 255), 1.3))
             p.setBrush(Qt.NoBrush)
             p.drawPolyline(QtGui.QPolygonF(pts))
+        p.restore()
         cx = self.x_of(self.center, w)
         p.setPen(QtGui.QPen(QtGui.QColor(255, 107, 107, 120), 1, Qt.DashLine))
         p.drawLine(QPointF(cx, 0), QPointF(cx, top_h))
@@ -435,10 +486,20 @@ class SpectrumView(QtWidgets.QWidget):
         p.fillRect(QtCore.QRectF(0, top_h, w, axis_h), QtGui.QColor(PANEL))
         # the grip: this bar can be dragged up or down to give the trace or the waterfall more room
         hot = self.split_drag or (self.mouse is not None and self._on_split(self.mouse.y()))
-        p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 60) if hot else QtGui.QColor(MUTED), 1.5))
-        for dy in (5, 9, 13):
-            p.drawLine(QPointF(8, top_h + dy), QPointF(22, top_h + dy))
-            p.drawLine(QPointF(w - 22, top_h + dy), QPointF(w - 8, top_h + dy))
+        if self.part == 'both':             # (one part alone: nothing to share)
+            p.setPen(QtGui.QPen(QtGui.QColor(255, 210, 60) if hot else QtGui.QColor(MUTED), 1.5))
+            for dy in (5, 9, 13):
+                p.drawLine(QPointF(8, top_h + dy), QPointF(22, top_h + dy))
+                p.drawLine(QPointF(w - 22, top_h + dy), QPointF(w - 8, top_h + dy))
+        # the dB scale lights up under the mouse: it can be dragged (top half: the top, bottom half: the bottom)
+        if self.db_drag or (self.mouse is not None and self._on_db_axis(self.mouse.x(), self.mouse.y())):
+            end = self.db_drag[0] if self.db_drag else ('hi' if self.mouse.y() < top_h / 2 else 'lo')
+            y0 = 0 if end == 'hi' else top_h / 2
+            p.fillRect(QtCore.QRectF(0, y0, self.DB_AXIS_W, top_h / 2), QtGui.QColor(255, 210, 60, 28))
+            p.setPen(QtGui.QColor(255, 210, 60))
+            p.drawText(QtCore.QRectF(2, y0 + (2 if end == 'hi' else top_h / 2 - 16), self.DB_AXIS_W + 120, 14),
+                       Qt.AlignLeft | Qt.AlignVCenter, '↕ drag: %s %.0f dB' % (
+                           'top' if end == 'hi' else 'bottom', self.db_hi if end == 'hi' else self.db_lo))
         f = np.ceil(f0 / fstep) * fstep
         p.setPen(QtGui.QColor(MUTED))
         while f <= f1:
@@ -471,6 +532,46 @@ class SpectrumView(QtWidgets.QWidget):
         elif self.view:
             p.setPen(QtGui.QColor(MUTED))
             p.drawText(QPointF(w - 230, 30), 'zoomed - double-click to show all')
+
+
+class SpectrumMirror(SpectrumView):
+    """a second look at a SpectrumView's live data - its waveform or its waterfall alone, in a window of its own.
+    Everything about what is received and listened to is the main view's (shared, both ways); the mouse, drags
+    and repainting are its own."""
+    SHARED = ('center', 'rate', 'n', 'trace', 'peak', 'avg', 'water', 'water_db', 'last_frame', 'paused', 'auto',
+              'peak_hold', 'db_lo', 'db_hi', 'view', 'listen_hz', 'passband', 'bookmarks', 'frames', 'pan_retune',
+              'lut')
+
+    def __init__(self, master, part):
+        QtWidgets.QWidget.__init__(self)
+        self.master = master
+        self.part = part
+        self.setMinimumHeight(120)
+        self.setMouseTracking(True)
+        self.drag = self.mouse = self.edge_drag = self.db_drag = None
+        self.split_drag = False
+        self.pan_df = 0.0
+        self.trace_frac, self.section = 0.42, 'mirror'
+        self.dirty = True
+        self.seen = -1
+        # its clicks and drags act on the main view's listening (the panel is connected to those)
+        self.listenPicked.connect(master.listenPicked)
+        self.bandwidthPicked.connect(master.bandwidthPicked)
+        self.rangePicked.connect(master.rangePicked)
+        t = QtCore.QTimer(self)
+        t.timeout.connect(self._repaint)
+        t.start(66)
+
+    def _repaint(self):
+        if self.dirty or self.master.frames != self.seen or self.master.dirty:
+            self.seen = self.master.frames
+            self.dirty = False
+            self.update()
+
+
+for _name in SpectrumMirror.SHARED:         # (each shared value is read and written on the main view)
+    setattr(SpectrumMirror, _name, property(lambda self, n=_name: getattr(self.master, n),
+                                            lambda self, v, n=_name: setattr(self.master, n, v)))
 
 
 class SpectrumPanel(QtWidgets.QWidget):
@@ -517,18 +618,86 @@ class SpectrumPanel(QtWidgets.QWidget):
         self.pause = QtWidgets.QPushButton('Pause')
         self.pause.setCheckable(True)
         self.pause.toggled.connect(lambda on: setattr(self.view, 'paused', on))
+        # the waveform or the waterfall can each go into a window of their own
+        import popout
+        self.popped = {}            # part -> (its window, its mirror view)
+        self.pop_btns = {}
+        for part, label, tip in (('trace', 'Waveform', 'the spectrum line'), ('water', 'Waterfall', 'the waterfall')):
+            b = QtWidgets.QToolButton()
+            b.setText('%s %s' % (popout.POP, label))
+            b.setToolTip('Pop %s out into a window of its own (close that window to bring it back)' % tip)
+            b.clicked.connect(lambda _, part=part: self.pop_out(part))
+            self.pop_btns[part] = b
         bar.addWidget(title)
         bar.addSpacing(10)
         bar.addWidget(self.info, 1)
-        for wdg in (self.sound, self.volume, self.audio_btn, self.auto, self.lo, self.hi, self.peak, self.pause):
+        for wdg in (self.sound, self.volume, self.audio_btn, self.auto, self.lo, self.hi, self.peak, self.pause,
+                    self.pop_btns['trace'], self.pop_btns['water']):
             bar.addWidget(wdg)
+        self.both_out = popout.placeholder('The waveform and the waterfall are in their own windows.',
+                                           self.dock_all)
+        self.both_out.hide()
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(0, 4, 0, 0)
         lay.addLayout(bar)
         lay.addWidget(self.view, 1)
+        lay.addWidget(self.both_out, 1)
+        self.view.rangePicked.connect(self._range_picked)
         t = QtCore.QTimer(self)
         t.timeout.connect(self._update_info)
         t.start(500)
+
+    # ---- pop-outs
+    def pop_out(self, part):
+        """the waveform ('trace') or the waterfall ('water') in a window of its own; the panel keeps the other"""
+        import popout
+        if part in self.popped:
+            win = self.popped[part][0]
+            win.showNormal()
+            win.raise_()
+            return
+        mirror = SpectrumMirror(self.view, part)
+        title = 'Waveform (spectrum)' if part == 'trace' else 'Waterfall'
+        win = popout.PopWindow('spectrum_' + part, title, mirror, size=(1200, 380 if part == 'trace' else 520))
+        win.closed.connect(lambda: self._docked(part))
+        self.popped[part] = (win, mirror)
+        self._parts()
+        win.show()
+
+    def _docked(self, part):
+        got = self.popped.pop(part, None)
+        if got:
+            got[0].deleteLater()
+        self._parts()
+
+    def dock_all(self):
+        for part in list(self.popped):
+            self.popped[part][0].close()
+
+    close_windows = dock_all
+
+    def _parts(self):
+        """what the panel's own view shows: whatever is not popped out"""
+        out = set(self.popped)
+        self.view.part = 'both' if not out else 'water' if out == {'trace'} else 'trace' if out == {'water'} else None
+        both = self.view.part is None
+        self.view.setVisible(not both)
+        self.both_out.setVisible(both)
+        if not both:
+            self.view.dirty = True
+        for part, b in self.pop_btns.items():
+            b.setDown(part in out)
+
+    def _range_picked(self, lo, hi):
+        """the dB scale was dragged: the numbers follow, Auto range off (numbers first: switching Auto off applies
+        the boxes' values, and old ones there would undo the drag)"""
+        for sb, val in ((self.lo, lo), (self.hi, hi)):
+            sb.blockSignals(True)
+            sb.setValue(int(round(val)))
+            sb.blockSignals(False)
+        if self.auto.isChecked():
+            self.auto.setChecked(False)
+            self.view.set_range(lo, hi)     # (the boxes hold whole dB; keep the exact range dragged)
 
     def attach_sound(self, player):
         """connect the sound controls to a sound.SoundPlayer"""
