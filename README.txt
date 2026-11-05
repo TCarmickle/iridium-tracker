@@ -240,15 +240,26 @@ and messaging channels are shaded green, the phone channels blue.
 
 THE CONSOLE (more detail)
 -------------------------
-Double-click "Iridium Console.bat" for a burst-by-burst view, like a radio log:
-every decoded frame with its type, signal strength and frequency, ring alerts with the
-satellite's name and position, damaged bursts, and the decoder's own status every 10 s.
-- It watches whatever the tracker's receiver is decoding, so you can run both together.
-- Or press R in the console to receive from there without the tracker (close the
-  tracker's receiver first). Press R again or Q to stop; the capture goes into the catalog.
-- B turns beeps on/off (short = damaged, long = decoded, extra long = ring alert with a
-  position). D shows/hides damaged bursts.
-- To list a finished capture:  Iridium Console.bat --capture output-<date-time>
+Double-click "Satellite Console.bat" for a line-by-line view of the receiver, like a radio log,
+on whichever band it is on (shown at the top, with the frequency it is tuned to):
+- Iridium: every decoded frame with its type, signal and frequency, ring alerts with the
+  satellite's name and position, damaged bursts, and the decoder's status every 10 s.
+- Orbcomm: each packet, and the satellites' own positions (ephemeris packets).
+- ISS / ham: each frame with the satellite and callsign (never its contents).
+- GNSS (GPS, Galileo, WAAS, GLONASS): each satellite as it is acquired, then its signal
+  (dB-Hz), Doppler and lock every 15 s, when it is lost, its broadcast orbit as it is
+  decoded, and the receiver's own position fixes.
+- It watches whatever the tracker's receiver is doing, so you can run both together.
+- Or receive from the console without the tracker (close the tracker's receiver first):
+  press 1-6 to choose the band (Iridium, Orbcomm, ISS & ham 2 m, ham 70 cm, GPS L1,
+  GLONASS L1 - it starts on the tracker's last one), then R. Press R again or Q to stop;
+  the capture goes into the catalog. The choice is the console's only: the tracker keeps its own.
+- B turns beeps on/off (short = not decoded, long = decoded, extra long = a position).
+  D shows/hides what was heard but not decoded.
+- From the command line: Satellite Console.bat --band gnss1 --receive
+  (bands: iridium orbcomm ham2m ham70 gnss1 glo1)
+- To list a finished capture:  Satellite Console.bat --capture output-<date-time>
+  (or gnss-..., glo-..., orbcomm-..., ham2m-..., ham70-...)
 
 
 YOUR DATA (all in the data folder, next to app)

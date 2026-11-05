@@ -2826,7 +2826,7 @@ class Tracker(QtWidgets.QMainWindow):
         self._check_new_satellites()
         queue, self.data.frame_queue = self.data.frame_queue, []
         if queue and not self.receiver.busy:
-            # another program is receiving (e.g. the Iridium Console): its frames arrive here in batches,
+            # another program is receiving (e.g. the Satellite Console): its frames arrive here in batches,
             # so spread their flashes over the time until the next look
             queue = queue[-200:]
             for i, (kind, line) in enumerate(queue):
@@ -2851,7 +2851,7 @@ class Tracker(QtWidgets.QMainWindow):
         if not self.receiver.busy:
             outside = writing and not (d.live_cap or '').endswith(str(self.receiver.stamp))   # not our own last run
             if outside:
-                self.rx_status.setText('Another receiver is running (%s) - stop it (Iridium Console or another '
+                self.rx_status.setText('Another receiver is running (%s) - stop it (Satellite Console or another '
                                        'tracker window) before starting the receiver here' % self.data.live_cap)
             elif not self.receiver.stamp or self.rx_status.text().startswith('Another receiver'):
                 self.rx_status.setText(self._source_text())     # (after a run here, its result message stays up)

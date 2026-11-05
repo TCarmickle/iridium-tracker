@@ -1,4 +1,4 @@
-r"""The Iridium receiver, run from the tracker or the console. Files go to data\captures:
+r"""The receiver (every band in systems.ORDER), run from the tracker or the console. Iridium's files go to data\captures:
 
   iridium-extractor (gr-iridium)  SDR samples -> raw bursts      -> output-<stamp>.bits
   iridium-parser (iridium-toolkit) raw bursts -> decoded frames  -> output-<stamp>.live
@@ -100,7 +100,8 @@ class Receiver(QtCore.QObject):
         return self.state != 'idle'
 
     # ---- start
-    def start(self):
+    def start(self, band=None):
+        """band: a systems.ORDER key to receive this time (the console's choice), instead of the tracker's saved one"""
         if self.busy:
             return
         need = storage.settings()['min_free_gb']
@@ -109,6 +110,8 @@ class Receiver(QtCore.QObject):
             return
         self.stamp = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
         self.sdr = sdr_settings.load()
+        if band:
+            self.sdr['system'] = band
         self.system = systems.get('iridium' if self.replay else self.sdr['system'])
         self.capname = self.system['capture_prefix'] + self.stamp
         os.makedirs(paths.CAPTURES, exist_ok=True)
@@ -139,7 +142,7 @@ class Receiver(QtCore.QObject):
         if self.replay:
             self.extractor.start(PY, ['-c', REPLAY_CODE, self.replay])
         else:
-            s = self.sdr = sdr_settings.load()
+            s = self.sdr
             conf = sdr_settings.write_conf(s, os.path.join(paths.DATA, 'sdr.conf'))
             args = [SOURCE, conf, '%g' % s['threshold_db'], '--ppm', '%g' % s['ppm']]
             if self.spectrum_port:
@@ -324,7 +327,7 @@ class Receiver(QtCore.QObject):
             if 'Failed to open' in self.stop_reason or 'usb_claim' in self.stop_reason:
                 self.stop_reason = ('the SDR (%s) could not be opened - is it plugged in, and are SDR++, SatDump '
                                     % self.sdr['device'] +
-                                    'and other receivers (like the Iridium Console) closed?')
+                                    'and other receivers (like the Satellite Console) closed?')
         if self.state != 'stopping':
             return
         self.timer.stop()
