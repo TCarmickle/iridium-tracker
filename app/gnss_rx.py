@@ -67,6 +67,10 @@ ap.add_argument('--rate', type=float, default=2048000)
 ap.add_argument('--center', type=float, default=1575.42e6)
 ap.add_argument('--gain', type=float, default=40.0)
 ap.add_argument('--auto-gain', action='store_true')
+# E4000 tuner: its IF gain left at the driver's default leaves the samples at ~0.6% of the ADC's range (under
+# one 8-bit step), losing weak signals in the rounding; 60 dB lifts them to ~10% (measured on GPS: 5 satellites
+# at ~37 dB-Hz instead of 0-2 at ~33). Other tuners ignore it.
+ap.add_argument('--if-gain', type=float, default=60.0)
 ap.add_argument('--ppm', type=float, default=0.0)
 ap.add_argument('--no-dc', action='store_true')
 ap.add_argument('--start-file', default='')
@@ -493,6 +497,8 @@ class Receiver(gr.top_block):
         else:
             _try('Gain: manual', src.set_gain_mode, False, 0)
             _try('Gain: %.1f dB' % opts.gain, src.set_gain, opts.gain, 0)
+            if opts.if_gain:
+                _try('IF gain: %.1f dB' % opts.if_gain, src.set_if_gain, opts.if_gain, 0)
         _try('DC correction: %s' % ('off' if opts.no_dc else 'on'), src.set_dc_offset_mode, 0 if opts.no_dc else 2, 0)
         self.writer = sink
         self.connect(src, self.writer)
