@@ -411,6 +411,13 @@ This package contains open-source software; see the LICENSES folder.
 The tracker itself (the files in app\ other than iridium-toolkit and orbcomm) is free software under the
 GNU General Public License v3 (LICENSES\GPL-3.0.txt). The source code is the .py files in app\.
 
+CATALOG SAFETY
+--------------
+data\catalog-data.json (everything received) is saved to a temporary file first and swapped in,
+with the previous good copy kept as catalog-data.previous.json; if the main file can't be read,
+the previous copy is used. (Before this, an interrupted save on 5 Nov 2026 cut the file off and the
+tracker showed no history until it was repaired: the complete entries were recovered and the
+captures still on disk were analyzed again.)
 PC CLOCK FROM GPS
 -----------------
 While the GNSS L1 (GPS) receiver has a position fix, Settings (the cog) > PC clock shows how far
@@ -418,6 +425,21 @@ this PC's clock is from GPS time (accurate to a few milliseconds - the receiver 
 from the SDR's sample count). 'Set PC clock to GPS time' moves the Windows clock by that much;
 Windows asks for permission first.
 
+YOUR POSITION ACCURACY
+----------------------
+In the Navigation view, under the number boxes: how good your own GNSS position is, from the last
+10 minutes of position fixes (hover it for the breakdown):
+  - 95 % radius (R95): 95 % of the fixes fall within this distance of their middle - the usual
+    GPS accuracy figure - graded under 5 m excellent, 10 good, 25 fair, 50 poor, beyond that bad;
+    CEP50 is the radius holding half of them; the height wanders about twice as much.
+  - Drift: how far the middle of the fixes moved over the window (the first two minutes against
+    the last two). The antenna doesn't move, so this is the satellites and the atmosphere.
+  - HDOP: the satellites' geometry, from their own orbits. Spread over the sky is good (under 2);
+    bunched up is poor (over 5). Expected 95 % error ~ 2 x HDOP x 5 m.
+  - From home: the middle of the fixes against the location in Settings.
+Measured here with the current antenna (4-6 satellites): about 20-25 m (95 %), half within
+6-9 m, drift 2-5 m over 8 minutes. Needs 30 fixes; fixes a second apart aren't independent, so
+the full 10 minutes gives the honest figure.
 JAMMING AND SPOOFING WATCH (Integrity section)
 ----------------------------------------------
 The Integrity section (header button) watches the GNSS L1 (GPS) band - GPS, Galileo and WAAS -

@@ -538,8 +538,12 @@ class Data:
         path = catalog.DATA
         try:
             self.cat_mtime = os.path.getmtime(path)
-            caps = json.load(open(path))
-        except (OSError, ValueError):
+        except OSError:
+            pass
+        try:
+            caps = catalog.load_data()      # (the previous good copy if the file was cut off)
+        except (OSError, ValueError, SystemExit) as e:
+            print('catalog: %s' % e)
             caps = {}
         self.captures, self.fixes = [], []
         self.gnss_eph, self.gnss_fixes = {}, []
@@ -2092,6 +2096,17 @@ class Tracker(QtWidgets.QMainWindow):
         rv = QtWidgets.QVBoxLayout(right)
         rv.addLayout(sys_row)
         rv.addLayout(stat_row)
+        # how good your own GNSS position is (scatter, drift, satellite geometry): shown with the GNSS satellites
+        self.pos_label = QtWidgets.QLabel()
+        self.pos_label.setWordWrap(True)
+        self.pos_label.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)
+        theme.style(self.pos_label, 'QLabel { background: %(SURFACE)s; border: 1px solid %(BORDER)s; '
+                                    'border-radius: 4px; padding: 4px 8px; }')
+        self.pos_label.hide()
+        rv.addWidget(self.pos_label)
+        self.pos_timer = QtCore.QTimer(self)
+        self.pos_timer.timeout.connect(self._update_position_quality)
+        self.pos_timer.start(2000)
         rv.addWidget(self.summary)
         rv.addWidget(self.table, 1)
         rv.addWidget(self.detail_scroll, 1)
@@ -2379,6 +2394,50 @@ class Tracker(QtWidgets.QMainWindow):
             return o if float(np.asarray(o.sigma_km(time.time())).reshape(-1)[0]) < 20 else None
         except Exception:
             return None
+
+    def _update_position_quality(self):
+        """the 'Your position' line in the GNSS view: accuracy from the scatter of your recent fixes, their drift and
+        the tracked satellites' geometry (posquality.py)"""
+        show = self.view_key() == 'gnss'
+        self.pos_label.setVisible(show)
+        if not show:
+            return
+        import posquality
+        import integrity
+        now = time.time()
+        home = (HOME_LAT, HOME_LON, HOME_H) if catalog.HOME else None
+        fixes = self.data.gnss_fixes
+        last = max((f['t'] for f in fixes), default=None)
+        live = last is not None and now - last < 60
+        azel = []
+        if live and home:       # the geometry of the satellites tracked now (their own broadcast orbits)
+            for name, i in self.data.info.items():
+                sat, cur = i.get('sat'), i.get('now')
+                if not sat or not cur or sat[0] == 'S' or now - cur['t'] > 10:
+                    continue
+                o = self._gnss_orbit_of(sat)
+                if o is None:
+                    continue
+                try:
+                    el, az, _ = integrity.enu(home, o.ecef(cur['t']))
+                except Exception:
+                    continue
+                if el > 0:
+                    azel.append((az, el))
+        try:
+            q = posquality.quality(fixes, None, home, azel)
+        except Exception as e:
+            q = None
+            print('position quality: %r' % e)
+        text = posquality.headline(q)
+        if q and q.get('t_last') and not live:
+            text += '  ·  (from your last fixes, %s)' % time.strftime('%d %b %H:%M', time.localtime(q['t_last']))
+        col = {'excellent': GOOD, 'good': GOOD, 'fair': theme.PAL['WARN'], 'poor': theme.PAL['ALERT'],
+               'bad': theme.PAL['ALERT']}.get(q.get('grade') if q else None, MUTED)
+        head, _, rest = text.partition('  ·  ')
+        self.pos_label.setText('<span style="color:%s; font-weight:600">%s</span>%s' % (
+            col, head, ('<span style="color:%s">  ·  %s</span>' % (MUTED, rest)) if rest else ''))
+        self.pos_label.setToolTip(posquality.details(q))
 
     def _integrity_running(self, on):
         """the receiver started / stopped: the Integrity watch follows (with the receiver's settings, which go into

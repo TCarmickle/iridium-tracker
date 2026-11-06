@@ -11,8 +11,9 @@ import storage
 def catalogued():
     """names of the captures already in the catalog"""
     try:
-        return set(json.load(open(os.path.join(paths.DATA, 'catalog-data.json'))))
-    except (OSError, ValueError):
+        import catalog
+        return set(catalog.load_data())
+    except (OSError, ValueError, SystemExit):
         return set()
 
 

@@ -106,8 +106,8 @@ class Names:
     def __init__(self):
         self.by_net, self.by_slot, self.orbcomm, self._tles = {}, {}, {}, None
         try:
-            caps = json.load(open(catalog.DATA))
-        except (OSError, ValueError):
+            caps = catalog.load_data()
+        except (OSError, ValueError, SystemExit):
             caps = {}
         for c in caps.values():
             oc = c.get('system') == 'orbcomm'

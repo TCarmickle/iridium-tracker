@@ -46,6 +46,7 @@ def tle_file(system='iridium'):
 
 SATDUMP_TLES = os.path.join(os.environ.get('APPDATA', ''), 'satdump', 'satdump_tles.txt')
 DATA = os.path.join(paths.DATA, 'catalog-data.json')
+PREVIOUS = os.path.join(paths.DATA, 'catalog-data.previous.json')     # the last good one before each save
 REPORT = os.path.join(paths.DATA, 'catalog.txt')
 SETTINGS = os.path.join(paths.DATA, 'settings.json')
 
@@ -671,12 +672,48 @@ def build_report(caps):
     return '\n'.join(out) + '\n'
 
 
+def load_data():
+    """catalog-data.json; if it can't be read (cut off by an interrupted save), the previous good copy"""
+    for path in (DATA, PREVIOUS):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            if path != DATA:
+                print('catalog-data.json could not be read - using the previous copy (%s)' % path)
+            return data
+        except ValueError:
+            continue
+    if os.path.exists(DATA):    # unreadable and no good copy: stop rather than start the catalog from nothing
+        sys.exit('catalog-data.json can not be read and there is no good previous copy - see README (recovery)')
+    return {}
+
+
+def save_data(data):
+    """written to a temporary file first and swapped in, the old one kept as the previous copy: an interrupted
+    save (the PC or app closing mid-write) leaves a whole file behind, never a cut-off one"""
+    tmp = DATA + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, separators=(',', ':'))
+        f.flush()
+        os.fsync(f.fileno())
+    if os.path.exists(DATA):
+        try:
+            with open(DATA) as f:
+                json.load(f)                # (keep the old one as the previous copy only if it is whole)
+            os.replace(DATA, PREVIOUS)
+        except ValueError:
+            pass
+    os.replace(tmp, DATA)
+
+
 def main():
     if HOME is None:
         sys.exit('No antenna location yet - start the tracker once and enter it (it is saved in settings.json).')
     redo = '--redo' in sys.argv
     ready = {a[8:] for a in sys.argv if a.startswith('--ready=')}   # captures known to be finished
-    data = json.load(open(DATA)) if os.path.exists(DATA) else {}
+    data = load_data()
     if redo and data:     # captures whose files are gone keep their old results
         shutil.copy(DATA, DATA[:-5] + '.backup.json')
     sats = {s['key']: None for s in systems.ORDER}     # loaded when first needed
@@ -716,7 +753,7 @@ def main():
         if not src.endswith(storage.REDUCED):
             storage.write_reduced(stem, src, cap['counts'], cap['hours'])
         data[name] = cap
-    json.dump(data, open(DATA, 'w'), separators=(',', ':'))
+    save_data(data)
     caps = [c for _, c in sorted(data.items()) if sum(c['counts'].values()) and c.get('system', 'iridium') == 'iridium']
     open(REPORT, 'w').write(build_report(caps))     # the text report covers Iridium
     print('catalog written to %s' % REPORT)
