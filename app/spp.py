@@ -41,6 +41,7 @@ IONO_TIMEOUT_S = 600.0
 IONO_H = 350000.0
 HDOP_MAX = 6.0                  # worse geometry than this: no fix (satellites nearly in a line or a plane)
 READY_SMOOTH = 30               # seconds of smoothing before a satellite counts as settled
+SETTLE_S = 30                   # seconds after a satellite locks before its smoothing starts (code loop settling)
 
 
 # ---------------------------------------------------------------- geometry
@@ -294,8 +295,9 @@ class Sbas:
 class Solver:
     """modes: iono 'klobuchar' | 'sbas' | 'none'; sbas_orbit (fast + long-term corrections); smooth (carrier)"""
 
-    def __init__(self, iono='sbas', sbas_orbit=True, smooth=True, systems='GE'):
+    def __init__(self, iono='sbas', sbas_orbit=True, smooth=True, systems='GE', settle=None):
         self.iono_mode, self.sbas_orbit, self.smooth, self.systems = iono, sbas_orbit, smooth, systems
+        self.settle = SETTLE_S if settle is None else settle
         self.ephs = {}                  # sat -> {iode: eph} (WAAS long-term corrections name the IODE they fix)
         self.ion = None                 # Klobuchar numbers
         self.sbas = {}                  # WAAS PRN -> Sbas (each GEO's own corrections; the freshest is used)
@@ -379,11 +381,14 @@ class Solver:
         for o in obs:
             s, h = o['sat'], self.hatch.get(o['sat'])
             if h and abs((o['P'] - h[1]) - lam[s] * (o['L'] - h[2]) - common) < SLIP_M and o['L'] != 0:
-                n = min(h[3] + 1, SMOOTH_N)
+                age = h[4] + 1
+                # a newly locked satellite's code range is still settling (pocket_trk's code loop pulling in):
+                # smoothing starts only once it has been tracked SETTLE_S, or that start would stay in the average
+                n = min(h[3] + 1, SMOOTH_N) if age > self.settle else 1
                 ps = o['P'] / n + (n - 1) / n * (h[0] + lam[s] * (o['L'] - h[2]) + common)
             else:
-                n, ps = 1, o['P']
-            self.hatch[s] = [ps, o['P'], o['L'], n]
+                n, ps, age = 1, o['P'], 0
+            self.hatch[s] = [ps, o['P'], o['L'], n, age]
             out[s] = (ps, n)
         for s in [s for s in self.hatch if s not in out]:
             del self.hatch[s]

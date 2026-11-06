@@ -452,10 +452,13 @@ pocket_trk's raw measurements, in two steps pocket_trk doesn't take:
 WAAS doesn't give a position by itself; it corrects the GPS satellites. Its fixes (GSPP lines,
 kept in the catalog) are used by the 'Your position' line and 'Use GPS-tracked position' when
 there are enough; the line then says 'WAAS-corrected' and shows pocket_trk's own figure next to it.
-Measured on 9 recorded sessions here: 95 % within 5-16 m (pocket_trk 11-32 m), half within
-1-4 m (pocket_trk 4-9 m), and the sessions' middle positions agree with each other to 2.2 m rms
-(pocket_trk 3.2 m). Fixes start once 4 satellites have been smoothed for 30 s, and only with
-good geometry (HDOP 6 or better). GPS's own ionosphere model is kept in data\gnss-solver.json
+Measured on 8 recorded sessions here: 95 % within 3-10 m (pocket_trk 11-30 m), half within
+1-4 m (pocket_trk 4-9 m), and the sessions' middle positions agree with each other to 1.4 m rms
+horizontally and 5 m in height (pocket_trk 2.4 m and 8.5 m). Each satellite is left to settle
+for 30 s after it locks before its smoothing starts (a just-locked satellite's code range is
+still pulling in, and that start would stay in the average - seen against a Garmin GPSMAP 64st
+beside the antenna); fixes then start once 4 satellites have been smoothed for 30 s (about two
+minutes after starting the receiver), and only with good geometry (HDOP 6 or better). GPS's own ionosphere model is kept in data\gnss-solver.json
 between sessions. Galileo joins when 2 or more Galileo satellites have decoded orbits.
 JAMMING AND SPOOFING WATCH (Integrity section)
 ----------------------------------------------
