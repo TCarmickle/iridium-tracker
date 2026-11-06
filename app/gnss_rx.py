@@ -35,11 +35,17 @@ Lines (from its log):
                                            the strongest narrowband peak above the baseline's shape (dB, where),
                                            the median rise across the band; learning = 1 while the baseline is
                                            first learned (then the comparisons are 0)
+  GSPEC: t f_lo_mhz f_hi_mhz v1,v2,...     with each GNOISE (once learned): the spectrum against the baseline
+                                           in 128 bins from f_lo to f_hi, tenths of a dB (each bin the max of
+                                           its group)
+With --snap-trigger, the last 20 s of raw samples are kept in memory and saved, with the next 20 s, when the
+tracker asks (IQRecorder: an Integrity event began).
 """
 import argparse
 import collections
 import ctypes
 import datetime
+import json
 import os
 import queue
 import subprocess
@@ -69,6 +75,7 @@ CHUNK_S = 180.0
 WAAS_PRNS = '131,133,135,138'
 SIGNALS = ['-sig', 'L1CA', '-prn', '1-32,' + WAAS_PRNS, '-sig', 'E1B', '-prn', '1-36']
 NOISE = None                    # the band's noise meter (main)
+SNAP = None                     # the raw-sample recorder for Integrity events (main)
 GPS_UTC_S = 18                  # GPS time runs this far ahead of UTC (leap seconds)
 GPS_EPOCH = datetime.datetime(1980, 1, 6, tzinfo=datetime.timezone.utc)
 
@@ -93,6 +100,7 @@ ap.add_argument('--keep-chunks', default='')    # for tests: keep the recorded c
 ap.add_argument('--mode', choices=('live', 'chunks'), default='live')
 ap.add_argument('--noise-baseline', default='')     # the quiet band's noise, learned and kept here (.npz)
 ap.add_argument('--no-noise', action='store_true')  # no GNOISE lines
+ap.add_argument('--snap-trigger', default='')       # raw samples around events: IQRecorder's trigger file
 ap.add_argument('--constellation', choices=('gps', 'glonass', 'beidou'), default='gps')   # gps = GPS + Galileo + WAAS
 opts = ap.parse_args()
 if opts.constellation == 'glonass':     # every frequency channel (the SDR's slice holds the middle ones);
@@ -127,11 +135,12 @@ class Quantizer:
         self.rms = None
 
     def __call__(self, x):
-        if NOISE:
-            try:
-                NOISE(x)
-            except Exception as e:      # the watch must never stop the tracking
-                log('GNSS noise: %r' % e)
+        for watch in (NOISE, SNAP):
+            if watch:
+                try:
+                    watch(x)
+                except Exception as e:      # the watch must never stop the tracking
+                    log('GNSS watch: %r' % e)
         # 8 bits are plenty for signals under the noise: scale the noise to ~+-24 so it is neither clipped
         # nor coarse (the scale follows the noise level slowly)
         r = float(np.sqrt(np.mean(np.abs(x) ** 2) / 2)) + 1e-12
@@ -156,6 +165,7 @@ class NoiseMeter:
     LEARN_S = 30            # no baseline yet (or the gains changed): the first 30 s become it
     ADAPT = 0.002           # quiet seconds then nudge the baseline (~8 min time constant): it follows slow drifts
     SAVE_S = 300
+    SPEC_BINS = 128
 
     def __init__(self, rate, center, path):
         self.rate, self.center, self.path = rate, center, path
@@ -170,10 +180,13 @@ class NoiseMeter:
         self.key = np.array([rate, center, opts.gain, opts.if_gain, float(opts.auto_gain)])
         self.base_spec = self.base_power = None
         self.learn = []
+        self.on_disk = False        # the baseline is in its file (deleting the file = relearn now)
+        self.rand = np.random.default_rng()
         try:
             z = np.load(path)
             if z['key'].shape == self.key.shape and np.allclose(z['key'], self.key):
                 self.base_spec, self.base_power = z['spec'], float(z['power'])
+                self.on_disk = True
         except Exception:       # no baseline yet, another band's or other gains
             pass
         self._reset()
@@ -188,9 +201,13 @@ class NoiseMeter:
         self.p_n += len(x)
         self.clip += int(np.count_nonzero((np.abs(x.real) > 0.99) | (np.abs(x.imag) > 0.99)))
         n = self.NFFT
-        for k in range(0, len(x) - n + 1, 8 * n):       # a spectrum every 4096 samples is plenty
+        # a spectrum every ~4096 samples is plenty; at random offsets, so a jammer that repeats (a sweep every 1 or
+        # 2 ms) isn't always caught at the same point of its cycle - that made a sweep look like a carrier
+        k = int(self.rand.integers(0, 8 * n))
+        while k + n <= len(x):
             self.acc += np.abs(np.fft.fftshift(np.fft.fft(x[k:k + n] * self.win))) ** 2
             self.nacc += 1
+            k += 4 * n + int(self.rand.integers(0, 8 * n))
         now = time.time()
         if now - self.t_last >= 1.0 and self.nacc:
             self._report(now)
@@ -202,6 +219,11 @@ class NoiseMeter:
         clip = 100.0 * self.clip / max(self.p_n, 1)
         rms_pct = 100 * np.sqrt(self.p_sum / max(self.p_n, 1) / 2)
         self._reset()
+        if self.on_disk and self.path and not os.path.exists(self.path):    # 'Relearn quiet noise' in the tracker
+            self.base_spec = self.base_power = None
+            self.on_disk = False
+            self.learn = []
+            log('GNSS noise: baseline deleted - learning it again')
         learning = self.base_spec is None
         if learning:
             self.learn.append((power, spec))
@@ -221,6 +243,12 @@ class NoiseMeter:
         peak_mhz = self.freqs[self.use][i] / 1e6
         emit('GNOISE: %.3f %.2f %.2f %.4f %.2f %.4f %.2f 0 %.2f' % (now, power, rise, clip, peak, peak_mhz, floor,
                                                                     rms_pct))
+        # the whole spectrum against the baseline, coarsely (each of SPEC_BINS the max of its group, so a carrier
+        # keeps its height): the Integrity section keeps it around events as a waterfall
+        f = self.freqs[self.use]
+        groups = np.array_split(np.arange(len(d)), self.SPEC_BINS)
+        emit('GSPEC: %.3f %.4f %.4f %s' % (now, f[0] / 1e6, f[-1] / 1e6,
+                                           ','.join('%d' % round(10 * d[g].max()) for g in groups)))
         if abs(rise) < 1.0 and peak < 6.0 and clip < 0.01:     # quiet: follow slow drifts (temperature)
             self.base_power += self.ADAPT * rise
             self.base_spec += self.ADAPT * (spec - self.base_spec)
@@ -235,8 +263,101 @@ class NoiseMeter:
             with open(self.path + '.tmp', 'wb') as f:
                 np.savez(f, key=self.key, spec=self.base_spec, power=self.base_power)
             os.replace(self.path + '.tmp', self.path)
+            self.on_disk = True
         except OSError as e:
             log('GNSS noise: could not save the baseline (%s)' % e)
+
+
+# ---------------------------------------------------------------- raw samples around an event
+class IQRecorder:
+    """keeps the last PRE_S seconds of raw samples in memory; when the tracker writes a file name into the trigger
+    file (--snap-trigger: an Integrity event began), saves them plus the next POST_S seconds as <name>.cs8 - signed
+    8-bit I,Q pairs, the SDR's own ADC values (fixed scale, so a jammer's real level is kept; SDR++ / inspectrum /
+    numpy open it) - with <name>.json saying the rate, frequency and time of the first sample"""
+    PRE_S, POST_S = 20.0, 20.0
+
+    def __init__(self, rate, center, trigger):
+        self.rate, self.center, self.trigger = rate, center, trigger
+        self.n = int(self.PRE_S * rate)
+        self.ring = np.zeros(2 * self.n, np.int8)
+        self.pos = self.filled = 0
+        self.rec = None
+        self.t_check = 0.0
+        try:
+            os.remove(trigger)          # (a request left over from an earlier session)
+        except OSError:
+            pass
+
+    def __call__(self, x):
+        b = np.empty(2 * len(x), np.int8)
+        b[0::2] = np.clip(np.round(x.real * 128), -128, 127)
+        b[1::2] = np.clip(np.round(x.imag * 128), -128, 127)
+        if self.rec:
+            self.rec['q'].put(b.tobytes())
+            self.rec['left'] -= len(x)
+            if self.rec['left'] <= 0:
+                self.rec['q'].put(None)
+                self.rec = None
+        k = len(b)
+        if k >= len(self.ring):
+            self.ring[:] = b[-len(self.ring):]
+            self.pos, self.filled = 0, self.n
+        else:
+            end = self.pos * 2 + k
+            if end <= len(self.ring):
+                self.ring[self.pos * 2:end] = b
+            else:
+                cut = len(self.ring) - self.pos * 2
+                self.ring[self.pos * 2:] = b[:cut]
+                self.ring[:k - cut] = b[cut:]
+            self.pos = (self.pos + len(x)) % self.n
+            self.filled = min(self.n, self.filled + len(x))
+        now = time.time()
+        if now - self.t_check >= 1.0:
+            self.t_check = now
+            self._poll(now)
+
+    def _poll(self, now):
+        if not os.path.exists(self.trigger):
+            return
+        try:
+            with open(self.trigger) as f:
+                stem = f.read().strip()
+            os.remove(self.trigger)
+        except OSError:
+            return
+        if self.rec or not stem:        # already recording one: that one covers this too
+            return
+        pre = np.concatenate([self.ring[self.pos * 2:], self.ring[:self.pos * 2]])[-2 * self.filled:] \
+            if self.filled else np.zeros(0, np.int8)
+        t_first = now - self.filled / self.rate - usb_latency()
+        q = queue.Queue()
+        self.rec = {'q': q, 'left': int(self.POST_S * self.rate)}
+        threading.Thread(target=self._write, args=(stem, pre, q, t_first), daemon=True).start()
+
+    def _write(self, stem, pre, q, t_first):
+        n = len(pre) // 2
+        try:
+            os.makedirs(os.path.dirname(stem), exist_ok=True)
+            with open(stem + '.cs8', 'wb') as f:
+                f.write(pre.tobytes())
+                while True:
+                    b = q.get()
+                    if b is None:
+                        break
+                    f.write(b)
+                    n += len(b) // 2
+            with open(stem + '.json', 'w') as f:
+                json.dump({'format': 'cs8: signed 8-bit I,Q pairs (the SDR ADC values; divide by 128 for -1..1)',
+                           'sample_rate': self.rate, 'center_hz': self.center, 'samples': n,
+                           'seconds': n / self.rate, 'first_sample_unix': t_first,
+                           'first_sample_utc': datetime.datetime.fromtimestamp(t_first, datetime.timezone.utc)
+                           .strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + 'Z',
+                           'event_at_s': self.PRE_S, 'gain_db': opts.gain, 'if_gain_db': opts.if_gain,
+                           'auto_gain': opts.auto_gain, 'ppm': opts.ppm}, f, indent=1)
+            log('GNSS: saved %.0f s of raw samples around the event (%s.cs8)' % (n / self.rate, stem))
+        except Exception as e:
+            log('GNSS: could not save the raw samples (%r)' % e)
 
 
 # ---------------------------------------------------------------- recording chunks
@@ -750,9 +871,11 @@ def main():
     if not os.path.exists(POCKET_TRK):
         log('GNSS: %s is missing - see README (PocketSDR)' % POCKET_TRK)
         sys.exit(2)
-    global NOISE
+    global NOISE, SNAP
     if not opts.no_noise:
         NOISE = NoiseMeter(opts.rate, opts.center, opts.noise_baseline)
+    if opts.snap_trigger:
+        SNAP = IQRecorder(opts.rate, opts.center, opts.snap_trigger)
     if opts.mode == 'live':
         live = LiveTracker(opts.rate)
         live.start()

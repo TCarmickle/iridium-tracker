@@ -1910,9 +1910,8 @@ class Tracker(QtWidgets.QMainWindow):
                                         'save the pictures')
         self.section_btns[2].setToolTip('Listen anywhere the SDR reaches, like SDR++: big spectrum and waterfall, '
                                         'frequency digits, mode and bandwidth')
-        self.section_btns[3].setToolTip('Jamming and spoofing watch for GPS, Galileo, WAAS, GLONASS and BeiDou: '
-                                        'noise, signal strength, position, time and Doppler checks while a GNSS band '
-                                        'is received')
+        self.section_btns[3].setToolTip('Jamming and spoofing watch on GNSS L1 (GPS, Galileo, WAAS): noise, signal '
+                                        'strength, position, time and Doppler checks, with a snapshot of each event')
         self.integrity_level = -1
         hl.addStretch(1)
         hl.addWidget(self.rx_btn)
@@ -2120,8 +2119,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.sections.addWidget(self.integrity)
         self.receiver.frame.connect(self.integrity.on_line)
         self.receiver.gnss_line.connect(self.integrity.on_line)
-        self.receiver.running.connect(lambda on: self.integrity.on_running(
-            on, getattr(self.receiver, 'system', None), sdr_settings.gain(self.receiver.sdr)[1]))
+        self.receiver.running.connect(self._integrity_running)
         self.integrity.changed.connect(self._integrity_level)
         central = QtWidgets.QWidget()
         cv = QtWidgets.QVBoxLayout(central)
@@ -2381,6 +2379,17 @@ class Tracker(QtWidgets.QMainWindow):
             return o if float(np.asarray(o.sigma_km(time.time())).reshape(-1)[0]) < 20 else None
         except Exception:
             return None
+
+    def _integrity_running(self, on):
+        """the receiver started / stopped: the Integrity watch follows (with the receiver's settings, which go into
+        any event snapshot)"""
+        s = self.receiver.sdr
+        g, auto = sdr_settings.gain(s)
+        meta = {'device': s.get('label', ''), 'device_args': sdr_settings.device_args(s), 'gain_db': g,
+                'auto_gain': auto, 'if_gain_db': sdr_settings.if_gain(s), 'ppm': s.get('ppm', 0),
+                'center_hz': sdr_settings.center_hz(s), 'sample_rate': sdr_settings.sample_rate(s),
+                'capture': getattr(self.receiver, 'capname', '')}
+        self.integrity.on_running(on, getattr(self.receiver, 'system', None), auto, meta)
 
     def _integrity_level(self, lv):
         """the Integrity section's button shows a watch / alert from any section"""

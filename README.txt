@@ -420,11 +420,18 @@ Windows asks for permission first.
 
 JAMMING AND SPOOFING WATCH (Integrity section)
 ----------------------------------------------
-The Integrity section (header button) watches whichever GNSS band is being received - GPS /
-Galileo / WAAS, GLONASS or BeiDou - for someone drowning the satellites out (jamming) or faking
+The Integrity section (header button) watches the GNSS L1 (GPS) band - GPS, Galileo and WAAS -
+for someone drowning the satellites out (jamming) or faking
 them (spoofing). Two verdicts at the top (clear / watch / ALERT), the checks under them, the
 satellites tracked now, live charts of the last 30 minutes, and an event list (kept in the data
 folder as integrity-events.jsonl). The header button turns amber or red from any section.
+Arming: nothing counts as an event until the connection has proven itself - 4 or more satellites
+at a median C/N0 of 33 dB-Hz or better for 2 minutes, with the quiet band learned and the noise at
+that level (here GPS normally runs 4-7 satellites at ~36-38 dB-Hz). Until then the checks show
+their values but can't raise anything, so starting with no signal or a poor antenna logs nothing.
+If, once armed, the signal stays below that bar for 5 minutes with no extra noise, the watch
+disarms (an antenna or cable problem, not an attack) and waits to arm again. A jammer raises the
+noise, so the watch stays armed through it.
 Jamming checks:
   - Noise in the band: GNSS signals are under the noise, so with a fixed gain the band's power is
     the noise itself. The receiver learns the band's quiet level and shape in the first 30 s
@@ -444,5 +451,26 @@ Spoofing checks:
     ~1 Hz rms here; one fake transmitter can't get every satellite right. Alert at 50 Hz off.
   - Satellites heard that their own orbit puts below the horizon, and signals that are too strong
     or all the same strength.
-'Relearn quiet noise' forgets the noise baselines (do it when the band is known to be quiet; the
-next 30 s of receiving become the new one).
+'Relearn quiet noise' forgets the noise baselines (do it when the band is known to be quiet, e.g.
+after connecting or changing the antenna): the next 30 s become the new one, at once if receiving.
+Event snapshots: whenever a check rises to watch or alert, everything around it is saved in its
+own folder, data\integrity\<date-time>-<check>\ (the 'Snapshots' button opens it; double-click
+the 'Snapshot saved' line in the event list to view one):
+  - event.json: when (local time, weekday), the band and the receiver's settings, the checks and
+    satellites at the start and end, which checks rose and how far, and a summary - how long it
+    lasted, how the noise rose and fell (a gradual rise and fall is like a jammer in a passing
+    vehicle; an abrupt start, something switched on nearby), what kind of signal (narrowband,
+    swept, broadband) and which part of the band, each satellite's C/N0 before and at its
+    lowest and who was lost, the position and GPS time during it.
+  - lines.txt: every line the receiver sent from 2 minutes before until 90 s after the last
+    check cleared (up to 15 minutes): satellites, fixes, noise, the band's spectrum each second.
+  - waterfall.png: the band over the event.
+  - samples.cs8 + samples.json: the raw SDR samples from 20 s before to 20 s after the start
+    (~160 MB; signed 8-bit I/Q at 2.048 MS/s, opens in SDR++ or inspectrum) - to look at the
+    interfering signal itself. Only the newest 5 are kept; untick 'Keep raw samples' to skip
+    them (they are also skipped when the disk is low).
+  Limits, so it can't fill the disk: at most 20 snapshots a day and the newest 200 kept; a
+  signal that never goes away (a steady local spur) gets one snapshot, not a new one every
+  15 minutes. GLONASS and BeiDou are not watched for now (few satellites with this antenna, and a
+  steady spur at 1560.33 MHz next to BeiDou B1I kept raising alerts); WATCH_BANDS in
+  app\integrity.py turns them on.

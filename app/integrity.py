@@ -1,4 +1,4 @@
-"""The Integrity section: is anyone jamming or spoofing satellite navigation here? It watches whatever GNSS band the
+r"""The Integrity section: is anyone jamming or spoofing satellite navigation here? It watches whatever GNSS band the
 receiver is on (GPS / Galileo / WAAS, GLONASS, BeiDou) and checks what it hears against physics and against itself.
 
 Jamming (someone drowning the signals): GNSS signals arrive under the noise, so with the gain fixed the band's
@@ -15,6 +15,11 @@ the ground, and that shows -
   - the signals are too strong, or all the same strength (real ones differ with elevation)
 Each check has two levels (watch, alert); a level must hold a few seconds before it shows, and clears only after
 it has been quiet a while. Changes go to the event list (kept in integrity-events.jsonl).
+Each event also gets a snapshot folder (data\integrity\<time>-<check>\): every receiver line from 2 minutes before
+to 90 s after it cleared (lines.txt), event.json (the receiver's settings, the checks and satellites at the start and
+end, and a summary: how long, how the noise rose and fell, what kind of signal and where in the band, each
+satellite's C/N0 before and at its lowest, position and time), waterfall.png (the band over the event), and -
+unless switched off - the raw samples from 20 s before to 20 s after (samples.cs8, saved by gnss_rx).
 
 Monitor is the logic (no Qt; fed lines, asked for a report); IntegrityView is the section.
 """
@@ -22,6 +27,7 @@ import collections
 import json
 import math
 import os
+import shutil
 import time
 
 import numpy as np
@@ -55,6 +61,21 @@ DOPPLER_HZ = 50.0
 CN0_HIGH = (55.0, 60.0)         # stronger than real satellites reach a ground antenna
 CN0_SPREAD_DB = 1.0             # 5+ satellites within this of each other (and strong): one transmitter?
 BELOW_EL = -5.0                 # heard, but its own orbit says it is this far below the horizon
+# Event snapshots: when a check rises to watch / alert, everything the receiver said from PRE_S before it until
+# POST_S after the last check cleared (at most MAX_S) is saved in integrity\<time>-<check>\ with a summary; the
+# GNSS receiver also saves the raw samples from 20 s before to 20 s after (samples.cs8, ~160 MB; the newest IQ_KEEP)
+PRE_S, POST_S, MAX_S = 120.0, 90.0, 900.0
+IQ_KEEP = 5
+# Arming: nothing counts as an event until the connection has proven itself - ARM_SATS or more satellites at a
+# median C/N0 of ARM_CN0 or better for ARM_S (here GPS runs 4-7 satellites at a median ~37-38 dB-Hz). If the signal
+# then stays below that bar for DISARM_S with no extra noise, the watch disarms (a poor antenna, not an attack).
+ARM_SATS, ARM_CN0, ARM_S, DISARM_S = 4, 33.0, 120.0, 300.0
+SNAPS_PER_DAY = 20     # at most this many snapshots a day (beyond it events are still listed, not saved)
+SNAPS_KEEP = 200        # the newest snapshot folders kept (each ~0.2-2 MB without its raw samples)
+# The bands watched. GLONASS and BeiDou work too, but with this antenna they hear few satellites and a steady spur
+# near BeiDou's B1I (1560.33 MHz) kept raising alerts - so GPS only for now (add 'glo1', 'bds1' to watch them)
+WATCH_BANDS = ('gnss1',)
+GNSS_BANDS = ('gnss1', 'glo1', 'bds1')
 
 
 def _xyz(p):
@@ -145,8 +166,14 @@ CHECKS = [
 class Monitor:
     """the checks, fed the GNSS receiver's lines"""
 
-    def __init__(self, events_path=None):
-        self.events_path = events_path
+    def __init__(self, events_path=None, snap_dir=None):
+        self.events_path, self.snap_dir = events_path, snap_dir
+        self.on_open = None         # (stem) an event snapshot began: where its raw samples should go
+        self.on_saved = None        # (folder) a snapshot was saved
+        self.meta = {}
+        self.label = ''
+        self.idle_note = ''         # why nothing is watched (e.g. a band not covered)
+        self.blocked = set()        # checks still up when their last snapshot ran out of time: no new one until clear
         self.checks = [Check(*c) for c in CHECKS]
         self.by_key = {c.key: c for c in self.checks}
         self.events = collections.deque(maxlen=500)
@@ -170,17 +197,25 @@ class Monitor:
         self.series = {k: collections.deque() for k in ('rise', 'peak', 'cn0', 'nsat', 'pos', 'clock', 'dop')}
         self.sats = []
         self.bias = None
+        self.ring = collections.deque()     # the last PRE_S of the receiver's lines: (t, kind, line)
+        self.snap = None                    # the event snapshot being gathered
+        self.armed = False                  # a proven good signal: only then can anything be raised (_arm)
+        self.good_since = self.poor_since = None
+        self.arm_note = ''
         self.t_start = time.time()
         for c in self.checks:
             c.level, c.value, c.pending = NA, '', None
 
-    def start(self, band, label, auto_gain):
+    def start(self, band, label, auto_gain, meta=None):
         self.reset()
-        self.active, self.band, self.auto_gain = True, band, auto_gain
+        self.active, self.band, self.auto_gain, self.label = True, band, auto_gain, label
+        self.meta = dict(meta or {})
         self.event(time.time(), OK, 'Watching %s%s' % (label, ' (automatic gain: the noise checks are off)'
                                                        if auto_gain else ''))
 
     def stop(self):
+        if self.snap:
+            self._close(time.time(), 'the receiver stopped')
         if self.active:
             self.event(time.time(), OK, 'Stopped watching (receiver stopped)')
         self.active = False
@@ -194,6 +229,12 @@ class Monitor:
         f = line.split()
         try:
             t = float(f[1])
+            rec = (t, kind, line.strip())
+            self.ring.append(rec)
+            while self.ring and self.ring[0][0] < t - PRE_S:
+                self.ring.popleft()
+            if self.snap:
+                self.snap['lines'].append(rec)
             if kind == 'GCH' and len(f) >= 6:
                 sat, cn0, dop = f[2], float(f[4]), float(f[5])
                 self.last[sat] = (t, cn0, dop)
@@ -219,8 +260,10 @@ class Monitor:
             pass
 
     # ---- events
-    def event(self, t, level, text):
+    def event(self, t, level, text, snap=None):
         e = {'t': t, 'level': level, 'text': text}
+        if snap:
+            e['snap'] = snap
         self.events.append(e)
         if self.events_path:
             try:
@@ -403,15 +446,111 @@ class Monitor:
             raw['horizon'] = (NA, 'needs decoded orbits')
         self.sats = rows
 
+        self._arm(now, locked, n, noisy)
+        raised = []
         for c in self.checks:
             lv, text = raw.get(c.key, (NA, ''))
+            if not self.armed:          # nothing is raised until the signal has proven itself (values still shown)
+                lv = NA
             old = c.update(now, lv, text)
             if old is None:
                 continue
             if c.level > max(old, OK):
                 self.event(now, c.level, '%s: %s - %s' % (LEVEL_WORD[c.level].upper(), c.title, text))
+                raised.append(c)
             elif old >= WATCH:
                 self.event(now, c.level, '%s back to %s (%s)' % (c.title, LEVEL_WORD[c.level], text))
+        self._snapshot(now, raised, home)
+
+    # ---- event snapshots
+    def _state(self):
+        return [{'check': c.key, 'title': c.title, 'level': LEVEL_WORD[c.level], 'value': c.value} for c in self.checks]
+
+    def _sats(self):
+        return [{k: (round(v, 2) if isinstance(v, float) else v) for k, v in r.items()} for r in self.sats]
+
+    def _snapshot(self, now, raised, home):
+        s = self.snap
+        self.blocked = {k for k in self.blocked if self.by_key[k].level >= WATCH}
+        if s is None:
+            # a signal that stays up (a steady local spur) gets one snapshot, not a new one every MAX_S
+            raised = [c for c in raised if c.key not in self.blocked]
+            if not raised or not self.snap_dir:
+                return
+            day = time.strftime('%Y%m%d', time.localtime(now))
+            try:
+                today = sum(1 for d in os.listdir(self.snap_dir) if d.startswith(day + '-'))
+            except OSError:
+                today = 0
+            if today >= SNAPS_PER_DAY:
+                if getattr(self, '_cap_day', None) != day:
+                    self._cap_day = day
+                    self.event(now, OK, 'No more snapshots today (%d saved, the most per day): events are still '
+                                        'listed' % today)
+                return
+            name = '%s-%s' % (time.strftime('%Y%m%d-%H%M%S', time.localtime(now)), raised[0].key)
+            s = self.snap = {'name': name, 'folder': os.path.join(self.snap_dir, name), 't_trigger': now,
+                             'lines': list(self.ring), 'raised': [], 'worst': {}, 't_clear': None, 'home': home,
+                             'at_trigger': self._state(), 'sats_at_trigger': self._sats(), 'bias_at_trigger': self.bias}
+            if self.on_open:
+                self.on_open(os.path.join(s['folder'], 'samples'))
+        for c in raised:
+            s['raised'].append({'t': now, 'check': c.key, 'title': c.title, 'level': LEVEL_WORD[c.level],
+                                'value': c.value})
+        hot = [c for c in self.checks if c.level >= WATCH]
+        for c in hot:
+            w = s['worst'].get(c.key)
+            if w is None or c.level > w['rank']:
+                s['worst'][c.key] = {'rank': c.level, 'level': LEVEL_WORD[c.level], 'title': c.title, 'value': c.value,
+                                     't': now}
+        if hot:
+            s['t_clear'] = None
+        elif s['t_clear'] is None:
+            s['t_clear'] = now
+        if s['t_clear'] is not None and now - s['t_clear'] >= POST_S:
+            self._close(now, 'all checks clear for %.0f s' % POST_S)
+        elif now - s['t_trigger'] >= MAX_S:
+            self.blocked |= {c.key for c in hot}
+            self._close(now, 'longest snapshot (%.0f min) reached; still active (no new snapshot for %s until it '
+                             'clears)' % (MAX_S / 60, ', '.join(c.title.lower() for c in hot)))
+
+    def _close(self, now, why):
+        s, self.snap = self.snap, None
+        t_clear = s['t_clear'] or now
+        lines = sorted(s['lines'])
+        summary = summarize(lines, s['t_trigger'], t_clear, s['home'])
+        lv = max([w['rank'] for w in s['worst'].values()] or [WATCH])
+        info = {
+            'event': s['name'],
+            'trigger_local': time.strftime('%Y-%m-%d %H:%M:%S %Z (%A)', time.localtime(s['t_trigger'])),
+            'trigger_unix': s['t_trigger'],
+            'cleared_unix': s['t_clear'], 'closed_unix': now, 'closed_because': why,
+            'band': self.band, 'band_label': self.label, 'receiver': self.meta,
+            'home': {'lat': s['home'][0], 'lon': s['home'][1], 'alt_km': s['home'][2]} if s['home'] else None,
+            'summary': summary,
+            'checks_raised': s['raised'],
+            'worst': {k: {x: y for x, y in v.items() if x != 'rank'} for k, v in s['worst'].items()},
+            'checks_at_trigger': s['at_trigger'], 'checks_at_end': self._state(),
+            'satellites_at_trigger': s['sats_at_trigger'], 'satellites_at_end': self._sats(),
+            'sdr_doppler_offset_hz_at_trigger': s['bias_at_trigger'],
+            'lines': {'file': 'lines.txt', 'count': len(lines), 'from_unix': lines[0][0] if lines else None,
+                      'to_unix': lines[-1][0] if lines else None,
+                      'kinds': 'GCH satellite tracked, GPOS position fix, GNOISE band noise, GSPEC spectrum vs baseline, '
+                               'GTIME GPS minus PC clock (see gnss_rx.py)'},
+        }
+        try:
+            os.makedirs(s['folder'], exist_ok=True)
+            with open(os.path.join(s['folder'], 'event.json'), 'w') as f:
+                json.dump(info, f, indent=1)
+            with open(os.path.join(s['folder'], 'lines.txt'), 'w') as f:
+                f.write(''.join(l + '\n' for _, _, l in lines))
+        except OSError as e:
+            self.event(now, lv, 'Could not save the event snapshot (%s)' % e)
+            return
+        self.event(now, lv, 'Snapshot saved: %s - %s (double-click to view)' % (s['name'], summary['verdict']),
+                   snap=s['folder'])
+        if self.on_saved:
+            self.on_saved(s['folder'])
 
     @staticmethod
     def _grade(v, lim):
@@ -423,10 +562,59 @@ class Monitor:
         while q and q[0][0] < t - HISTORY_S:
             q.popleft()
 
+    # ---- arming: a proven good connection before anything counts as an event
+    def _arm(self, now, locked, n, noisy):
+        """armed once ARM_SATS+ satellites at a median C/N0 of ARM_CN0+ held for ARM_S, with the noise baseline
+        learned and the band at its quiet level; disarmed if the signal then stays below that bar for DISARM_S with
+        no extra noise (a poor antenna or cable, not an attack - nothing to log)"""
+        cs = [v[1] for v in locked.values()]
+        med = float(np.median(cs)) if cs else 0.0
+        good = len(cs) >= ARM_SATS and med >= ARM_CN0
+        have = '%d satellites at a median %.0f dB-Hz' % (len(cs), med) if cs else 'no satellites'
+        need = 'needs %d+ at %.0f+ for %d min' % (ARM_SATS, ARM_CN0, ARM_S / 60)
+        noise_ok = bool(n and not n['learning'] and (self.auto_gain or n['rise'] < NOISE_RISE_DB[0]))
+        if not self.armed:
+            if good and noise_ok:
+                self.good_since = self.good_since or now
+                held = now - self.good_since
+                if held >= ARM_S:
+                    self.armed, self.poor_since = True, None
+                    self.event(now, OK, 'Armed: good signal for %d min (%s) - events count from now' % (ARM_S / 60, have))
+                    self.arm_note = ''
+                else:
+                    self.arm_note = 'arming: good signal for %.0f of %.0f s (%s)' % (held, ARM_S, have)
+            else:
+                self.good_since = None
+                if good and n and n['learning']:
+                    self.arm_note = 'waiting: learning the quiet band'
+                elif good and not n:
+                    self.arm_note = 'waiting: no noise readings yet'
+                elif good:
+                    self.arm_note = ('waiting: the band is %+.1f dB above its learned quiet level - if the antenna was '
+                                     'just connected or changed, press Relearn quiet noise' % n['rise'])
+                else:
+                    self.arm_note = 'waiting for a good signal: %s (%s)' % (have, need)
+            return
+        if good or noisy:
+            self.poor_since = None
+            return
+        self.poor_since = self.poor_since or now
+        if now - self.poor_since >= DISARM_S:
+            self.armed, self.good_since = False, None
+            if self.snap:
+                self._close(now, 'disarmed: the signal stayed poor')
+            for c in self.checks:
+                c.level, c.pending = NA, None
+            self.event(now, OK, 'Disarmed: the signal stayed below the bar for %d min without extra noise (%s) - '
+                                'an antenna or cable issue, not logged as an event' % (DISARM_S / 60, have))
+            self.arm_note = 'waiting for a good signal: %s (%s)' % (have, need)
+
     def verdict(self, group):
         """(level, one line) for jamming / spoofing"""
         if not self.active:
-            return NA, 'not watching - start a GNSS band on the receiver'
+            return NA, self.idle_note or 'not watching - start GNSS L1 (GPS) on the receiver'
+        if not self.armed:
+            return NA, self.arm_note or 'waiting for a good signal'
         cs = [c for c in self.checks if c.group == group]
         lv = max(c.level for c in cs)
         hot = [c.title.lower() for c in cs if c.level == lv and lv >= WATCH]
@@ -438,6 +626,152 @@ class Monitor:
         return OK, 'no sign (%d of %d checks running)' % (judged, len(cs))
 
 
+# ---------------------------------------------------------------- what an event looked like
+def parse_lines(lines):
+    """[(t, kind, line)] -> per kind lists of parsed values"""
+    out = {'noise': [], 'spec': [], 'ch': collections.defaultdict(list), 'pos': [], 'time': []}
+    for t, kind, line in lines:
+        f = line.split()
+        try:
+            if kind == 'GNOISE' and len(f) >= 10 and f[8] == '0':
+                out['noise'].append((t, float(f[3]), float(f[4]), float(f[5]), float(f[6])))  # rise clip peak MHz
+            elif kind == 'GSPEC' and len(f) >= 5:
+                out['spec'].append((t, float(f[2]), float(f[3]), [int(v) / 10 for v in f[4].split(',')]))
+            elif kind == 'GCH' and len(f) >= 6:
+                out['ch'][f[2]].append((t, float(f[4]), float(f[5])))
+            elif kind == 'GPOS' and len(f) >= 6 and int(f[5]) >= 4:
+                out['pos'].append((t, float(f[2]), float(f[3]), float(f[4]), int(f[5])))
+            elif kind == 'GTIME' and len(f) >= 5:
+                out['time'].append((t, float(f[2])))
+        except (ValueError, IndexError):
+            pass
+    return out
+
+
+def summarize(lines, t_trigger, t_clear, home):
+    """the event in numbers and a best-guess description: when it began and ended, how the noise rose and fell,
+    what kind of signal (carrier, swept, broadband) and where, what it did to each satellite, the position, time"""
+    p = parse_lines(lines)
+    onset = t_trigger - RAISE_S
+    s = {'local_time': time.strftime('%H:%M:%S', time.localtime(t_trigger)),
+         'weekday': time.strftime('%A', time.localtime(t_trigger)),
+         'duration_s': round(max(0.0, t_clear - onset), 1)}
+    notes = []
+    # -- noise: level, shape in time, kind of signal
+    nz = p['noise']
+    before = [x for x in nz if x[0] < onset - 5]
+    during = [x for x in nz if onset - 30 <= x[0] <= t_clear + 5]
+    jam = False
+    if during:
+        rises = np.array([x[1] for x in during])
+        peaks = np.array([x[3] for x in during])
+        i = int(np.argmax(rises))
+        j = int(np.argmax(peaks))
+        s['noise'] = {'baseline_rise_before_db': round(float(np.median([x[1] for x in before])), 2) if before else None,
+                      'max_rise_db': round(float(rises[i]), 2),
+                      'max_rise_at': time.strftime('%H:%M:%S', time.localtime(during[i][0])),
+                      'max_peak_db': round(float(peaks[j]), 2), 'max_peak_mhz': during[j][4],
+                      'max_clip_pct': round(max(x[2] for x in during), 4)}
+        strong = [x for x in during if x[3] >= PEAK_DB[0]]
+        if strong:
+            fs = np.array([x[4] for x in strong])
+            s['noise']['peak_mhz_range'] = [round(float(fs.min()), 4), round(float(fs.max()), 4)]
+            s['noise']['peak_seconds'] = len(strong)
+        # how it came and went: time from 10 % of the top to the top, and back
+        key = rises if rises[i] >= NOISE_RISE_DB[0] else peaks
+        top = int(np.argmax(key))
+        lim = 0.1 * key[top]
+        a = top
+        while a > 0 and key[a - 1] > lim:
+            a -= 1
+        b = top
+        while b < len(key) - 1 and key[b + 1] > lim:
+            b += 1
+        s['noise']['rise_time_s'] = round(during[top][0] - during[a][0], 1)
+        s['noise']['fall_time_s'] = round(during[b][0] - during[top][0], 1)
+        jam = rises[i] >= NOISE_RISE_DB[0] or peaks[j] >= PEAK_DB[0]
+    # -- spectrum: which part of the band was hit
+    sp = [x for x in p['spec'] if onset - 30 <= x[0] <= t_clear + 5]
+    if sp:
+        n = min(len(x[3]) for x in sp)
+        hold = np.max([x[3][:n] for x in sp], axis=0)
+        floor = float(np.median(hold))
+        hot = np.nonzero(hold > 3)[0]       # (GSPEC is already against the quiet baseline)
+        f_lo, f_hi = sp[0][1], sp[0][2]
+        df = (f_hi - f_lo) / max(n - 1, 1)
+        if len(hot):
+            s['spectrum'] = {'max_hold_floor_db': round(floor, 2), 'hit_from_mhz': round(f_lo + hot[0] * df, 4),
+                             'hit_to_mhz': round(f_lo + hot[-1] * df, 4), 'bins_hit': int(len(hot)), 'bins': n,
+                             'strongest_mhz': round(f_lo + int(np.argmax(hold)) * df, 4),
+                             'strongest_db': round(float(hold.max()), 1)}
+    if jam:
+        nzs = s['noise']
+        width = (s['spectrum']['hit_to_mhz'] - s['spectrum']['hit_from_mhz']) if 'spectrum' in s else None
+        fr = nzs.get('peak_mhz_range')
+        if fr and fr[1] - fr[0] > 0.2:
+            kind = 'a swept (chirp) signal across %.3f-%.3f MHz' % tuple(fr)
+        elif nzs['max_peak_db'] >= PEAK_DB[0] and (width is None or width < 0.3):
+            kind = 'a narrowband signal at %.4f MHz%s' % (nzs['max_peak_mhz'], ' (about %.0f kHz wide)' % (width * 1000)
+                                                          if width else '')
+        elif nzs['max_rise_db'] >= NOISE_RISE_DB[0]:
+            kind = 'broadband noise (+%.1f dB%s)' % (nzs['max_rise_db'], ', across %.2f MHz of the band' % width
+                                                     if width else '')
+        else:
+            kind = 'interference peaking at %.4f MHz' % nzs['max_peak_mhz']
+        notes.append('Signal: ' + kind)
+        r, f = nzs['rise_time_s'], nzs['fall_time_s']
+        if r >= 5 and f >= 5 and max(r, f) / max(min(r, f), 1) < 3:
+            notes.append('It grew over %.0f s and faded over %.0f s - like a moving source passing by (a jammer in '
+                         'a vehicle)' % (r, f))
+        elif r <= 2:
+            notes.append('It switched on abruptly (rise %.0f s) - a source nearby being turned on, or a test' % r)
+        else:
+            notes.append('Rise %.0f s, fall %.0f s' % (r, f))
+    # -- satellites: C/N0 before and at the worst, who was lost
+    sats = {}
+    lost = []
+    for sat, v in p['ch'].items():
+        pre = [c for t, c, _ in v if onset - 60 <= t < onset - 2]
+        win = [(t, c) for t, c, _ in v if onset - 2 <= t <= t_clear + 5]
+        e = {'cn0_before': round(float(np.median(pre)), 1) if pre else None}
+        if win:
+            e['cn0_min'] = round(min(c for _, c in win), 1)
+            if e['cn0_before'] is not None:
+                e['drop_db'] = round(e['cn0_before'] - e['cn0_min'], 1)
+        if pre:     # tracked before: lost if it went quiet for 10 s or more during the event
+            ts = [onset] + sorted(t for t, _ in win) + [t_clear]
+            gap = max(b - a for a, b in zip(ts, ts[1:]))
+            if gap >= 10:
+                lost.append(sat)
+                e['lost'] = True
+                e['longest_gap_s'] = round(gap, 1)
+        sats[sat] = e
+    s['satellites'] = sats
+    drops = [e['drop_db'] for e in sats.values() if 'drop_db' in e]
+    if drops:
+        s['median_cn0_drop_db'] = round(float(np.median(drops)), 1)
+    if lost:
+        s['satellites_lost'] = sorted(lost)
+    if not jam and drops and float(np.median(drops)) >= CN0_DROP_DB[0]:
+        notes.append('Signals weakened %.0f dB without more noise - the antenna blocked or disconnected (or a '
+                     'spoofer taking over)' % float(np.median(drops)))
+    # -- position and time
+    if home and p['pos']:
+        d = [(t, distance_m(home[0], home[1], la, lo)) for t, la, lo, _, _ in p['pos']]
+        pre = [x for t, x in d if t < onset]
+        win = [x for t, x in d if onset <= t <= t_clear + 5]
+        s['position'] = {'from_home_before_m': round(float(np.median(pre)), 1) if pre else None,
+                         'from_home_max_m': round(max(win), 1) if win else None,
+                         'fixes_during': len(win)}
+    if p['time']:
+        off = [o for t, o in p['time'] if onset - 120 <= t <= t_clear + 5]
+        if off:
+            s['gps_minus_pc_s'] = {'min': round(min(off), 4), 'max': round(max(off), 4)}
+    s['notes'] = notes
+    s['verdict'] = notes[0] if notes else 'see the checks raised'
+    return s
+
+
 # ---------------------------------------------------------------- the section
 def level_colour(lv):
     return {ALERT: theme.PAL['ALERT'], WATCH: theme.PAL['WARN'], OK: theme.PAL['GOOD']}.get(lv, theme.PAL['MUTED'])
@@ -446,10 +780,11 @@ def level_colour(lv):
 class StripChart(QtWidgets.QWidget):
     """a value over the last 30 minutes, with the watch / alert lines (instrument-dark, like the other plots)"""
 
-    def __init__(self, title, unit, lines, limits=None, floor_range=1.0, absval=False):
+    def __init__(self, title, unit, lines, limits=None, floor_range=1.0, absval=False, window=None, marker=None):
         super().__init__()
         self.title, self.unit, self.lines, self.limits = title, unit, lines, limits
         self.floor_range, self.absval = floor_range, absval
+        self.window, self.marker = window, marker       # a fixed (t0, t1) instead of the last 30 min; a time line
         self.series = {}
         self.setMinimumHeight(90)
 
@@ -464,8 +799,9 @@ class StripChart(QtWidgets.QWidget):
         p.fillRect(self.rect(), QtGui.QColor('#0d1014'))
         L, R, T, B = 46, 8, 18, 16
         pw, ph = w - L - R, h - T - B
-        now = time.time()
-        vals = [v for key, _, _ in self.lines for _, v in self.series.get(key, ())]
+        t_a, now = self.window or (time.time() - HISTORY_S, time.time())
+        span = max(now - t_a, 1.0)
+        vals = [v for key, _, _ in self.lines for t, v in self.series.get(key, ()) if t_a <= t <= now]
         lims = list(self.limits or ())
         lo = min(vals + [0.0] + ([-lims[0]] if self.absval and lims else []))
         hi = max(vals + [self.floor_range] + lims[:1])
@@ -478,15 +814,21 @@ class StripChart(QtWidgets.QWidget):
             return T + ph * (1 - (v - lo) / (hi - lo))
 
         def X(t):
-            return L + pw * (1 - (now - t) / HISTORY_S)
+            return L + pw * (1 - (now - t) / span)
 
         p.setPen(QtGui.QColor('#8b93a1'))
         f = p.font()
         f.setPointSizeF(8)
         p.setFont(f)
         p.drawText(L, 2, pw, 14, Qt.AlignLeft, self.title)
-        for frac, txt in ((0, '-30 min'), (0.5, '-15'), (1, 'now')):
+        ticks = ([(fr, time.strftime('%H:%M:%S', time.localtime(t_a + fr * span))) for fr in (0, 0.5, 1)]
+                 if self.window else ((0, '-30 min'), (0.5, '-15'), (1, 'now')))
+        for frac, txt in ticks:
             p.drawText(int(L + pw * frac) - 30, h - 14, 60, 14, Qt.AlignCenter, txt)
+        if self.marker and t_a <= self.marker <= now:
+            p.setPen(QtGui.QPen(QtGui.QColor('#e6e9ef'), 1, Qt.DotLine))
+            p.drawLine(int(X(self.marker)), T, int(X(self.marker)), T + ph)
+            p.setPen(QtGui.QColor('#8b93a1'))
         for v in (lo + pad, hi - pad):
             p.drawText(0, int(Y(v)) - 7, L - 4, 14, Qt.AlignRight | Qt.AlignVCenter, '%.3g %s' % (v, self.unit))
         p.setPen(QtGui.QPen(QtGui.QColor('#2f3541'), 1))
@@ -499,11 +841,11 @@ class StripChart(QtWidgets.QWidget):
                     p.drawLine(L, int(Y(s * v)), L + pw, int(Y(s * v)))
         x = L + pw - 4
         for key, col, name in self.lines:
-            pts = [(X(t), Y(v)) for t, v in self.series.get(key, ()) if now - t <= HISTORY_S]
+            pts = [(X(t), Y(v)) for t, v in self.series.get(key, ()) if t_a <= t <= now]
             p.setPen(QtGui.QPen(QtGui.QColor(col), 1.5))
             path = QtGui.QPainterPath()
             for i, (px, py) in enumerate(pts):
-                if i and px - pts[i - 1][0] > pw * 20 / HISTORY_S:      # a gap (receiver stopped)
+                if i and px - pts[i - 1][0] > pw * 20 / span:      # a gap (receiver stopped)
                     path.moveTo(px, py)
                 elif i:
                     path.lineTo(px, py)
@@ -546,6 +888,159 @@ class VerdictCard(QtWidgets.QFrame):
                         'QLabel { color: %%(MUTED)s; background: transparent; border: none; }' % col)
 
 
+WF_STOPS = [(0.0, (8, 12, 40)), (0.15, (20, 40, 120)), (0.35, (0, 170, 200)), (0.6, (240, 220, 40)),
+            (1.0, (255, 40, 40))]       # -1 dB (dark blue) ... +15 dB (red) above the baseline
+
+
+def waterfall_image(spec, t_mark=None, col_w=4):
+    """GSPEC rows [(t, f_lo, f_hi, [dB...])] -> a waterfall QImage (frequency across, time down, one row a second;
+    white ticks at the event's start)"""
+    if not spec:
+        return None
+    n = min(len(x[3]) for x in spec)
+    v = np.array([x[3][:n] for x in spec], float)
+    x = np.clip((v + 1.0) / 16.0, 0, 1)
+    xs = [a for a, _ in WF_STOPS]
+    rgb = np.stack([np.interp(x, xs, [c[i] for _, c in WF_STOPS]) for i in range(3)], axis=-1).astype(np.uint8)
+    rgb = np.repeat(rgb, col_w, axis=1)
+    if t_mark:
+        r = int(np.argmin([abs(s[0] - t_mark) for s in spec]))
+        rgb[r, :12] = rgb[r, -12:] = 255
+    rgb = np.ascontiguousarray(rgb)
+    h, w = rgb.shape[:2]
+    return QtGui.QImage(rgb.tobytes(), w, h, 3 * w, QtGui.QImage.Format_RGB888).copy()
+
+
+def _fmt(v):
+    if isinstance(v, float):
+        return '%g' % round(v, 4)
+    if isinstance(v, list):
+        return ', '.join(_fmt(x) for x in v)
+    return str(v)
+
+
+class SnapshotDialog(QtWidgets.QDialog):
+    """one saved event: the summary, the waterfall of the band, and the charts from before to after"""
+
+    def __init__(self, parent, folder):
+        super().__init__(parent)
+        self.folder = folder
+        self.setWindowTitle('Event snapshot - %s' % os.path.basename(folder))
+        self.resize(1200, 820)
+        info = json.load(open(os.path.join(folder, 'event.json')))
+        lines = []
+        for line in open(os.path.join(folder, 'lines.txt'), errors='replace').read().splitlines():
+            f = line.split()
+            try:
+                lines.append((float(f[1]), f[0].rstrip(':'), line))
+            except (IndexError, ValueError):
+                pass
+        p = parse_lines(lines)
+        s = info.get('summary', {})
+        t0 = lines[0][0] if lines else info['trigger_unix'] - PRE_S
+        t1 = lines[-1][0] if lines else info['closed_unix']
+
+        text = QtWidgets.QTextBrowser()
+        html = ['<h3>%s</h3>' % info.get('trigger_local', ''),
+                '<p><b>%s</b> · %s · lasted about %s s · %s</p>' % (
+                    info.get('band_label', ''), ', '.join('%s (%s)' % (w['title'], w['level'])
+                                                          for w in info.get('worst', {}).values()),
+                    _fmt(s.get('duration_s', '?')), info.get('closed_because', ''))]
+        for n in s.get('notes', []):
+            html.append('<p>• %s</p>' % n)
+        for key, title in (('noise', 'Noise'), ('spectrum', 'Spectrum (max over the event)'), ('position', 'Position'),
+                           ('gps_minus_pc_s', 'GPS time minus PC clock (s)')):
+            if s.get(key):
+                html.append('<p><b>%s</b>: %s</p>' % (title, '; '.join('%s %s' % (k.replace('_', ' '), _fmt(v))
+                                                                       for k, v in s[key].items())))
+        if s.get('satellites'):
+            rows = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
+                catalog.gnss_name(k), _fmt(v.get('cn0_before', '-')), _fmt(v.get('cn0_min', '-')),
+                _fmt(v.get('drop_db', '-')), 'lost' if v.get('lost') else '') for k, v in sorted(s['satellites'].items()))
+            html.append('<p><b>Satellites</b> (C/N0 dB-Hz)</p><table cellspacing=6><tr><th align=left>Satellite</th>'
+                        '<th>before</th><th>lowest</th><th>drop</th><th></th></tr>%s</table>' % rows)
+        iq = os.path.join(folder, 'samples.cs8')
+        html.append('<p><b>Raw samples</b>: %s</p>' % (
+            'samples.cs8 (%.0f MB, 20 s before to 20 s after; see samples.json) - open in SDR++ or inspectrum'
+            % (os.path.getsize(iq) / 1e6) if os.path.exists(iq) else 'not kept (off, low disk, or pruned)'))
+        html.append('<p style="color:gray">Everything is in %s: event.json (all the details), lines.txt (every line '
+                    'the receiver sent from %d s before to %d s after), waterfall.png.</p>' % (folder, PRE_S, POST_S))
+        text.setHtml(''.join(html))
+
+        wf = QtWidgets.QLabel()
+        wf.setAlignment(Qt.AlignCenter)
+        img = waterfall_image(p['spec'], info['trigger_unix'] - RAISE_S)
+        if img is not None:
+            wf.setPixmap(QtGui.QPixmap.fromImage(img.scaled(512, min(max(img.height(), 200), 600))))
+            if p['spec']:
+                wf.setToolTip('The band against its quiet baseline, %.3f MHz (left) to %.3f MHz (right), one row a '
+                              'second from top to bottom; the white ticks mark the event\'s start' %
+                              (p['spec'][0][1], p['spec'][0][2]))
+        else:
+            wf.setText('no spectrum lines in this snapshot')
+        wf_box = QtWidgets.QWidget()
+        wv = QtWidgets.QVBoxLayout(wf_box)
+        wv.setContentsMargins(0, 0, 0, 0)
+        cap = QtWidgets.QLabel()
+        cap.setWordWrap(True)
+        if p['spec']:
+            cap.setText('<b>The band over the event</b> - %.3f MHz (left) to %.3f MHz (right); time runs down, one row '
+                        'a second, %s to %s; the white ticks mark the start. Colour: dB above the quiet band, dark blue '
+                        '0, cyan +5, yellow +9, red +15.' % (
+                            p['spec'][0][1], p['spec'][0][2], time.strftime('%H:%M:%S', time.localtime(p['spec'][0][0])),
+                            time.strftime('%H:%M:%S', time.localtime(p['spec'][-1][0]))))
+        wv.addWidget(cap)
+        series = {'rise': [(x[0], x[1]) for x in p['noise']], 'peak': [(x[0], x[3]) for x in p['noise']],
+                  'cn0': [], 'nsat': []}
+        by_t = collections.defaultdict(list)
+        for sat, v in p['ch'].items():
+            for t, c, _ in v:
+                by_t[int(t)].append(c)
+        for t in sorted(by_t):
+            series['cn0'].append((t, float(np.median(by_t[t]))))
+            series['nsat'].append((t, len(by_t[t])))
+        home = info.get('home')
+        if home:
+            series['pos'] = [(t, distance_m(home['lat'], home['lon'], la, lo)) for t, la, lo, _, _ in p['pos']]
+        mark = info['trigger_unix'] - RAISE_S
+        charts = [StripChart('Noise above the quiet baseline', 'dB', [('rise', '#4c9aff', 'band power'),
+                                                                      ('peak', '#c792ea', 'narrowband peak')],
+                             NOISE_RISE_DB, 2.0, window=(t0, t1), marker=mark),
+                  StripChart('Satellites', '', [('cn0', '#4cd07d', 'median C/N0 dB-Hz'), ('nsat', '#e6e9ef', 'locked')],
+                             None, 5.0, window=(t0, t1), marker=mark),
+                  StripChart('Position from home', 'm', [('pos', '#4c9aff', 'distance')], POS_HOME_M[:1], 50.0,
+                             window=(t0, t1), marker=mark)]
+        right = QtWidgets.QWidget()
+        rv = QtWidgets.QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        for c in charts:
+            c.set_series(series)
+            rv.addWidget(c, 1)
+        top = QtWidgets.QSplitter()
+        top.addWidget(text)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(wf)
+        scroll.setWidgetResizable(True)
+        wv.addWidget(scroll, 1)
+        top.addWidget(wf_box)
+        top.setSizes([620, 560])
+        split = QtWidgets.QSplitter(Qt.Vertical)
+        split.addWidget(top)
+        split.addWidget(right)
+        split.setSizes([480, 340])
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(split, 1)
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        open_btn = QtWidgets.QPushButton('Open folder')
+        open_btn.clicked.connect(lambda: os.startfile(folder))
+        close = QtWidgets.QPushButton('Close')
+        close.clicked.connect(self.accept)
+        row.addWidget(open_btn)
+        row.addWidget(close)
+        v.addLayout(row)
+
+
 class IntegrityView(QtWidgets.QWidget):
     """the section: two verdicts, the checks, the charts, the satellites and the events"""
     changed = QtCore.pyqtSignal(int)        # the worst level now (for the section button)
@@ -553,7 +1048,10 @@ class IntegrityView(QtWidgets.QWidget):
     def __init__(self, tracker, orbit_of, home_of):
         super().__init__()
         self.tracker, self.orbit_of, self.home_of = tracker, orbit_of, home_of
-        self.mon = Monitor(os.path.join(paths.DATA, 'integrity-events.jsonl'))
+        self.snap_dir = os.path.join(paths.DATA, 'integrity')
+        self.mon = Monitor(os.path.join(paths.DATA, 'integrity-events.jsonl'), self.snap_dir)
+        self.mon.on_open = self._snapshot_began
+        self.mon.on_saved = self._snapshot_saved
         self.n_events = -1
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(4, 4, 4, 4)
@@ -595,7 +1093,9 @@ class IntegrityView(QtWidgets.QWidget):
                                   'left. Real satellites stay within tens of Hz.')
 
         self.events = QtWidgets.QListWidget()
-        self.events.setToolTip('What changed, newest first (kept in integrity-events.jsonl in the data folder)')
+        self.events.setToolTip('What changed, newest first (kept in integrity-events.jsonl in the data folder).\n'
+                               'Double-click a "Snapshot saved" line to see that event: summary, waterfall, charts.')
+        self.events.itemDoubleClicked.connect(self._open_event)
 
         self.charts = [
             StripChart('Noise above the quiet baseline', 'dB', [('rise', '#4c9aff', 'band power'),
@@ -635,7 +1135,19 @@ class IntegrityView(QtWidgets.QWidget):
                                 'the gains, it happens by itself).')
         self.relearn.clicked.connect(self._relearn)
         clear = QtWidgets.QPushButton('Clear events')
+        clear.setToolTip('Empty the list (the saved snapshot folders stay)')
         clear.clicked.connect(self._clear)
+        self.iq_box = QtWidgets.QCheckBox('Keep raw samples')
+        self.iq_box.setToolTip('With each event snapshot, save the raw SDR samples from 20 s before to 20 s after '
+                               '(samples.cs8, ~160 MB; only the newest %d are kept) - to look at the interfering '
+                               'signal itself later in SDR++ or inspectrum' % IQ_KEEP)
+        self.iq_box.setChecked(bool(theme.load_ui().get('integrity_iq', True)))
+        self.iq_box.toggled.connect(lambda on: theme.save_ui(integrity_iq=on))
+        folder = QtWidgets.QPushButton('Snapshots')
+        folder.setToolTip('Open the folder with the saved event snapshots')
+        folder.clicked.connect(self._open_folder)
+        row.addWidget(self.iq_box)
+        row.addWidget(folder)
         row.addWidget(self.relearn)
         row.addWidget(clear)
         ev.addLayout(row)
@@ -662,15 +1174,74 @@ class IntegrityView(QtWidgets.QWidget):
 
     # ---- the receiver
     def on_line(self, kind, line):
-        if kind in ('GCH', 'GPOS', 'GNOISE', 'GTIME'):
+        if kind in ('GCH', 'GPOS', 'GNOISE', 'GTIME', 'GSPEC'):
             self.mon.line(kind, line)
 
-    def on_running(self, on, system=None, auto_gain=False):
-        if on and system is not None and system['key'] in ('gnss1', 'glo1', 'bds1'):
-            self.mon.start(system['key'], system['label'], auto_gain)
+    def on_running(self, on, system=None, auto_gain=False, meta=None):
+        self.mon.idle_note = ''
+        if on and system is not None and system['key'] in WATCH_BANDS:
+            self.mon.start(system['key'], system['label'], auto_gain, meta)
+        elif on and system is not None and system['key'] in GNSS_BANDS:
+            self.mon.idle_note = ('not watching %s - the watch covers GNSS L1 (GPS) only for now' % system['label'])
         elif not on:
             self.mon.stop()
         self.tick()
+
+    # ---- snapshots
+    def _snapshot_began(self, stem):
+        """an event began: ask the GNSS receiver for the raw samples around it (if wanted and there is room)"""
+        if not self.iq_box.isChecked():
+            return
+        try:
+            import receiver
+            import storage
+            if storage.free_gb() < storage.settings()['min_free_gb'] + 1:
+                self.mon.event(time.time(), OK, 'Raw samples not kept for this event: low disk space')
+                return
+            os.makedirs(os.path.dirname(stem), exist_ok=True)
+            with open(receiver.snap_trigger(), 'w') as f:
+                f.write(stem)
+        except Exception as e:
+            print('integrity: raw-sample request failed: %r' % e)
+
+    def _snapshot_saved(self, folder):
+        """a snapshot is complete: its waterfall picture, and only the newest IQ_KEEP raw recordings kept"""
+        try:
+            lines = []
+            for line in open(os.path.join(folder, 'lines.txt'), errors='replace'):
+                if line.startswith('GSPEC'):
+                    f = line.split()
+                    lines.append((float(f[1]), 'GSPEC', line.strip()))
+            info = json.load(open(os.path.join(folder, 'event.json')))
+            img = waterfall_image(parse_lines(lines)['spec'], info['trigger_unix'] - RAISE_S)
+            if img is not None:
+                img.save(os.path.join(folder, 'waterfall.png'))
+        except Exception as e:
+            print('integrity: waterfall: %r' % e)
+        iq = []
+        for d in os.listdir(self.snap_dir):
+            p = os.path.join(self.snap_dir, d, 'samples.cs8')
+            if os.path.exists(p):
+                iq.append((os.path.getmtime(p), p))
+        for _, p in sorted(iq)[:-IQ_KEEP]:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        snaps = sorted(d for d in os.listdir(self.snap_dir) if os.path.isfile(os.path.join(self.snap_dir, d, 'event.json')))
+        for d in snaps[:-SNAPS_KEEP]:       # (names start with the date and time: oldest first)
+            shutil.rmtree(os.path.join(self.snap_dir, d), ignore_errors=True)
+
+    def _open_event(self, item):
+        folder = item.data(Qt.UserRole)
+        if folder and os.path.exists(os.path.join(folder, 'event.json')):
+            SnapshotDialog(self, folder).exec_()
+        elif folder:
+            QtWidgets.QMessageBox.information(self, 'Event snapshot', 'That snapshot is no longer there:\n%s' % folder)
+
+    def _open_folder(self):
+        os.makedirs(self.snap_dir, exist_ok=True)
+        os.startfile(self.snap_dir)
 
     # ---- buttons
     def _relearn(self):
@@ -683,7 +1254,7 @@ class IntegrityView(QtWidgets.QWidget):
                 pass
         busy = self.mon.active
         self.mon.event(time.time(), OK, 'Quiet-noise baselines forgotten (%d)%s' % (
-            gone, ': the receiver relearns at its next start' if busy else ''))
+            gone, ': the receiver relearns them now (30 s)' if busy else ''))
         self.tick()
 
     def _clear(self):
@@ -707,7 +1278,7 @@ class IntegrityView(QtWidgets.QWidget):
         self.spoof.set(sl, sw, self.mon.active)
         for c in self.mon.checks:
             it = self.items[c.key]
-            it.setText(1, LEVEL_WORD[c.level])
+            it.setText(1, 'not armed' if self.mon.active and not self.mon.armed else LEVEL_WORD[c.level])
             it.setForeground(1, QtGui.QBrush(QtGui.QColor(level_colour(c.level))))
             it.setText(2, c.value)
         self.sat_table.clear()
@@ -731,6 +1302,11 @@ class IntegrityView(QtWidgets.QWidget):
                                                            e['text']))
                 if e['level'] >= WATCH:
                     it.setForeground(QtGui.QBrush(QtGui.QColor(level_colour(e['level']))))
+                if e.get('snap'):
+                    it.setData(Qt.UserRole, e['snap'])
+                    f = it.font()
+                    f.setBold(True)
+                    it.setFont(f)
                 self.events.addItem(it)
 
     def showEvent(self, e):

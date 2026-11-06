@@ -47,6 +47,12 @@ NO_WINDOW = 0x08000000   # CREATE_NO_WINDOW
 RUNNING = '.running'     # <capture>.running: written while a receiver is on, holding its program's process ID
 
 
+def snap_trigger():
+    """the file the Integrity section writes an event's name into, so the GNSS receiver saves the raw samples
+    around it"""
+    return os.path.join(paths.DATA, 'integrity', 'iq-trigger.txt')
+
+
 def _alive(pid):
     h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
     if not h:
@@ -107,7 +113,7 @@ class Receiver(QtCore.QObject):
     running = QtCore.pyqtSignal(bool)
     decoded = QtCore.pyqtSignal()
     frame = QtCore.pyqtSignal(str, str)
-    gnss_line = QtCore.pyqtSignal(str, str)     # GNSS receivers' GNOISE / GTIME lines (kind, line)
+    gnss_line = QtCore.pyqtSignal(str, str)     # GNSS receivers' GNOISE / GSPEC / GTIME lines (kind, line)
 
     def __init__(self, replay=None):
         super().__init__()
@@ -231,6 +237,9 @@ class Receiver(QtCore.QObject):
         args += ['--if-gain', '%g' % sdr_settings.if_gain(s)]
         if prog[0] == GNSS_RX:      # the band's quiet noise, for the jamming watch (Integrity section)
             args += ['--noise-baseline', os.path.join(paths.DATA, 'noise-%s.npz' % self.system['key'])]
+            import integrity
+            if self.system['key'] in integrity.WATCH_BANDS:     # (it keeps 20 s of samples in memory: ~80 MB)
+                args += ['--snap-trigger', snap_trigger()]
         self.extractor.start(PY, args)
         if not self.extractor.waitForStarted(5000):
             self.status.emit('Could not start the %s receiver: %s' % (self.system['label'], self.extractor.errorString()))
@@ -357,16 +366,16 @@ class Receiver(QtCore.QObject):
             return
         lines = (self.out_rest + data.replace('\r\n', '\n')).split('\n')
         self.out_rest = lines.pop()
-        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS|MSIG|GTIME|GNOISE): ', l)]
+        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS|MSIG|GTIME|GNOISE|GSPEC): ', l)]
         if not lines:
             return
         with open(self.live_path, 'a', newline='') as f:
-            f.write(''.join(l + '\r\n' for l in lines if not l.startswith(('GTIME', 'GNOISE'))))
+            f.write(''.join(l + '\r\n' for l in lines if not l.startswith(('GTIME', 'GNOISE', 'GSPEC'))))
         for line in lines:
             kind = line.split(':', 1)[0]
-            if kind in ('GTIME', 'GNOISE'):     # (for the Integrity section; not saved, not frames)
+            if kind in ('GTIME', 'GNOISE', 'GSPEC'):    # (for the Integrity section; not saved, not frames)
                 self.gnss_line.emit(kind, line)
-            if kind == 'GNOISE':
+            if kind in ('GNOISE', 'GSPEC'):
                 continue
             if kind == 'GTIME':         # GNSS: GPS time minus the PC clock (Settings > PC clock); not saved
                 try:
