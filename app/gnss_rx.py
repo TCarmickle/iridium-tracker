@@ -29,6 +29,12 @@ Lines (from its log):
   GTIME: t offset_s nsat spread_s          GPS time minus this PC's clock (live mode, every 10 s): the median
                                            over the last fixes, each fix's GPS time against the PC time its
                                            samples were taken at (from the SDR's sample count)
+  GNOISE: t power_dbfs rise_db clip_pct peak_db peak_mhz floor_db learning rms_pct
+                                           the band's noise, once a second (NoiseMeter): its power (dB of full
+                                           scale) and how far it is above the quiet baseline, the samples clipped,
+                                           the strongest narrowband peak above the baseline's shape (dB, where),
+                                           the median rise across the band; learning = 1 while the baseline is
+                                           first learned (then the comparisons are 0)
 """
 import argparse
 import collections
@@ -62,6 +68,7 @@ CHUNK_S = 180.0
 # 135; 138 was in service until 2022) - tracked alongside, and their own position decoded from their messages
 WAAS_PRNS = '131,133,135,138'
 SIGNALS = ['-sig', 'L1CA', '-prn', '1-32,' + WAAS_PRNS, '-sig', 'E1B', '-prn', '1-36']
+NOISE = None                    # the band's noise meter (main)
 GPS_UTC_S = 18                  # GPS time runs this far ahead of UTC (leap seconds)
 GPS_EPOCH = datetime.datetime(1980, 1, 6, tzinfo=datetime.timezone.utc)
 
@@ -84,6 +91,8 @@ ap.add_argument('--parent-pid', type=int, default=0)   # stop when the tracker t
 ap.add_argument('--chunk-s', type=float, default=CHUNK_S)
 ap.add_argument('--keep-chunks', default='')    # for tests: keep the recorded chunks in this folder
 ap.add_argument('--mode', choices=('live', 'chunks'), default='live')
+ap.add_argument('--noise-baseline', default='')     # the quiet band's noise, learned and kept here (.npz)
+ap.add_argument('--no-noise', action='store_true')  # no GNOISE lines
 ap.add_argument('--constellation', choices=('gps', 'glonass', 'beidou'), default='gps')   # gps = GPS + Galileo + WAAS
 opts = ap.parse_args()
 if opts.constellation == 'glonass':     # every frequency channel (the SDR's slice holds the middle ones);
@@ -118,6 +127,11 @@ class Quantizer:
         self.rms = None
 
     def __call__(self, x):
+        if NOISE:
+            try:
+                NOISE(x)
+            except Exception as e:      # the watch must never stop the tracking
+                log('GNSS noise: %r' % e)
         # 8 bits are plenty for signals under the noise: scale the noise to ~+-24 so it is neither clipped
         # nor coarse (the scale follows the noise level slowly)
         r = float(np.sqrt(np.mean(np.abs(x) ** 2) / 2)) + 1e-12
@@ -129,6 +143,100 @@ class Quantizer:
         # came out with the wrong sign (checked against the satellites' real geometry on live GPS data)
         iq[1::2] = np.clip(np.round(-x.imag * k), -127, 127)
         return iq.tobytes()
+
+
+# ---------------------------------------------------------------- the band's noise (jamming watch)
+class NoiseMeter:
+    """once a second, a GNOISE line: the band's total power and its spectrum against a baseline learned when the
+    band was quiet (saved in --noise-baseline, so the next session starts from it). GNSS signals are under the
+    noise, so with the gain fixed the band's power is the noise itself: a jammer raises it (broadband), or shows as
+    a peak above the baseline's own shape (a narrowband or swept carrier). Known local spurs are part of the
+    baseline, so they don't count."""
+    NFFT = 512
+    LEARN_S = 30            # no baseline yet (or the gains changed): the first 30 s become it
+    ADAPT = 0.002           # quiet seconds then nudge the baseline (~8 min time constant): it follows slow drifts
+    SAVE_S = 300
+
+    def __init__(self, rate, center, path):
+        self.rate, self.center, self.path = rate, center, path
+        self.win = np.blackman(self.NFFT).astype(np.float32)
+        self.win /= np.sqrt(np.mean(self.win ** 2))
+        n = self.NFFT
+        use = np.ones(n, bool)
+        use[:n // 10] = use[-n // 10:] = False          # the filter's roll-off at the slice's edges
+        use[n // 2 - 3:n // 2 + 4] = False              # the DC spike
+        self.use = use
+        self.freqs = center + (np.arange(n) - n // 2) * rate / n
+        self.key = np.array([rate, center, opts.gain, opts.if_gain, float(opts.auto_gain)])
+        self.base_spec = self.base_power = None
+        self.learn = []
+        try:
+            z = np.load(path)
+            if z['key'].shape == self.key.shape and np.allclose(z['key'], self.key):
+                self.base_spec, self.base_power = z['spec'], float(z['power'])
+        except Exception:       # no baseline yet, another band's or other gains
+            pass
+        self._reset()
+        self.t_last = time.time()
+        self.t_saved = time.time()
+
+    def _reset(self):
+        self.p_sum, self.p_n, self.clip, self.acc, self.nacc = 0.0, 0, 0, np.zeros(self.NFFT), 0
+
+    def __call__(self, x):
+        self.p_sum += float(np.sum(x.real * x.real + x.imag * x.imag))
+        self.p_n += len(x)
+        self.clip += int(np.count_nonzero((np.abs(x.real) > 0.99) | (np.abs(x.imag) > 0.99)))
+        n = self.NFFT
+        for k in range(0, len(x) - n + 1, 8 * n):       # a spectrum every 4096 samples is plenty
+            self.acc += np.abs(np.fft.fftshift(np.fft.fft(x[k:k + n] * self.win))) ** 2
+            self.nacc += 1
+        now = time.time()
+        if now - self.t_last >= 1.0 and self.nacc:
+            self._report(now)
+
+    def _report(self, now):
+        self.t_last = now
+        power = 10 * np.log10(self.p_sum / max(self.p_n, 1) + 1e-20)        # dB of full scale
+        spec = 10 * np.log10(self.acc / self.nacc / self.NFFT + 1e-20)
+        clip = 100.0 * self.clip / max(self.p_n, 1)
+        rms_pct = 100 * np.sqrt(self.p_sum / max(self.p_n, 1) / 2)
+        self._reset()
+        learning = self.base_spec is None
+        if learning:
+            self.learn.append((power, spec))
+            if len(self.learn) >= self.LEARN_S:
+                self.base_power = float(np.median([p for p, _ in self.learn]))
+                self.base_spec = np.median([s for _, s in self.learn], axis=0)
+                self.learn = []
+                self._save()
+                log('GNSS noise: baseline learned (band power %.1f dBFS)' % self.base_power)
+            emit('GNOISE: %.3f %.2f 0 %.4f 0 0 0 1 %.2f' % (now, power, clip, rms_pct))
+            return
+        rise = power - self.base_power
+        d = (spec - self.base_spec)[self.use]
+        floor = float(np.median(d))
+        i = int(np.argmax(d))
+        peak = float(d[i] - floor)          # above the band's own (possibly raised) level
+        peak_mhz = self.freqs[self.use][i] / 1e6
+        emit('GNOISE: %.3f %.2f %.2f %.4f %.2f %.4f %.2f 0 %.2f' % (now, power, rise, clip, peak, peak_mhz, floor,
+                                                                    rms_pct))
+        if abs(rise) < 1.0 and peak < 6.0 and clip < 0.01:     # quiet: follow slow drifts (temperature)
+            self.base_power += self.ADAPT * rise
+            self.base_spec += self.ADAPT * (spec - self.base_spec)
+            if now - self.t_saved > self.SAVE_S:
+                self._save()
+
+    def _save(self):
+        self.t_saved = time.time()
+        if not self.path:
+            return
+        try:
+            with open(self.path + '.tmp', 'wb') as f:
+                np.savez(f, key=self.key, spec=self.base_spec, power=self.base_power)
+            os.replace(self.path + '.tmp', self.path)
+        except OSError as e:
+            log('GNSS noise: could not save the baseline (%s)' % e)
 
 
 # ---------------------------------------------------------------- recording chunks
@@ -642,6 +750,9 @@ def main():
     if not os.path.exists(POCKET_TRK):
         log('GNSS: %s is missing - see README (PocketSDR)' % POCKET_TRK)
         sys.exit(2)
+    global NOISE
+    if not opts.no_noise:
+        NOISE = NoiseMeter(opts.rate, opts.center, opts.noise_baseline)
     if opts.mode == 'live':
         live = LiveTracker(opts.rate)
         live.start()

@@ -1895,7 +1895,8 @@ class Tracker(QtWidgets.QMainWindow):
         hl.addWidget(title)
         # the two sections: the tracker (map, satellites) and the pictures received (Meteor-M weather images)
         self.section_btns = []
-        for k, text in enumerate(('\U0001F6F0  Tracker', '\U0001F5BC  Images', '\U0001F4FB  Radio')):
+        for k, text in enumerate(('\U0001F6F0  Tracker', '\U0001F5BC  Images', '\U0001F4FB  Radio',
+                                  '\U0001F6E1  Integrity')):
             b = QtWidgets.QPushButton(text)
             b.setCheckable(True)
             b.setChecked(k == 0)
@@ -1909,6 +1910,10 @@ class Tracker(QtWidgets.QMainWindow):
                                         'save the pictures')
         self.section_btns[2].setToolTip('Listen anywhere the SDR reaches, like SDR++: big spectrum and waterfall, '
                                         'frequency digits, mode and bandwidth')
+        self.section_btns[3].setToolTip('Jamming and spoofing watch for GPS, Galileo, WAAS, GLONASS and BeiDou: '
+                                        'noise, signal strength, position, time and Doppler checks while a GNSS band '
+                                        'is received')
+        self.integrity_level = -1
         hl.addStretch(1)
         hl.addWidget(self.rx_btn)
         hl.addWidget(self.rx_system)
@@ -2110,6 +2115,14 @@ class Tracker(QtWidgets.QMainWindow):
         import radio_view
         self.radio_view = radio_view.RadioView(self)
         self.sections.addWidget(self.radio_view)
+        import integrity
+        self.integrity = integrity.IntegrityView(self, self._gnss_orbit_of, lambda: (HOME_LAT, HOME_LON, HOME_H))
+        self.sections.addWidget(self.integrity)
+        self.receiver.frame.connect(self.integrity.on_line)
+        self.receiver.gnss_line.connect(self.integrity.on_line)
+        self.receiver.running.connect(lambda on: self.integrity.on_running(
+            on, getattr(self.receiver, 'system', None), sdr_settings.gain(self.receiver.sdr)[1]))
+        self.integrity.changed.connect(self._integrity_level)
         central = QtWidgets.QWidget()
         cv = QtWidgets.QVBoxLayout(central)
         cv.setContentsMargins(4, 4, 4, 0)
@@ -2336,11 +2349,12 @@ class Tracker(QtWidgets.QMainWindow):
 
     # ---- sky plot
     def show_section(self, k):
-        """0: the tracker, 1: Images, 2: Radio (the map's own buttons are hidden in the others; the spectrum comes along)"""
+        """0: the tracker, 1: Images, 2: Radio, 3: Integrity (the map's own buttons are hidden in the others; the
+        spectrum comes along, except to Integrity)"""
         # the spectrum / waterfall / sound panel goes with the section shown (one panel, one set of settings)
         visible = self.spec_btn.isChecked()
         self.spectrum.view.pan_retune = None        # (dragging along the band: the Radio section only)
-        self.spectrum.view.set_section(('tracker', 'images', 'radio')[k])     # (its own trace / waterfall split)
+        self.spectrum.view.set_section(('tracker', 'images', 'radio', 'tracker')[k])  # (its own trace / waterfall split)
         if k == 1:
             self.images_view.take_spectrum(self.spectrum)
         elif k == 2:
@@ -2356,6 +2370,30 @@ class Tracker(QtWidgets.QMainWindow):
             b.setVisible(k == 0)
         if k == 1:
             self.images_view.refresh()
+
+    def _gnss_orbit_of(self, sat):
+        """a GNSS satellite's own broadcast orbit, if decoded and still fresh (for the Integrity checks)"""
+        import gnss
+        o = self.data.orbits.get(catalog.gnss_name(sat))
+        if not isinstance(o, (gnss.EphemerisOrbit, gnss.SBASOrbit, gnss.GlonassOrbit)):
+            return None
+        try:
+            return o if float(np.asarray(o.sigma_km(time.time())).reshape(-1)[0]) < 20 else None
+        except Exception:
+            return None
+
+    def _integrity_level(self, lv):
+        """the Integrity section's button shows a watch / alert from any section"""
+        if lv == self.integrity_level:
+            return
+        self.integrity_level = lv
+        b = self.section_btns[3]
+        b.setText('\U0001F6E1  Integrity' + {1: '  ●', 2: '  ⚠'}.get(lv, ''))
+        col = {1: 'WARN', 2: 'ALERT'}.get(lv)
+        extra = ('QPushButton { color: %%(%s)s; font-weight: 700; border: 1px solid %%(%s)s; }' % (col, col)) if col else ''
+        theme.style(b, 'QPushButton { padding: 4px 12px; } QPushButton:checked { background: %(SEL_BG)s; '
+                       'border: 1px solid %(ACCENT)s; color: %(TEXT)s; font-weight: 600; }' + extra)
+        b.setMinimumWidth(b.sizeHint().width() + 16)
 
     def _make_sky(self):
         """the sky plot (made once)"""

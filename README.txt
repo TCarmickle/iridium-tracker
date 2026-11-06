@@ -417,3 +417,32 @@ While the GNSS L1 (GPS) receiver has a position fix, Settings (the cog) > PC clo
 this PC's clock is from GPS time (accurate to a few milliseconds - the receiver times each fix
 from the SDR's sample count). 'Set PC clock to GPS time' moves the Windows clock by that much;
 Windows asks for permission first.
+
+JAMMING AND SPOOFING WATCH (Integrity section)
+----------------------------------------------
+The Integrity section (header button) watches whichever GNSS band is being received - GPS /
+Galileo / WAAS, GLONASS or BeiDou - for someone drowning the satellites out (jamming) or faking
+them (spoofing). Two verdicts at the top (clear / watch / ALERT), the checks under them, the
+satellites tracked now, live charts of the last 30 minutes, and an event list (kept in the data
+folder as integrity-events.jsonl). The header button turns amber or red from any section.
+Jamming checks:
+  - Noise in the band: GNSS signals are under the noise, so with a fixed gain the band's power is
+    the noise itself. The receiver learns the band's quiet level and shape in the first 30 s
+    (kept as noise-<band>.npz in the data folder, per band and gain) and reports the rise.
+    Watch +3 dB, alert +6 dB. Off with automatic gain.
+  - Narrowband interference: a peak above the band's usual shape (its own spurs are in the
+    baseline): a carrier or swept jammer. Watch 5 dB, alert 12 dB.
+  - Overload (samples clipped), signal strength (every satellite's C/N0 falling together) and
+    satellites lost at once. A C/N0 drop without more noise is reported as a watch: something
+    blocking the antenna.
+Spoofing checks:
+  - Position vs home and position drift: the receiver's own fix against Settings > location, and
+    how far it moved during the session (measured here: within ~15-25 m normally).
+  - Time jump: GPS time against the PC clock, with the PC clock's own steps taken out.
+  - Doppler vs orbits: each satellite's Doppler against what its own broadcast orbit says it must
+    be from here, after the SDR's frequency offset (common to all). Real satellites matched to
+    ~1 Hz rms here; one fake transmitter can't get every satellite right. Alert at 50 Hz off.
+  - Satellites heard that their own orbit puts below the horizon, and signals that are too strong
+    or all the same strength.
+'Relearn quiet noise' forgets the noise baselines (do it when the band is known to be quiet; the
+next 30 s of receiving become the new one).
