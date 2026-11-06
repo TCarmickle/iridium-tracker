@@ -48,8 +48,12 @@ def save(refs):
 
 def add(ref):
     """ref: {'name','lat','lon', 'height_msl'?, 'height_ell'?, 'source', 'n'?, 'span_s'?, 'avg95_m'?, 't'?};
-    a reference of the same name and source is replaced"""
+    a reference of the same name and source is replaced - keeping its star (the Garmin's points are imported again
+    every time it is plugged in, and that must not lose which one was chosen)"""
+    old = [r for r in load() if r['name'] == ref['name'] and r.get('source') == ref.get('source')]
     refs = [r for r in load() if not (r['name'] == ref['name'] and r.get('source') == ref.get('source'))]
+    if any(r.get('primary') for r in old) and 'primary' not in ref:
+        ref['primary'] = True
     ref.setdefault('t', time.time())
     refs.append(ref)
     save(refs)

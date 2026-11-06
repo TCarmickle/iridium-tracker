@@ -286,8 +286,6 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
 `pocket_trk.opt`.
 
 ## Known issues / stale text (fix when touching nearby)
-- `refpoints.add` replaces an entry with the same (name, source) and **drops its `primary` ★**; `garmin_seen` is in
-  memory, so after a restart a connected Garmin re-imports and its ★ is lost.
 - `gnss_rx.Lines.line` `$POS` branch checks `len(f) > 11` but reads `f[12]` (IndexError in the reader thread on a
   12-field line; only ValueError is caught).
 - The tracker's storage protection (`_housekeeping`, `show_settings` in iridium_tracker.py) hard-codes the Iridium
