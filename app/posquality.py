@@ -105,13 +105,16 @@ def headline(q):
         return 'Your position: no GNSS position fixes yet (receive GNSS L1)'
     if not q['enough']:
         return 'Your position: %d fixes so far - needs %d for an accuracy figure' % (q['n'], MIN_FIXES)
-    parts = ['Your position: ±%.0f m (95%%), %s' % (q['r95_m'], q['grade']),
+    parts = ['Your position%s: ±%.0f m (95%%), %s' % (' (WAAS-corrected)' if q.get('source') == 'waas' else '',
+                                                            q['r95_m'], q['grade']),
              'half within %.0f m' % q['cep50_m']]
     if 'drift_m' in q:
         parts.append('drift %.0f m over %.0f min' % (q['drift_m'], q['drift_min']))
     if 'hdop' in q:
         parts.append('HDOP %.1f' % q['hdop'])
     parts.append('%.0f satellites' % q['nsat'])
+    if 'pocket_r95_m' in q:
+        parts.append('pocket_trk alone ±%.0f m' % q['pocket_r95_m'])
     return '  ·  '.join(parts)
 
 
@@ -120,8 +123,13 @@ def details(q):
     if not q or not q['enough']:
         return ('Needs %d position fixes with 4+ satellites (about half a minute of GNSS L1 with a fix). The figures '
                 'are from the last %d minutes.' % (MIN_FIXES, WINDOW_S / 60))
-    L = ['From your last %d position fixes (%.0f min, median %.0f satellites):' % (q['n'], q['span_s'] / 60, q['nsat']),
-         '',
+    L = ['From your last %d position fixes (%.0f min, median %.0f satellites):' % (q['n'], q['span_s'] / 60, q['nsat'])]
+    if q.get('source') == 'waas':
+        L += ['These are the tracker\'s own fixes (spp.py): the raw satellite ranges, carrier-smoothed, with the WAAS '
+              'corrections (satellite orbits and clocks, and the ionosphere over North America).' +
+              (' pocket_trk\'s own fixes over the same time: 95 %% within %.0f m.' % q['pocket_r95_m']
+               if 'pocket_r95_m' in q else '')]
+    L += ['',
          'Scatter - how far each fix is from their middle:',
          '   half of them within %.1f m (CEP50)' % q['cep50_m'],
          '   95 %% within %.1f m (R95) - %s' % (q['r95_m'], q['grade']),

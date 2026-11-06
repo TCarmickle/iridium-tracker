@@ -117,7 +117,7 @@ GNSS_BAND = {
     'band_hz': (1574.4e6, 1576.44e6),
     'rate': 2048000, 'center_hz': 1575420000,
     'capture_prefix': 'gnss-',
-    'keep_kinds': ('GCH:', 'GEPH:', 'GPOS:'),
+    'keep_kinds': ('GCH:', 'GEPH:', 'GPOS:', 'GSPP:'),
     'antenna': 'the active GPS antenna, plugged straight into the SDR (it is powered through the coax - no DC '
                'blocker), with open sky: outdoors or in a window',
     'listen_hz': 1575.42e6,

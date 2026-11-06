@@ -447,11 +447,12 @@ def gnss_catalog_names():
 
 def read_gnss(lines):
     """GNSS receiver lines -> [(kind, unix t, fields)]
-       GCH: t sat sig cn0 doppler_hz lock_s    GEPH: t sat <$EPH fields>    GPOS: t lat lon height nsat"""
+       GCH: t sat sig cn0 doppler_hz lock_s    GEPH: t sat <$EPH fields>    GPOS: t lat lon height nsat
+       GSPP: t lat lon height nsat hdop ...    (our own WAAS-corrected, carrier-smoothed fix: spp.py)"""
     out = []
     for line in lines:
         f = line.split(None, 3)
-        if len(f) < 3 or f[0] not in ('GCH:', 'GEPH:', 'GPOS:'):
+        if len(f) < 3 or f[0] not in ('GCH:', 'GEPH:', 'GPOS:', 'GSPP:'):
             continue
         try:
             out.append((f[0][:-1], float(f[1]), line.split()[2:]))
@@ -486,6 +487,9 @@ def analyze_gnss(stem):
         elif kind == 'GPOS' and len(f) >= 4:
             cap['gnss_fixes'].append({'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
                                       'nsat': int(f[3])})
+        elif kind == 'GSPP' and len(f) >= 5:
+            cap.setdefault('gnss_spp', []).append({'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]),
+                                                   'height_m': float(f[2]), 'nsat': int(f[3]), 'hdop': float(f[4])})
     for sat, hits in sorted(by_sat.items()):
         hits.sort()
         groups, cur = [], [hits[0]]

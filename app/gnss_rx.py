@@ -29,6 +29,11 @@ Lines (from its log):
   GTIME: t offset_s nsat spread_s          GPS time minus this PC's clock (live mode, every 10 s): the median
                                            over the last fixes, each fix's GPS time against the PC time its
                                            samples were taken at (from the SDR's sample count)
+  GSPP: t lat lon height_m nsat hdop n_waas_iono n_fast n_longterm n_smoothed
+                                           our own position fix (spp.py, GPS band only): pocket_trk's raw
+                                           ranges, carrier-smoothed, with the WAAS corrections (how many satellites
+                                           got the WAAS ionosphere / fast / long-term corrections; how many were
+                                           smoothed 30 s or more); only fixes that pass its quality gate
   GNOISE: t power_dbfs rise_db clip_pct peak_db peak_mhz floor_db learning rms_pct
                                            the band's noise, once a second (NoiseMeter): its power (dB of full
                                            scale) and how far it is above the quiet baseline, the samples clipped,
@@ -61,6 +66,7 @@ from gnuradio import gr
 import gnss
 import rtcm3
 import sdr_taps
+import spp
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 POCKET_TRK = os.path.join(HERE, 'pocketsdr', 'pocket_trk.exe')
@@ -101,6 +107,8 @@ ap.add_argument('--mode', choices=('live', 'chunks'), default='live')
 ap.add_argument('--noise-baseline', default='')     # the quiet band's noise, learned and kept here (.npz)
 ap.add_argument('--no-noise', action='store_true')  # no GNOISE lines
 ap.add_argument('--snap-trigger', default='')       # raw samples around events: IQRecorder's trigger file
+ap.add_argument('--spp-state', default='')          # our position solver's kept state (GPS ionosphere model, .json)
+ap.add_argument('--no-spp', action='store_true')    # no GSPP lines (our own WAAS-corrected position)
 ap.add_argument('--constellation', choices=('gps', 'glonass', 'beidou'), default='gps')   # gps = GPS + Galileo + WAAS
 opts = ap.parse_args()
 if opts.constellation == 'glonass':     # every frequency channel (the SDR's slice holds the middle ones);
@@ -516,6 +524,20 @@ class Lines:
         self.bds = BeidouNames() if opts.constellation == 'beidou' else None
         self.offsets = collections.deque(maxlen=10)
         self.last_gtime = 0.0
+        # our own position solution (spp.py: WAAS corrections + carrier smoothing) from pocket_trk's raw measurements,
+        # GPS L1 band only; GPS's ionosphere model is kept between sessions (it takes up to 12.5 min to arrive)
+        self.spp = None
+        self.spp_fixes = 0
+        if opts.constellation == 'gps' and not opts.no_spp:
+            self.spp = spp.Solver(iono='sbas', sbas_orbit=True, smooth=True)
+            try:
+                with open(opts.spp_state) as f:
+                    st = json.load(f)
+                if time.time() - st.get('t', 0) < 7 * 86400:
+                    self.spp.ion = st['ion']
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            self.saved_ion = self.spp.ion
 
     def orbits(self, ephs, t):
         for sat, sig, fields in ephs:      # in the field order of a $EPH line, so gnss.parse_eph reads it
@@ -531,12 +553,41 @@ class Lines:
             if self.eph.get(sat) != same:
                 self.eph[sat] = same
                 emit('GEPH: %.3f %s %s' % (t, sat, text))
+                if self.spp and not fields.get('glo'):
+                    self.spp.eph(gnss.parse_eph('$EPH,%.3f,%s,%s' % (t, sat, text)))
+
+    def _spp(self, f, line):
+        """pocket_trk's raw measurements and navigation messages into our own solver; a GSPP line per good fix"""
+        if f[0] == '$NAV':
+            self.spp.nav(line)
+            if self.spp.ion and self.spp.ion != self.saved_ion and opts.spp_state:
+                self.saved_ion = self.spp.ion
+                try:
+                    with open(opts.spp_state, 'w') as fh:
+                        json.dump({'t': time.time(), 'ion': self.spp.ion}, fh)
+                except OSError:
+                    pass
+        elif f[0] == '$EPH':
+            self.spp.eph(gnss.parse_eph(line))
+        elif f[0] == '$OBS':
+            try:
+                s = self.spp.obs(line)
+            except Exception as e:      # our solver must never stop the tracking
+                log('GNSS position solver: %r' % e)
+                return
+            if s and s['ok']:
+                self.spp_fixes += 1
+                emit('GSPP: %.3f %.9f %.9f %.3f %d %.2f %d %d %d %d' % (
+                    float(gnss.gpst_to_unix(s['t'])), s['lat'], s['lon'], s['h'], s['nsat'], s['hdop'],
+                    s['iono'].get('sbas', 0), s['fast'], s['lt'], s['smoothed']))
 
     def line(self, line, when):
         """one log line; when(receiver time) -> unix time"""
         f = line.strip().split(',')
         if not f or not f[0].startswith('$'):
             return
+        if self.spp and f[0] in ('$NAV', '$OBS', '$EPH'):
+            self._spp(f, line)
         try:
             if f[0] == '$CH' and len(f) > 10:
                 rt, sat, sig, lock, cn0, fd = float(f[1]), f[4], f[5], float(f[7]), float(f[8]), float(f[10])
@@ -830,9 +881,10 @@ class LiveTracker(threading.Thread):
             if time.time() - last_note > 60:
                 last_note = time.time()
                 locked = sorted(s for s, rt in self.out.last_ch.items() if when(rt) > time.time() - 5)
-                log('%d | GNSS live: %d satellites locked now (%s), %d broadcast orbits, %d position fixes, '
-                    '%.0f s of samples dropped%s' % (time.time(), len(locked), ' '.join(locked) or 'none',
-                                                    len(self.out.eph), self.out.fixes, self.dropped / self.rate,
+                log('%d | GNSS live: %d satellites locked now (%s), %d broadcast orbits, %d position fixes '
+                    '(%d WAAS-corrected), %.0f s of samples dropped%s' % (
+                        time.time(), len(locked), ' '.join(locked) or 'none', len(self.out.eph), self.out.fixes,
+                        self.out.spp_fixes, self.dropped / self.rate,
                                                     ', WAAS messages %s' % self.out.sbas_types if self.out.sbas_types
                                                     else ''))
             if not alive:

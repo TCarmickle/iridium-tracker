@@ -312,7 +312,8 @@ class Data:
         self._ham_names = None  # NORAD number -> catalog name, for ham satellites
         self._ham_fits = {}     # ham satellite -> (data size, time) of its last Doppler-only fit
         self.gnss_eph = {}      # GNSS satellite id (G05...) -> (time, its newest broadcast ephemeris fields)
-        self.gnss_fixes = []    # GNSS position fixes of the receiver itself
+        self.gnss_fixes = []    # GNSS position fixes of the receiver itself (pocket_trk's)
+        self.gnss_spp = []      # ...and our own WAAS-corrected, carrier-smoothed ones (spp.py)
         self.live_read = {}     # live file -> how far we've read it
         self.live_cap = None    # the newest capture (the one the receiver writes while running)
         self.live_fixes, self.live_heard, self.live_events = [], {}, []
@@ -546,7 +547,7 @@ class Data:
             print('catalog: %s' % e)
             caps = {}
         self.captures, self.fixes = [], []
-        self.gnss_eph, self.gnss_fixes = {}, []
+        self.gnss_eph, self.gnss_fixes, self.gnss_spp = {}, [], []
         self.doppler = {}       # name -> list of Doppler curves [(t, Hz), ...]
         self.info = {}          # name -> details
         self.slot_name = {}     # (plane, slot) -> name
@@ -562,6 +563,7 @@ class Data:
                     if t >= self.gnss_eph.get(sat, (0, ''))[0]:
                         self.gnss_eph[sat] = (t, fields)
                 self.gnss_fixes += c.get('gnss_fixes', [])
+                self.gnss_spp += c.get('gnss_spp', [])
             if systems.get(c.get('system')).get('system') == 'ham':
                 if self._ham_names is None:
                     self._ham_names = catalog.norad_names()
@@ -934,6 +936,9 @@ class Data:
                 self.gnss_fixes.append(fx)
                 events.append('%s  GNSS FIX  %+.5f, %+.5f, %.0f m (%d satellites)' % (fmt_clock(t), fx['lat'], fx['lon'],
                                                                                   fx['height_m'], fx['nsat']))
+            elif kind == 'GSPP' and len(f) >= 5:      # our own WAAS-corrected fix (no event line: one a second)
+                self.gnss_spp.append({'t': t, 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
+                                      'nsat': int(f[3]), 'hdop': float(f[4])})
         return events
 
 
@@ -2426,9 +2431,19 @@ class Tracker(QtWidgets.QMainWindow):
                     azel.append((az, el))
         try:
             q = posquality.quality(fixes, None, home, azel)
+            # our own WAAS-corrected, carrier-smoothed fixes (spp.py) when there are enough recent ones
+            spp_last = max((f['t'] for f in self.data.gnss_spp), default=None)
+            qs = posquality.quality(self.data.gnss_spp, None, home, azel) if spp_last and (
+                last is None or spp_last > last - 120) else None
         except Exception as e:
-            q = None
+            q = qs = None
             print('position quality: %r' % e)
+        plain = q
+        if qs and qs['enough']:
+            q = qs
+            q['source'] = 'waas'
+            if plain and plain['enough']:
+                q['pocket_r95_m'] = plain['r95_m']
         text = posquality.headline(q)
         if q and q.get('t_last') and not live:
             text += '  ·  (from your last fixes, %s)' % time.strftime('%d %b %H:%M', time.localtime(q['t_last']))
@@ -2645,7 +2660,9 @@ class Tracker(QtWidgets.QMainWindow):
 
     def gnss_location(self):
         """(lat, lon, height km, n) from your most recent GNSS position fixes (their median), or None"""
-        fixes = sorted(self.data.gnss_fixes, key=lambda f: f['t'])[-20:]
+        # our own WAAS-corrected, smoothed fixes if there are any (the last 2 minutes of them), else pocket_trk's
+        fixes = sorted(self.data.gnss_spp, key=lambda f: f['t'])[-120:] or \
+            sorted(self.data.gnss_fixes, key=lambda f: f['t'])[-20:]
         if not fixes:
             return None
         med = lambda k: float(np.median([f[k] for f in fixes]))     # noqa: E731

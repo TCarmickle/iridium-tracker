@@ -236,7 +236,8 @@ class Receiver(QtCore.QObject):
         args += ['--auto-gain'] * auto + ['--no-dc'] * (not s['dc_correction']) + ['--parent-pid', str(os.getpid())]
         args += ['--if-gain', '%g' % sdr_settings.if_gain(s)]
         if prog[0] == GNSS_RX:      # the band's quiet noise, for the jamming watch (Integrity section)
-            args += ['--noise-baseline', os.path.join(paths.DATA, 'noise-%s.npz' % self.system['key'])]
+            args += ['--noise-baseline', os.path.join(paths.DATA, 'noise-%s.npz' % self.system['key']),
+                     '--spp-state', os.path.join(paths.DATA, 'gnss-solver.json')]
             import integrity
             if self.system['key'] in integrity.WATCH_BANDS:     # (it keeps 20 s of samples in memory: ~80 MB)
                 args += ['--snap-trigger', snap_trigger()]
@@ -366,7 +367,7 @@ class Receiver(QtCore.QObject):
             return
         lines = (self.out_rest + data.replace('\r\n', '\n')).split('\n')
         self.out_rest = lines.pop()
-        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS|MSIG|GTIME|GNOISE|GSPEC): ', l)]
+        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS|GSPP|MSIG|GTIME|GNOISE|GSPEC): ', l)]
         if not lines:
             return
         with open(self.live_path, 'a', newline='') as f:

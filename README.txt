@@ -440,6 +440,23 @@ In the Navigation view, under the number boxes: how good your own GNSS position 
 Measured here with the current antenna (4-6 satellites): about 20-25 m (95 %), half within
 6-9 m, drift 2-5 m over 8 minutes. Needs 30 fixes; fixes a second apart aren't independent, so
 the full 10 minutes gives the honest figure.
+WAAS-CORRECTED POSITION (our own solver)
+----------------------------------------
+On the GNSS L1 (GPS) band the tracker also works out the position itself (app\spp.py) from
+pocket_trk's raw measurements, in two steps pocket_trk doesn't take:
+  - carrier smoothing: each satellite's range is carried forward on its carrier phase (smooth to
+    millimetres) and only nudged by the noisy code range (100 s, as WAAS receivers do);
+  - WAAS corrections from the WAAS satellites (WAAS 131 / 133 / 135, the GEO satellites in the
+    list): each GPS satellite's orbit and clock error (long-term and fast corrections, message
+    types 2-5, 24, 25) and the ionosphere delay over a 5-degree grid (types 18 and 26).
+WAAS doesn't give a position by itself; it corrects the GPS satellites. Its fixes (GSPP lines,
+kept in the catalog) are used by the 'Your position' line and 'Use GPS-tracked position' when
+there are enough; the line then says 'WAAS-corrected' and shows pocket_trk's own figure next to it.
+Measured on 9 recorded sessions here: 95 % within 5-16 m (pocket_trk 11-32 m), half within
+1-4 m (pocket_trk 4-9 m), and the sessions' middle positions agree with each other to 2.2 m rms
+(pocket_trk 3.2 m). Fixes start once 4 satellites have been smoothed for 30 s, and only with
+good geometry (HDOP 6 or better). GPS's own ionosphere model is kept in data\gnss-solver.json
+between sessions. Galileo joins when 2 or more Galileo satellites have decoded orbits.
 JAMMING AND SPOOFING WATCH (Integrity section)
 ----------------------------------------------
 The Integrity section (header button) watches the GNSS L1 (GPS) band - GPS, Galileo and WAAS -
