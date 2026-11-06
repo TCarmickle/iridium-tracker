@@ -2444,6 +2444,20 @@ class Tracker(QtWidgets.QMainWindow):
             q['source'] = 'waas'
             if plain and plain['enough']:
                 q['pocket_r95_m'] = plain['r95_m']
+        if q and q.get('enough'):
+            # over time: every session in the catalog (our own WAAS fixes once there are 3+ sessions of them)
+            key = (len(self.data.gnss_spp), len(fixes), home)
+            if getattr(self, '_long_key', None) != key:
+                self._long_key = key
+                lt = posquality.long_term(self.data.gnss_spp, home)
+                if lt and lt['sessions'] >= 3:
+                    lt['label'] = 'WAAS-corrected'
+                else:
+                    lt = posquality.long_term(fixes, home)
+                    if lt:
+                        lt['label'] = 'pocket_trk'
+                self._long = lt
+            q['long'] = self._long
         text = posquality.headline(q)
         if q and q.get('t_last') and not live:
             text += '  ·  (from your last fixes, %s)' % time.strftime('%d %b %H:%M', time.localtime(q['t_last']))

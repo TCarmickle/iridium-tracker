@@ -437,6 +437,15 @@ In the Navigation view, under the number boxes: how good your own GNSS position 
   - HDOP: the satellites' geometry, from their own orbits. Spread over the sky is good (under 2);
     bunched up is poor (over 5). Expected 95 % error ~ 2 x HDOP x 5 m.
   - From home: the middle of the fixes against the location in Settings.
+  - Average: how sure the middle of the recent fixes is (95 %). Single fixes jump, but their
+    middle settles: errors are taken to last at least 2 minutes, so 10 minutes of fixes count as
+    about 5 independent ones (needs 5+ minutes; a 10-minute average is about +-3 m with the
+    WAAS-corrected fixes here, about +-10 m with pocket_trk's).
+  - All sessions: every GNSS session in the catalog, each one's middle, and their average; how
+    sure that is comes from how much the sessions disagree (other days, times, satellites), so it
+    tightens as sessions are added. Uses the WAAS-corrected fixes once there are 3+ sessions of
+    them. (Checked against a Garmin GPSMAP 64st left 10 minutes beside the antenna: its average
+    was 1.5 m from the home location.)
 Measured here with the current antenna (4-6 satellites): about 20-25 m (95 %), half within
 6-9 m, drift 2-5 m over 8 minutes. Needs 30 fixes; fixes a second apart aren't independent, so
 the full 10 minutes gives the honest figure.

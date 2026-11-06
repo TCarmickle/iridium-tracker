@@ -16,6 +16,7 @@ Fixes one second apart are not independent (the errors change over minutes), so 
 it is: the figures need MIN_FIXES and are best over the full WINDOW_S.
 """
 import math
+import time
 
 import numpy as np
 
@@ -50,6 +51,75 @@ def dop(azel):
     return {'hdop': h, 'vdop': v, 'pdop': math.sqrt(h * h + v * v), 'n_geo': len(azel)}
 
 
+def _rstd(x):
+    """a standard deviation that a few wild fixes don't inflate (1.4826 x the median absolute deviation)"""
+    x = np.asarray(x, float)
+    return float(1.4826 * np.median(np.abs(x - np.median(x)))) if len(x) else 0.0
+
+
+def _corr_time(t, x):
+    """how long (s) the errors take to change: where the autocorrelation of x (on a 1 s grid) falls below 1/e"""
+    if len(t) < 10 or t[-1] - t[0] < 20:
+        return 60.0
+    g = np.arange(t[0], t[-1], 1.0)
+    y = np.interp(g, t, x)
+    y = y - y.mean()
+    n = len(y)
+    f = np.fft.rfft(y, 2 * n)
+    ac = np.fft.irfft(f * np.conj(f))[:n]
+    if ac[0] <= 0:
+        return 60.0
+    ac = ac / ac[0]
+    below = np.nonzero(ac < 1 / math.e)[0]
+    lag = float(below[0]) if len(below) else float(n)
+    return min(max(lag, 5.0), 600.0)
+
+
+SESSION_GAP_S = 600.0
+TAU_MIN_S = 120.0       # GNSS position errors are taken to change no faster than this (see quality)
+AVG_MIN_S = 300.0       # a window's average figure needs at least this much of it
+
+
+def long_term(fixes, home=None):
+    """your position from every session in the catalog: each session's middle (sessions apart by 10+ min, with 30+
+    fixes over 2+ min), their average, and how sure that is - from how much the sessions disagree with each other
+    (they differ in time, satellites and atmosphere, so their spread is the honest error). None without a session."""
+    fx = sorted((f for f in fixes if f.get('nsat', 0) >= 4), key=lambda f: f['t'])
+    sessions, cur = [], []
+    for f in fx:
+        if cur and f['t'] - cur[-1]['t'] > SESSION_GAP_S:
+            sessions.append(cur)
+            cur = []
+        cur.append(f)
+    if cur:
+        sessions.append(cur)
+    mids = []
+    for s in sessions:
+        if len(s) >= MIN_FIXES and s[-1]['t'] - s[0]['t'] >= 120:
+            mids.append((float(np.median([f['lat'] for f in s])), float(np.median([f['lon'] for f in s])),
+                         float(np.median([f['height_m'] for f in s])), s[0]['t'], len(s)))
+    if not mids:
+        return None
+    lat = float(np.mean([m[0] for m in mids]))
+    lon = float(np.mean([m[1] for m in mids]))
+    h = float(np.mean([m[2] for m in mids]))
+    e, n = _enu_m(lat, lon, [m[0] for m in mids], [m[1] for m in mids])
+    N = len(mids)
+    out = {'sessions': N, 'lat': lat, 'lon': lon, 'height_m': h, 'fixes': sum(m[4] for m in mids),
+           'first': mids[0][3], 'last': mids[-1][3],
+           'spread_m': float(np.sqrt(np.mean(e * e + n * n))),
+           'days': len({time.localtime(m[3])[:3] for m in mids})}
+    if N >= 2:
+        sig = math.sqrt((np.var(e, ddof=1) + np.var(n, ddof=1)) / 2.0)
+        out['avg95_m'] = 2.45 * sig / math.sqrt(N)
+        out['v95_m'] = 1.96 * float(np.std([m[2] for m in mids], ddof=1)) / math.sqrt(N)
+    if home:
+        he, hn = _enu_m(lat, lon, home[0], home[1])
+        out['from_home_m'] = float(math.hypot(he, hn))
+        out['height_vs_home_m'] = h - home[2] * 1000.0
+    return out
+
+
 def grade(r95):
     for lim, word in GRADES:
         if r95 < lim:
@@ -81,6 +151,16 @@ def quality(fixes, now=None, home=None, azel=None):
          'v95_m': float(np.percentile(np.abs(h - h0), 95)),
          'nsat': float(np.median([f['nsat'] for f in fx]))}
     q['grade'] = grade(q['r95_m'])
+    # how sure the window's middle is: the scatter shrinks with the number of independent fixes, and fixes are only
+    # independent once the errors have had time to change (their correlation time, from the fixes themselves)
+    # (at least TAU_MIN_S: the atmosphere, reflections and the carrier smoothing make errors last minutes, which a
+    # short window can't see - without the floor a 2-minute average claimed 0.6 m where the Garmin beside the antenna
+    # showed 4 m, and separate sessions disagree by 1.4 m (WAAS-corrected) to 5 m (pocket_trk))
+    tau = max(_corr_time(t, e), _corr_time(t, n), TAU_MIN_S)
+    n_eff = max(1.0, q['span_s'] / (2.0 * tau))
+    sig = math.sqrt((_rstd(e) ** 2 + _rstd(n) ** 2) / 2.0)
+    q.update(tau_s=tau, n_eff=n_eff, avg95_m=2.45 * sig / math.sqrt(n_eff),
+             avg_v95_m=1.96 * _rstd(h - h0) / math.sqrt(n_eff))
     # drift: the middle of the first two minutes against the last two
     a, b = t <= t[0] + 120, t >= t[-1] - 120
     if q['span_s'] >= 300 and a.sum() >= 10 and b.sum() >= 10:
@@ -105,9 +185,19 @@ def headline(q):
         return 'Your position: no GNSS position fixes yet (receive GNSS L1)'
     if not q['enough']:
         return 'Your position: %d fixes so far - needs %d for an accuracy figure' % (q['n'], MIN_FIXES)
-    parts = ['Your position%s: ±%.0f m (95%%), %s' % (' (WAAS-corrected)' if q.get('source') == 'waas' else '',
-                                                            q['r95_m'], q['grade']),
-             'half within %.0f m' % q['cep50_m']]
+    parts = ['Your position%s: ±%.0f m per fix (95%%), %s' % (
+        ' (WAAS-corrected)' if q.get('source') == 'waas' else '', q['r95_m'], q['grade'])]
+    if q['span_s'] >= AVG_MIN_S:
+        avg = '%.0f-min average ±%.1f m' % (q['span_s'] / 60, q['avg95_m'])
+    else:
+        avg = 'average: needs %d+ min' % (AVG_MIN_S / 60)
+    if 'from_home_m' in q:
+        avg += ', %.1f m from home' % q['from_home_m']
+    parts.append(avg)
+    lt = q.get('long')
+    if lt and lt['sessions'] >= 2:
+        parts.append('all %d sessions ±%.1f m%s' % (lt['sessions'], lt['avg95_m'], ', %.1f m from home' % lt['from_home_m']
+                                                    if 'from_home_m' in lt else ''))
     if 'drift_m' in q:
         parts.append('drift %.0f m over %.0f min' % (q['drift_m'], q['drift_min']))
     if 'hdop' in q:
@@ -143,9 +233,30 @@ def details(q):
               '   expected 95 %% horizontal error about %.0f m (2 x HDOP x %.0f m ranging error)' % (q['expected_r95_m'],
                                                                                                UERE_M),
               '   (under 2 is good geometry; over 5, the satellites are bunched up)']
+    L += ['', 'The average - how sure the middle of these fixes is:',
+          ('   95 %% within %.1f m horizontally, %.1f m in height' % (q['avg95_m'], q['avg_v95_m'])
+           if q['span_s'] >= AVG_MIN_S else
+           '   needs %d minutes or more of fixes (errors last minutes, so a shorter stretch can\'t say)' % (AVG_MIN_S / 60)),
+          '   (the errors change over about %.0f s, so these %d fixes count as about %.0f independent ones; single '
+          'fixes jump, but their middle settles)' % (q['tau_s'], q['n'], q['n_eff'])]
     if 'from_home_m' in q:
-        L.append('From your home location in Settings: %.1f m (height %+.0f m)' % (q['from_home_m'],
-                                                                                   q['height_vs_home_m']))
+        L.append('   the middle is %.1f m from your home location in Settings (height %+.0f m)' % (
+            q['from_home_m'], q['height_vs_home_m']))
+    lt = q.get('long')
+    if lt:
+        L += ['', 'Over time - every session in the catalog (%s fixes):' % lt.get('label', 'position')]
+        if lt['sessions'] >= 2:
+            L += ['   %d sessions on %d day%s, %s - %s: their middles agree to %.1f m (rms)' % (
+                lt['sessions'], lt['days'], '' if lt['days'] == 1 else 's',
+                time.strftime('%d %b', time.localtime(lt['first'])), time.strftime('%d %b', time.localtime(lt['last'])),
+                lt['spread_m']),
+                  '   so their average is good to %.1f m horizontally, %.1f m in height (95 %%) - it tightens as '
+                  'sessions on other days and times are added' % (lt['avg95_m'], lt['v95_m'])]
+        else:
+            L.append('   one session so far - the over-time figure needs two or more (other days, other times)')
+        if 'from_home_m' in lt:
+            L.append('   that average is %.1f m from your home location (height %+.0f m)' % (lt['from_home_m'],
+                                                                                         lt['height_vs_home_m']))
     L += ['', 'Grades by the 95 % figure: under 5 m excellent, 10 good, 25 fair, 50 poor.',
           'Fixes a second apart aren\'t independent, so the longer the window (up to %d min) the more honest the '
           'figures.' % (WINDOW_S / 60)]
