@@ -84,7 +84,7 @@ def long_term(fixes, home=None):
     """your position from every session in the catalog: each session's middle (sessions apart by 10+ min, with 30+
     fixes over 2+ min), their average, and how sure that is - from how much the sessions disagree with each other
     (they differ in time, satellites and atmosphere, so their spread is the honest error). None without a session."""
-    fx = sorted((f for f in fixes if f.get('nsat', 0) >= 4), key=lambda f: f['t'])
+    fx = sorted((f for f in fixes if f.get('nsat', 0) >= 4 and not f.get('quick')), key=lambda f: f['t'])
     sessions, cur = [], []
     for f in fx:
         if cur and f['t'] - cur[-1]['t'] > SESSION_GAP_S:
@@ -131,7 +131,7 @@ def quality(fixes, now=None, home=None, azel=None):
     """fixes: [{'t','lat','lon','height_m','nsat'}]; now: the end of the window (default: the last fix);
     home: (lat, lon, alt_km) or None; azel: the tracked satellites' (az, el) for the geometry.
     Returns a dict (see the module notes), or None without enough fixes."""
-    fx = sorted((f for f in fixes if f.get('nsat', 0) >= 4), key=lambda f: f['t'])
+    fx = sorted((f for f in fixes if f.get('nsat', 0) >= 4 and not f.get('quick')), key=lambda f: f['t'])
     if not fx:
         return None
     end = now if now is not None else fx[-1]['t']
@@ -191,13 +191,17 @@ def headline(q):
         avg = '%.0f-min average ±%.1f m' % (q['span_s'] / 60, q['avg95_m'])
     else:
         avg = 'average: needs %d+ min' % (AVG_MIN_S / 60)
-    if 'from_home_m' in q:
+    ref = q.get('ref')
+    if ref:                         # measured against a reference point (independent of these fixes) when there is one
+        avg += ', %.1f m from %s' % (q['ref_m'], ref['name'])
+    elif 'from_home_m' in q:
         avg += ', %.1f m from home' % q['from_home_m']
     parts.append(avg)
     lt = q.get('long')
     if lt and lt['sessions'] >= 2:
-        parts.append('all %d sessions ±%.1f m%s' % (lt['sessions'], lt['avg95_m'], ', %.1f m from home' % lt['from_home_m']
-                                                    if 'from_home_m' in lt else ''))
+        far = (', %.1f m from %s' % (lt['ref_m'], ref['name']) if ref and 'ref_m' in lt else
+               ', %.1f m from home' % lt['from_home_m'] if 'from_home_m' in lt else '')
+        parts.append('all %d sessions ±%.1f m%s' % (lt['sessions'], lt['avg95_m'], far))
     if 'drift_m' in q:
         parts.append('drift %.0f m over %.0f min' % (q['drift_m'], q['drift_min']))
     if 'hdop' in q:
@@ -257,6 +261,14 @@ def details(q):
         if 'from_home_m' in lt:
             L.append('   that average is %.1f m from your home location (height %+.0f m)' % (lt['from_home_m'],
                                                                                          lt['height_vs_home_m']))
+    if q.get('ref'):
+        r = q['ref']
+        L += ['', 'Reference point "%s" (%s%s): the recent middle is %.1f m from it%s' % (
+            r['name'], r.get('source', ''), ', ±%.1f m' % r['avg95_m'] if r.get('avg95_m') else '', q['ref_m'],
+            '; the all-sessions average %.1f m' % lt['ref_m'] if lt and 'ref_m' in lt else '')]
+    if q.get('geoid_sep') is not None:
+        L.append('Height: %.0f m above sea level (%.0f m on GPS\'s ellipsoid; the two differ by %.1f m here)' % (
+            q['height_m'] - q['geoid_sep'], q['height_m'], -q['geoid_sep']))
     L += ['', 'Grades by the 95 % figure: under 5 m excellent, 10 good, 25 fair, 50 poor.',
           'Fixes a second apart aren\'t independent, so the longer the window (up to %d min) the more honest the '
           'figures.' % (WINDOW_S / 60)]

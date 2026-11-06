@@ -238,6 +238,11 @@ class Receiver(QtCore.QObject):
         if prog[0] == GNSS_RX:      # the band's quiet noise, for the jamming watch (Integrity section)
             args += ['--noise-baseline', os.path.join(paths.DATA, 'noise-%s.npz' % self.system['key']),
                      '--spp-state', os.path.join(paths.DATA, 'gnss-solver.json')]
+            if catalog.HOME:        # (warm start: which satellites are up, from the orbits kept last time)
+                args += ['--home', '%.6f,%.6f,%.4f' % catalog.HOME]
+            opt = os.path.join(paths.DATA, 'pocket_trk.opt')
+            if os.path.exists(opt):         # pocket_trk's own settings, if tuned (see README)
+                args += ['--pocket-opts', opt]
             import integrity
             if self.system['key'] in integrity.WATCH_BANDS:     # (it keeps 20 s of samples in memory: ~80 MB)
                 args += ['--snap-trigger', snap_trigger()]

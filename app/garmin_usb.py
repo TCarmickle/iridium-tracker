@@ -230,6 +230,7 @@ def log_forever(path):
             prod = g.product()
             w('GSTATE: %.3f connected %s' % (time.time(), prod[2] if prod else '?'))
             g.start_pvt()
+            geoid_done = False
             last = time.time()
             while time.time() - last < 5:       # nothing for 5 s: unplugged or switched off
                 k, v = g.read()
@@ -239,6 +240,13 @@ def log_forever(path):
                     continue
                 last = now
                 if k == 'pvt':
+                    if v['fix'].startswith('3D') and not geoid_done:
+                        geoid_done = True       # the local sea-level offset, for the tracker's heights
+                        try:
+                            import refpoints
+                            refpoints.set_geoid_sep(v['alt_ell'] - v['msl'], prod[2] if prod else 'Garmin')
+                        except Exception:
+                            pass
                     w('GPVT: %.3f %.3f %.8f %.8f %.2f %.2f %.2f %.2f %.2f %s' % (
                         now, v['t'], v['lat'], v['lon'], v['alt_ell'], v['msl'], v['epe'], v['eph'], v['epv'], v['fix']))
                 elif k == 'sats':

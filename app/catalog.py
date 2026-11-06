@@ -23,6 +23,8 @@ import subprocess
 import sys
 import time
 
+import numpy as np
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import paths  # noqa: E402  (where the data lives)
@@ -45,8 +47,11 @@ def tle_file(system='iridium'):
 
 
 SATDUMP_TLES = os.path.join(os.environ.get('APPDATA', ''), 'satdump', 'satdump_tles.txt')
-DATA = os.path.join(paths.DATA, 'catalog-data.json')
-PREVIOUS = os.path.join(paths.DATA, 'catalog-data.previous.json')     # the last good one before each save
+# one file per capture in data\catalog, and an index of them (its time changes with every save: the tracker reloads)
+CAT_DIR = os.path.join(paths.DATA, 'catalog')
+DATA = os.path.join(CAT_DIR, 'index.json')
+LEGACY = os.path.join(paths.DATA, 'catalog-data.json')                # the old single file (read until migrated)
+PREVIOUS = os.path.join(paths.DATA, 'catalog-data.previous.json')     # ...and its last good copy
 REPORT = os.path.join(paths.DATA, 'catalog.txt')
 SETTINGS = os.path.join(paths.DATA, 'settings.json')
 
@@ -488,8 +493,12 @@ def analyze_gnss(stem):
             cap['gnss_fixes'].append({'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
                                       'nsat': int(f[3])})
         elif kind == 'GSPP' and len(f) >= 5:
-            cap.setdefault('gnss_spp', []).append({'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]),
-                                                   'height_m': float(f[2]), 'nsat': int(f[3]), 'hdop': float(f[4])})
+            fx = {'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
+                  'nsat': int(f[3]), 'hdop': float(f[4])}
+            if len(f) >= 9 and int(f[8]) < 4:
+                fx['quick'] = True      # (a quick fix before carrier smoothing settled)
+            cap.setdefault('gnss_spp', []).append(fx)
+    cap['_cn0'] = [h[2] for v in by_sat.values() for h in v]
     for sat, hits in sorted(by_sat.items()):
         hits.sort()
         groups, cur = [], [hits[0]]
@@ -503,7 +512,31 @@ def analyze_gnss(stem):
             cap['passes'].append({'name': gnss_name(sat), 'sat': sat, 'first': iso(g[0][0]), 'last': iso(g[-1][0]),
                                   'frames': len(g), 'best_snr': max(h[2] for h in g),
                                   'doppler': [[round(h[0], 3), round(h[1], 1)] for h in g]})
+    cap['session'] = session_stats(cap, cap.pop('_cn0'))
     return cap
+
+
+def session_stats(cap, cn0=None):
+    """a GNSS capture in a few numbers, kept with it (like a handheld's track statistics): when and how long, how
+    long the first fixes took (pocket_trk's and our own solver's), satellites and their signal, and the session's
+    middle position with its accuracy figures (posquality)"""
+    import posquality
+    start = datetime.datetime.fromisoformat(cap['start_utc']).timestamp()
+    fx, sp = cap.get('gnss_fixes', []), cap.get('gnss_spp', [])
+    good = [f for f in sp if not f.get('quick')]
+    s = {'start': start, 'hours': cap.get('hours', 0),
+         'first_fix_s': round(min(f['t'] for f in fx) - start, 1) if fx else None,
+         'first_waas_s': round(min(f['t'] for f in sp) - start, 1) if sp else None,
+         'fixes': len(fx), 'waas_fixes': len(good),
+         'satellites': len({p['sat'] for p in cap.get('passes', [])})}
+    if cn0:
+        s['cn0_median'] = round(float(np.median(cn0)), 1)
+    for key, pts in (('pocket', fx), ('waas', good)):
+        q = posquality.quality(pts, home=HOME) if pts else None
+        if q and q.get('enough'):
+            s[key] = {k: round(q[k], 8 if k in ('lat', 'lon') else 2) for k in
+                      ('lat', 'lon', 'height_m', 'r95_m', 'cep50_m', 'avg95_m', 'span_s', 'from_home_m') if k in q}
+    return s
 
 
 GNSS_L1 = 1575.42e6
@@ -676,40 +709,79 @@ def build_report(caps):
     return '\n'.join(out) + '\n'
 
 
-def load_data():
-    """catalog-data.json; if it can't be read (cut off by an interrupted save), the previous good copy"""
-    for path in (DATA, PREVIOUS):
+def _load_legacy():
+    """the old single-file catalog (catalog-data.json, or its previous copy if cut off)"""
+    for path in (LEGACY, PREVIOUS):
         if not os.path.exists(path):
             continue
         try:
             with open(path) as f:
                 data = json.load(f)
-            if path != DATA:
+            if path != LEGACY:
                 print('catalog-data.json could not be read - using the previous copy (%s)' % path)
             return data
         except ValueError:
             continue
-    if os.path.exists(DATA):    # unreadable and no good copy: stop rather than start the catalog from nothing
+    if os.path.exists(LEGACY):  # unreadable and no good copy: stop rather than start the catalog from nothing
         sys.exit('catalog-data.json can not be read and there is no good previous copy - see README (recovery)')
     return {}
 
 
-def save_data(data):
-    """written to a temporary file first and swapped in, the old one kept as the previous copy: an interrupted
-    save (the PC or app closing mid-write) leaves a whole file behind, never a cut-off one"""
-    tmp = DATA + '.tmp'
+def _cap_file(name):
+    return os.path.join(CAT_DIR, name + '.json')
+
+
+def load_data():
+    """every capture's results: one file each in data\\catalog (the index lists them). Before the first save in this
+    layout, the old single catalog-data.json. A capture file that can't be read is left out (with a message) - the
+    rest load; it is analysed again from its capture files at the next catalog run if they are still there."""
+    if not os.path.exists(DATA):
+        return _load_legacy()
+    try:
+        with open(DATA) as f:
+            names = json.load(f)['captures']
+    except (OSError, ValueError, KeyError):
+        names = [os.path.basename(p)[:-5] for p in glob.glob(os.path.join(CAT_DIR, '*.json'))
+                 if os.path.basename(p) != 'index.json']
+    data = {}
+    for name in names:
+        try:
+            with open(_cap_file(name)) as f:
+                data[name] = json.load(f)
+        except (OSError, ValueError) as e:
+            print('catalog: %s could not be read (%s)' % (name, e))
+    return data
+
+
+def _write_atomic(path, obj):
+    tmp = path + '.tmp'
     with open(tmp, 'w') as f:
-        json.dump(data, f, separators=(',', ':'))
+        json.dump(obj, f, separators=(',', ':'))
         f.flush()
         os.fsync(f.fileno())
-    if os.path.exists(DATA):
+    os.replace(tmp, path)
+
+
+def save_data(data):
+    """one small file per capture, each written to a temporary file and swapped in, only when it changed; then the
+    index. An interrupted save can at most leave one capture's previous version (never a cut-off catalog), and a
+    save rewrites only what is new instead of the whole history"""
+    os.makedirs(CAT_DIR, exist_ok=True)
+    for name, cap in data.items():
+        text = json.dumps(cap, separators=(',', ':'))
+        path = _cap_file(name)
         try:
-            with open(DATA) as f:
-                json.load(f)                # (keep the old one as the previous copy only if it is whole)
-            os.replace(DATA, PREVIOUS)
-        except ValueError:
+            with open(path) as f:
+                if f.read() == text:
+                    continue
+        except OSError:
             pass
-    os.replace(tmp, DATA)
+        _write_atomic(path, cap)
+    for p in glob.glob(os.path.join(CAT_DIR, '*.json')):     # captures no longer in the catalog
+        name = os.path.basename(p)[:-5]
+        if name != 'index' and name not in data:
+            os.remove(p)
+    _write_atomic(DATA, {'captures': sorted(data), 'saved': time.time()})
 
 
 def main():
@@ -717,9 +789,7 @@ def main():
         sys.exit('No antenna location yet - start the tracker once and enter it (it is saved in settings.json).')
     redo = '--redo' in sys.argv
     ready = {a[8:] for a in sys.argv if a.startswith('--ready=')}   # captures known to be finished
-    data = load_data()
-    if redo and data:     # captures whose files are gone keep their old results
-        shutil.copy(DATA, DATA[:-5] + '.backup.json')
+    data = load_data()      # (with --redo, captures whose files are gone keep their old results)
     sats = {s['key']: None for s in systems.ORDER}     # loaded when first needed
     recording = set()
     for name, files in sorted(storage.captures().items()):
@@ -757,6 +827,13 @@ def main():
         if not src.endswith(storage.REDUCED):
             storage.write_reduced(stem, src, cap['counts'], cap['hours'])
         data[name] = cap
+    # session statistics for GNSS captures analysed before they existed (from what the catalog holds)
+    for name, cap in data.items():
+        if cap.get('system') == 'gnss1' and 'session' not in cap and cap.get('start_utc'):
+            try:
+                cap['session'] = session_stats(cap)
+            except (ValueError, KeyError, TypeError):
+                pass
     save_data(data)
     caps = [c for _, c in sorted(data.items()) if sum(c['counts'].values()) and c.get('system', 'iridium') == 'iridium']
     open(REPORT, 'w').write(build_report(caps))     # the text report covers Iridium

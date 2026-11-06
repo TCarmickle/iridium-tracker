@@ -51,6 +51,7 @@ import collections
 import ctypes
 import datetime
 import json
+import math
 import os
 import queue
 import subprocess
@@ -81,6 +82,7 @@ CHUNK_S = 180.0
 WAAS_PRNS = '131,133,135,138'
 SIGNALS = ['-sig', 'L1CA', '-prn', '1-32,' + WAAS_PRNS, '-sig', 'E1B', '-prn', '1-36']
 NOISE = None                    # the band's noise meter (main)
+POCKET_OPTS = []                # extra pocket_trk arguments (main: -opt FILE)
 SNAP = None                     # the raw-sample recorder for Integrity events (main)
 GPS_UTC_S = 18                  # GPS time runs this far ahead of UTC (leap seconds)
 GPS_EPOCH = datetime.datetime(1980, 1, 6, tzinfo=datetime.timezone.utc)
@@ -109,6 +111,9 @@ ap.add_argument('--no-noise', action='store_true')  # no GNOISE lines
 ap.add_argument('--snap-trigger', default='')       # raw samples around events: IQRecorder's trigger file
 ap.add_argument('--spp-state', default='')          # our position solver's kept state (GPS ionosphere model, .json)
 ap.add_argument('--no-spp', action='store_true')    # no GSPP lines (our own WAAS-corrected position)
+ap.add_argument('--home', default='')               # lat,lon,alt_km: which satellites are up (warm start)
+ap.add_argument('--narrow-search', action='store_true')     # search only the satellites up (from saved orbits)
+ap.add_argument('--pocket-opts', default='')        # pocket_trk options file (-opt), e.g. its lock thresholds
 ap.add_argument('--constellation', choices=('gps', 'glonass', 'beidou'), default='gps')   # gps = GPS + Galileo + WAAS
 opts = ap.parse_args()
 if opts.constellation == 'glonass':     # every frequency channel (the SDR's slice holds the middle ones);
@@ -401,15 +406,108 @@ class ChunkWriter(gr.sync_block):
 
 
 _started = threading.Event()
+_started_at = [None]            # the stream's first sample (unix), for how long the first fix took
 
 
 def started(t):
     if _started.is_set():
         return
     _started.set()
+    _started_at[0] = t
     if opts.start_file:
         with open(opts.start_file, 'w') as f:
             f.write(datetime.datetime.fromtimestamp(t, datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] + 'Z\n')
+
+
+# ---------------------------------------------------------------- what is kept between sessions (warm start)
+# --spp-state (gnss-solver.json): GPS's ionosphere model and the newest broadcast orbit of each GPS / Galileo
+# satellite. Like a handheld's memory, it makes the next start warm: our solver has orbits at once, and pocket_trk
+# is told which satellites are up (visible_prns) instead of searching for all of them.
+STATE = {}
+QUICK_RES_M = 15.0              # quick (not yet smoothed) fixes: ranges must agree this well
+SEARCH_HOURS = 4.0              # the search list covers satellites up at any time in the next few hours
+EPH_KEEP_DAYS = 7.0
+_state_saved = [0.0]
+
+
+def load_state():
+    try:
+        with open(opts.spp_state) as f:
+            st = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return {}
+    if time.time() - st.get('t', 0) > EPH_KEEP_DAYS * 86400:
+        st.pop('ion', None)
+    st['ephs'] = {s: v for s, v in st.get('ephs', {}).items() if time.time() - v[0] < EPH_KEEP_DAYS * 86400}
+    return st
+
+
+def keep_eph(sat, t, text):
+    STATE.setdefault('ephs', {})[sat] = [t, text]
+    save_state()
+
+
+def save_state(force=False):
+    """written at most once a minute (or at once with force), to a temporary file swapped in"""
+    if not opts.spp_state or (not force and time.time() - _state_saved[0] < 60):
+        return
+    _state_saved[0] = time.time()
+    STATE['t'] = time.time()
+    try:
+        with open(opts.spp_state + '.tmp', 'w') as f:
+            json.dump(STATE, f)
+        os.replace(opts.spp_state + '.tmp', opts.spp_state)
+    except OSError as e:
+        log('GNSS: could not save the solver state (%s)' % e)
+
+
+def visible_prns(sys_letter, n_prn, hours=SEARCH_HOURS):
+    """the PRNs of one system worth searching for: those whose saved orbit (up to a week old - plenty for knowing
+    whether a satellite is up) puts them above the horizon here at some time in the next `hours`, plus any we have
+    no orbit for (can't tell). None when too few orbits are known to judge, or no home location."""
+    if not opts.home:
+        return None
+    try:
+        lat, lon, alt_km = (float(v) for v in opts.home.split(','))
+    except ValueError:
+        return None
+    lla = (math.radians(lat), math.radians(lon), alt_km * 1000.0)
+    rx = spp.lla_to_ecef(*lla)
+    known, up = set(), set()
+    now = time.time()
+    for sat, (t, text) in STATE.get('ephs', {}).items():
+        if sat[0] != sys_letter:
+            continue
+        e = gnss.parse_eph('$EPH,%.3f,%s,%s' % (t, sat, text))
+        if not e:
+            continue
+        known.add(e['prn'])
+        ts = np.arange(now, now + hours * 3600 + 1, 600.0)
+        pos = gnss._kepler(e, ts)[0]
+        for p in pos:
+            if spp.azel(rx, p, lla)[1] > math.radians(-2.0):
+                up.add(e['prn'])
+                break
+    if len(known) < (12 if sys_letter == 'G' else 6):
+        return None
+    return sorted(up | (set(range(1, n_prn + 1)) - known))
+
+
+def live_signals():
+    """pocket_trk's signal list for this session: the satellites that are up (or unknown), else all of them"""
+    # (off unless --narrow-search: on a recording, pocket_trk with the shorter list locked 4-5 satellites in 40 s
+    # where the full list locked 6 - it already searches every satellite in parallel on its 72 channels)
+    if opts.constellation != 'gps' or not opts.narrow_search:
+        return SIGNALS
+    g = visible_prns('G', 32)
+    e = visible_prns('E', 36)
+    if g is None and e is None:
+        return SIGNALS
+    gl = ','.join(str(p) for p in g) if g else '1-32'
+    el = ','.join(str(p) for p in e) if e else '1-36'
+    log('GNSS: searching for %s GPS and %s Galileo satellites (the ones up in the next %.0f h, or not known yet)' % (
+        len(g) if g else 32, len(e) if e else 36, SEARCH_HOURS))
+    return ['-sig', 'L1CA', '-prn', gl + ',' + WAAS_PRNS, '-sig', 'E1B', '-prn', el]
 
 
 # ---------------------------------------------------------------- tracking a chunk with pocket_trk
@@ -528,16 +626,20 @@ class Lines:
         # GPS L1 band only; GPS's ionosphere model is kept between sessions (it takes up to 12.5 min to arrive)
         self.spp = None
         self.spp_fixes = 0
+        self.first_fix = None
         if opts.constellation == 'gps' and not opts.no_spp:
             self.spp = spp.Solver(iono='sbas', sbas_orbit=True, smooth=True)
-            try:
-                with open(opts.spp_state) as f:
-                    st = json.load(f)
-                if time.time() - st.get('t', 0) < 7 * 86400:
-                    self.spp.ion = st['ion']
-            except (OSError, ValueError, KeyError, TypeError):
-                pass
-            self.saved_ion = self.spp.ion
+            # a warm start, like a handheld's: the orbits decoded in earlier sessions (good for hours), so a position
+            # comes as soon as 4 satellites are locked, without waiting ~a minute for each orbit to be sent again
+            self.spp.ion = STATE.get('ion')
+            n = 0
+            for sat, (t, text) in STATE.get('ephs', {}).items():
+                e = gnss.parse_eph('$EPH,%.3f,%s,%s' % (t, sat, text))
+                if e and abs(time.time() - e['toe']) < 4 * 3600:
+                    self.spp.eph(e)
+                    n += 1
+            log('GNSS position solver: warm start with %d saved orbits%s' % (
+                n, ' and the ionosphere model' if self.spp.ion else ''))
 
     def orbits(self, ephs, t):
         for sat, sig, fields in ephs:      # in the field order of a $EPH line, so gnss.parse_eph reads it
@@ -553,6 +655,8 @@ class Lines:
             if self.eph.get(sat) != same:
                 self.eph[sat] = same
                 emit('GEPH: %.3f %s %s' % (t, sat, text))
+                if not fields.get('glo') and sat[:1] in 'GE':
+                    keep_eph(sat, t, text)
                 if self.spp and not fields.get('glo'):
                     self.spp.eph(gnss.parse_eph('$EPH,%.3f,%s,%s' % (t, sat, text)))
 
@@ -560,25 +664,35 @@ class Lines:
         """pocket_trk's raw measurements and navigation messages into our own solver; a GSPP line per good fix"""
         if f[0] == '$NAV':
             self.spp.nav(line)
-            if self.spp.ion and self.spp.ion != self.saved_ion and opts.spp_state:
-                self.saved_ion = self.spp.ion
-                try:
-                    with open(opts.spp_state, 'w') as fh:
-                        json.dump({'t': time.time(), 'ion': self.spp.ion}, fh)
-                except OSError:
-                    pass
+            if self.spp.ion and self.spp.ion != STATE.get('ion'):
+                STATE['ion'] = self.spp.ion
+                save_state(force=True)
         elif f[0] == '$EPH':
-            self.spp.eph(gnss.parse_eph(line))
+            e = gnss.parse_eph(line)
+            self.spp.eph(e)
+            if e and e['sys'] in 'GE':
+                keep_eph(f[2], float(f[1]), ','.join(f[3:]))
         elif f[0] == '$OBS':
             try:
                 s = self.spp.obs(line)
             except Exception as e:      # our solver must never stop the tracking
                 log('GNSS position solver: %r' % e)
                 return
-            if s and s['ok']:
+            if not s:
+                return
+            # good fixes; and before smoothing has settled, quick ones (good geometry, ranges that agree) so the
+            # first position comes as early as possible - n_smoothed says which is which
+            quick = (not s['ok'] and s['nsat'] >= 4 and s['hdop'] <= spp.HDOP_MAX and s['res_rms'] is not None
+                     and s['res_rms'] < QUICK_RES_M)
+            if s['ok'] or quick:
                 self.spp_fixes += 1
+                t = float(gnss.gpst_to_unix(s['t']))
+                if self.first_fix is None:
+                    self.first_fix = t
+                    log('GNSS position solver: first fix %.0f s after the start (%d satellites)' % (
+                        t - (_started_at[0] or t), s['nsat']))
                 emit('GSPP: %.3f %.9f %.9f %.3f %d %.2f %d %d %d %d' % (
-                    float(gnss.gpst_to_unix(s['t'])), s['lat'], s['lon'], s['h'], s['nsat'], s['hdop'],
+                    t, s['lat'], s['lon'], s['h'], s['nsat'], s['hdop'],
                     s['iono'].get('sbas', 0), s['fast'], s['lt'], s['smoothed']))
 
     def line(self, line, when):
@@ -806,8 +920,12 @@ class LiveTracker(threading.Thread):
         pipe = Pipe('gnss_rx_%d_%d' % (os.getpid(), self.runs))
         logf = os.path.join(self.folder, 'trk-%d.log' % self.runs)
         rtcmf = os.path.join(self.folder, 'trk-%d.rtcm' % self.runs)
-        cmd = [POCKET_TRK] + SIGNALS + ['-fmt', 'INT8X2', '-f', '%.6f' % (self.rate / 1e6),
-                                        '-log', logf, '-rtcm', rtcmf, pipe.path]
+        signals = live_signals()
+        # a narrowed search list covers SEARCH_HOURS: before it runs out, pocket_trk is restarted with a fresh one
+        # (the satellites are picked up again within a minute; our solver keeps its state)
+        renew_at = time.time() + (SEARCH_HOURS - 0.5) * 3600 if signals is not SIGNALS else None
+        cmd = [POCKET_TRK] + signals + ['-fmt', 'INT8X2', '-f', '%.6f' % (self.rate / 1e6),
+                                        '-log', logf, '-rtcm', rtcmf, pipe.path] + POCKET_OPTS
         proc = subprocess.Popen(cmd, cwd=os.path.dirname(POCKET_TRK), stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, creationflags=0x08000000)
         if not pipe.connect():
@@ -832,6 +950,9 @@ class LiveTracker(threading.Thread):
         next_k = None
         started_reader = False
         while proc.poll() is None:
+            if renew_at and time.time() > renew_at and live_signals() != signals:
+                log('GNSS: renewing the satellite search list')
+                break
             try:
                 data, n, k = self.q.get(timeout=1.0)
             except queue.Empty:
@@ -924,6 +1045,10 @@ def main():
         log('GNSS: %s is missing - see README (PocketSDR)' % POCKET_TRK)
         sys.exit(2)
     global NOISE, SNAP
+    STATE.update(load_state())
+    if opts.pocket_opts and os.path.exists(opts.pocket_opts):
+        POCKET_OPTS[:] = ['-opt', opts.pocket_opts]
+        log('GNSS: pocket_trk options from %s' % opts.pocket_opts)
     if not opts.no_noise:
         NOISE = NoiseMeter(opts.rate, opts.center, opts.noise_baseline)
     if opts.snap_trigger:

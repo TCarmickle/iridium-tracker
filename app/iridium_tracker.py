@@ -57,6 +57,7 @@ HOME_LAT, HOME_LON, HOME_H = catalog.HOME or (0.0, 0.0, 0.0)   # set_home() chan
 RE, F = 6378.137, 1 / 298.257223563
 E2 = F * (2 - F)
 MIN_EL = 8.2          # Iridium serves phones down to about 8 degrees elevation
+MISSING_EL = 15.0     # GNSS: a satellite this high that the receiver isn't hearing is listed as 'up but not heard'
 MAX_SIGMA_KM = 1500   # hide a satellite once our orbit for it is more uncertain than this
 OMEGA_EARTH = 7.2921151467e-5   # Earth rotation, rad/s
 FAINT_SIGMA_KM = 150  # draw it faded beyond this uncertainty
@@ -314,6 +315,7 @@ class Data:
         self.gnss_eph = {}      # GNSS satellite id (G05...) -> (time, its newest broadcast ephemeris fields)
         self.gnss_fixes = []    # GNSS position fixes of the receiver itself (pocket_trk's)
         self.gnss_spp = []      # ...and our own WAAS-corrected, carrier-smoothed ones (spp.py)
+        self.gnss_sessions = []     # each GNSS L1 capture's session stats (catalog.session_stats), oldest first
         self.live_read = {}     # live file -> how far we've read it
         self.live_cap = None    # the newest capture (the one the receiver writes while running)
         self.live_fixes, self.live_heard, self.live_events = [], {}, []
@@ -547,7 +549,7 @@ class Data:
             print('catalog: %s' % e)
             caps = {}
         self.captures, self.fixes = [], []
-        self.gnss_eph, self.gnss_fixes, self.gnss_spp = {}, [], []
+        self.gnss_eph, self.gnss_fixes, self.gnss_spp, self.gnss_sessions = {}, [], [], []
         self.doppler = {}       # name -> list of Doppler curves [(t, Hz), ...]
         self.info = {}          # name -> details
         self.slot_name = {}     # (plane, slot) -> name
@@ -564,6 +566,8 @@ class Data:
                         self.gnss_eph[sat] = (t, fields)
                 self.gnss_fixes += c.get('gnss_fixes', [])
                 self.gnss_spp += c.get('gnss_spp', [])
+                if c.get('session') and c.get('system') == 'gnss1':
+                    self.gnss_sessions.append(c['session'])
             if systems.get(c.get('system')).get('system') == 'ham':
                 if self._ham_names is None:
                     self._ham_names = catalog.norad_names()
@@ -937,8 +941,11 @@ class Data:
                 events.append('%s  GNSS FIX  %+.5f, %+.5f, %.0f m (%d satellites)' % (fmt_clock(t), fx['lat'], fx['lon'],
                                                                                   fx['height_m'], fx['nsat']))
             elif kind == 'GSPP' and len(f) >= 5:      # our own WAAS-corrected fix (no event line: one a second)
-                self.gnss_spp.append({'t': t, 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
-                                      'nsat': int(f[3]), 'hdop': float(f[4])})
+                fx = {'t': t, 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
+                      'nsat': int(f[3]), 'hdop': float(f[4])}
+                if len(f) >= 9 and int(f[8]) < 4:
+                    fx['quick'] = True      # before smoothing settled: shown as the first fix, not in the accuracy
+                self.gnss_spp.append(fx)
         return events
 
 
@@ -2112,6 +2119,13 @@ class Tracker(QtWidgets.QMainWindow):
         self.pos_timer = QtCore.QTimer(self)
         self.pos_timer.timeout.connect(self._update_position_quality)
         self.pos_timer.start(2000)
+        self.pos_label.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.pos_label.customContextMenuRequested.connect(self._pos_menu)
+        # a Garmin handheld plugged in as a drive: its tracks and waypoints are copied and give reference points
+        self.garmin_seen = {}
+        self.garmin_timer = QtCore.QTimer(self)
+        self.garmin_timer.timeout.connect(self._garmin_import)
+        self.garmin_timer.start(30000)
         rv.addWidget(self.summary)
         rv.addWidget(self.table, 1)
         rv.addWidget(self.detail_scroll, 1)
@@ -2458,15 +2472,259 @@ class Tracker(QtWidgets.QMainWindow):
                         lt['label'] = 'pocket_trk'
                 self._long = lt
             q['long'] = self._long
+            # the reference point to measure against: the one marked for it, else one named 'antenna' (not just the
+            # nearest - a Garmin's stretch indoors isn't the antenna); and the local sea-level offset for heights
+            import refpoints
+            refs = refpoints.load()
+            ref = (next((r for r in refs if r.get('primary')), None) or
+                   next((r for r in refs if r['name'].lower() == 'antenna'), None))
+            if ref:
+                q['ref'] = ref
+                q['ref_m'] = refpoints._dist(q['lat'], q['lon'], ref['lat'], ref['lon'])
+                if q.get('long'):
+                    q['long']['ref_m'] = refpoints._dist(q['long']['lat'], q['long']['lon'], ref['lat'], ref['lon'])
+            q['geoid_sep'] = refpoints.geoid_sep()
         text = posquality.headline(q)
         if q and q.get('t_last') and not live:
             text += '  ·  (from your last fixes, %s)' % time.strftime('%d %b %H:%M', time.localtime(q['t_last']))
         col = {'excellent': GOOD, 'good': GOOD, 'fair': theme.PAL['WARN'], 'poor': theme.PAL['ALERT'],
                'bad': theme.PAL['ALERT']}.get(q.get('grade') if q else None, MUTED)
         head, _, rest = text.partition('  ·  ')
-        self.pos_label.setText('<span style="color:%s; font-weight:600">%s</span>%s' % (
-            col, head, ('<span style="color:%s">  ·  %s</span>' % (MUTED, rest)) if rest else ''))
-        self.pos_label.setToolTip(posquality.details(q))
+        html = '<span style="color:%s; font-weight:600">%s</span>%s' % (
+            col, head, ('<span style="color:%s">  ·  %s</span>' % (MUTED, rest)) if rest else '')
+        missing, tracked = self._missing_satellites(home, now) if live else ([], 0)
+        if missing:
+            html += ('<br><span style="color:%s">Up but not heard: %s</span><span style="color:%s">  ·  their own '
+                     'orbits put them %d°+ up - if this list is long, check the antenna\'s view of the sky</span>'
+                     % (theme.PAL['WARN'], ', '.join('%s %.0f°' % (s, el) for s, el in missing[:8]), MUTED,
+                        MISSING_EL))
+        self.pos_label.setText(html)
+        self.pos_label.setToolTip(posquality.details(q) + self._startup_text())
+
+    # ---- position: GPX, reference points, a Garmin as a drive
+    def _pos_menu(self, at):
+        m = QtWidgets.QMenu(self)
+        m.addAction('Export position fixes to GPX\u2026', self._export_gpx)
+        m.addAction('Import a GPX file (tracks / waypoints)\u2026', self._import_gpx)
+        m.addSeparator()
+        m.addAction('Save my average position as a reference point\u2026', self._save_reference)
+        m.addAction('Reference points\u2026', self._references_dialog)
+        m.exec_(self.pos_label.mapToGlobal(at))
+
+    def _export_gpx(self):
+        import gpxio
+        import refpoints
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, 'Export position fixes', os.path.join(
+            os.path.expanduser('~'), 'satellite-tracker-fixes.gpx'), 'GPX (*.gpx)')
+        if not path:
+            return
+        tracks = []
+        for label, fixes in (('pocket_trk', self.data.gnss_fixes), ('WAAS-corrected', self.data.gnss_spp)):
+            for s in self._sessions_of(fixes):
+                tracks.append(('%s %s' % (label, time.strftime('%Y-%m-%d %H:%M', time.localtime(s[0]['t']))), s))
+        wpts = [{'name': r['name'], 'lat': r['lat'], 'lon': r['lon'], 'height_m': r.get('height_ell'),
+                 't': r.get('t'), 'desc': r.get('source', '')} for r in refpoints.load()]
+        gpxio.write(path, tracks, wpts, refpoints.geoid_sep())
+        self.events.insertItem(0, '%s  Exported %d tracks (%d fixes) and %d reference points to %s' % (
+            fmt_clock(time.time()), len(tracks), sum(len(t[1]) for t in tracks), len(wpts), path))
+
+    @staticmethod
+    def _sessions_of(fixes, gap=600):
+        out, cur = [], []
+        for f in sorted(fixes, key=lambda f: f['t']):
+            if cur and f['t'] - cur[-1]['t'] > gap:
+                out.append(cur)
+                cur = []
+            cur.append(f)
+        return out + ([cur] if cur else [])
+
+    def _import_gpx(self, path=None, source=None, quiet=False):
+        """a GPX file's waypoints near home, and the stretches where its tracks sat still near home (3+ min), become
+        reference points; returns how many"""
+        import gpxio
+        import refpoints
+        if not path:
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, 'Import a GPX file', os.path.expanduser('~'),
+                                                            'GPX (*.gpx)')
+            if not path:
+                return 0
+        try:
+            tracks, wpts = gpxio.read(path)
+        except Exception as e:
+            if not quiet:
+                QtWidgets.QMessageBox.warning(self, 'Import GPX', 'Could not read %s:\n%s' % (path, e))
+            return 0
+        src = source or os.path.basename(path)
+        sep = refpoints.geoid_sep()
+        home = (HOME_LAT, HOME_LON) if catalog.HOME else None
+        n = 0
+        for w in wpts:
+            if home and refpoints._dist(home[0], home[1], w['lat'], w['lon']) > refpoints.NEAR_M:
+                continue
+            refpoints.add({'name': w['name'] or 'waypoint', 'lat': w['lat'], 'lon': w['lon'],
+                           'height_msl': w['ele'], 'height_ell': w['ele'] + sep if w['ele'] is not None and sep is not None
+                           else None, 'source': '%s waypoint' % src, 't': w['t']})
+            n += 1
+        for name, pts in tracks:
+            for t0, t1, la, lo, ele, k, sc in refpoints.still_stretches(pts, home):
+                refpoints.add({'name': 'still from %s' % time.strftime('%Y-%m-%d %H:%M', time.localtime(t0)),
+                               'lat': la, 'lon': lo, 'height_msl': ele,
+                               'height_ell': ele + sep if ele is not None and sep is not None else None,
+                               'source': '%s track' % src, 'n': k, 'span_s': t1 - t0, 'scatter95_m': sc, 't': t0})
+                n += 1
+        if not quiet:
+            self.events.insertItem(0, '%s  Imported %d reference points from %s' % (fmt_clock(time.time()), n, path))
+        self._long_key = None
+        return n
+
+    def _garmin_import(self):
+        """every 30 s: a Garmin handheld connected as a drive? Copy its GPX files (data\\garmin\\<unit>) when they
+        changed, and take reference points from them"""
+        import shutil
+        import string
+        for letter in string.ascii_uppercase[3:]:
+            dev = '%s:\\Garmin\\GarminDevice.xml' % letter
+            try:
+                if not os.path.exists(dev):
+                    continue
+                gpx = glob.glob('%s:\\Garmin\\GPX\\**\\*.gpx' % letter, recursive=True)
+            except OSError:
+                continue
+            sig = tuple(sorted((p, os.path.getmtime(p)) for p in gpx))
+            if self.garmin_seen.get(letter) == sig:
+                continue
+            self.garmin_seen[letter] = sig
+            try:
+                txt = open(dev, errors='replace').read()
+            except OSError:
+                txt = ''
+            m1 = re.search(r'<Description>([^<]+)</Description>', txt)
+            m2 = re.search(r'<Id>(\d+)</Id>', txt)
+            unit, uid = (m1.group(1) if m1 else 'Garmin'), (m2.group(1) if m2 else letter)
+            dest = os.path.join(paths.DATA, 'garmin', str(uid))
+            n = 0
+            for p in gpx:
+                rel = os.path.relpath(p, '%s:\\Garmin\\GPX' % letter)
+                out = os.path.join(dest, rel)
+                os.makedirs(os.path.dirname(out), exist_ok=True)
+                try:
+                    if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(p):
+                        shutil.copy2(p, out)
+                    n += self._import_gpx(out, unit, quiet=True)
+                except OSError:
+                    pass
+            self.events.insertItem(0, '%s  %s connected: %d GPX files copied to %s, %d reference points' % (
+                fmt_clock(time.time()), unit, len(gpx), dest, n))
+
+    def _save_reference(self):
+        import refpoints
+        lt = getattr(self, '_long', None)
+        if not lt or lt.get('sessions', 0) < 2:
+            QtWidgets.QMessageBox.information(self, 'Reference point', 'Needs GNSS position fixes from 2+ sessions.')
+            return
+        name, ok = QtWidgets.QInputDialog.getText(self, 'Save a reference point', 'Name (e.g. "antenna"):',
+                                                  text='antenna (tracker average)')
+        if not ok or not name.strip():
+            return
+        refpoints.add({'name': name.strip(), 'lat': lt['lat'], 'lon': lt['lon'], 'height_ell': lt['height_m'],
+                       'source': 'tracker average of %d sessions (%s)' % (lt['sessions'], lt.get('label', '')),
+                       'avg95_m': lt.get('avg95_m'), 'n': lt.get('fixes')})
+        self._long_key = None
+
+    def _references_dialog(self):
+        import refpoints
+        d = QtWidgets.QDialog(self)
+        d.setWindowTitle('Reference points')
+        d.resize(760, 360)
+        v = QtWidgets.QVBoxLayout(d)
+        v.addWidget(QtWidgets.QLabel('Known positions the "Your position" line is measured against: the one marked '
+                                     '\u2605, else one named "antenna" (else your home location). A Garmin\'s "still '
+                                     'from ..." points are where it sat 3+ minutes - star the one beside the antenna.'))
+        tree = QtWidgets.QTreeWidget()
+        tree.setHeaderLabels(['', 'Name', 'From the recent middle', 'Height (sea level)', 'Source'])
+        tree.setRootIsDecorated(False)
+        v.addWidget(tree, 1)
+        mid = getattr(self, '_long', None)
+
+        def fill():
+            tree.clear()
+            for r in refpoints.load():
+                dist = refpoints._dist(mid['lat'], mid['lon'], r['lat'], r['lon']) if mid else None
+                it = QtWidgets.QTreeWidgetItem(['\u2605' if r.get('primary') else '', r['name'],
+                                                '%.1f m' % dist if dist is not None else '-',
+                                                '%.0f m' % r['height_msl'] if r.get('height_msl') is not None else '-',
+                                                r.get('source', '')])
+                it.setData(1, Qt.UserRole, r['name'])
+                tree.addTopLevelItem(it)
+            for c in range(5):
+                tree.resizeColumnToContents(c)
+
+        def primary():
+            it = tree.currentItem()
+            if it:
+                refs = refpoints.load()
+                for r in refs:
+                    r['primary'] = r['name'] == it.data(1, Qt.UserRole)
+                refpoints.save(refs)
+                fill()
+
+        def delete():
+            it = tree.currentItem()
+            if it:
+                refpoints.remove(it.data(1, Qt.UserRole))
+                fill()
+        row = QtWidgets.QHBoxLayout()
+        for text, fn in (('\u2605 Measure against this one', primary), ('Delete', delete), ('Close', d.accept)):
+            b = QtWidgets.QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        v.addLayout(row)
+        fill()
+        d.exec_()
+        self._long_key = None
+
+    def _missing_satellites(self, home, now):
+        """GPS / Galileo satellites whose own decoded orbit (any age: plenty for where one is) puts them MISSING_EL+
+        up now, but that the GNSS L1 receiver isn't tracking - highest first; and how many are tracked"""
+        rx = self.receiver
+        if not home or not rx.busy or getattr(rx, 'system', {}).get('key') != 'gnss1':
+            return [], 0
+        import integrity
+        tracked = {i.get('sat') for i in self.data.info.values() if i.get('now') and now - i['now']['t'] < 10}
+        out = []
+        for name, o in self.data.orbits.items():
+            i = self.data.info.get(name, {})
+            sat = i.get('sat')
+            if not sat or sat[0] not in 'GE' or sat in tracked:
+                continue
+            try:
+                el = integrity.enu(home, o.ecef(now))[0]
+            except Exception:
+                continue
+            if el >= MISSING_EL:
+                out.append((sat, el))
+        return sorted(out, key=lambda x: -x[1]), len(tracked)
+
+    def _startup_text(self):
+        """how long the first fixes took: this receiving session, and the history (session stats in the catalog)"""
+        L = []
+        rx = self.receiver
+        if rx.busy and getattr(rx, 'system', {}).get('key') == 'gnss1':
+            t0 = rx.t_start
+            fp = min((f['t'] for f in self.data.gnss_fixes if f['t'] >= t0), default=None)
+            fs = min((f['t'] for f in self.data.gnss_spp if f['t'] >= t0), default=None)
+            L.append('This session: first fix %s (pocket_trk), %s (our solver)' % (
+                '%.0f s' % (fp - t0) if fp else 'not yet', '%.0f s' % (fs - t0) if fs else 'not yet'))
+        hist = [s for s in self.data.gnss_sessions if s.get('first_fix_s') is not None]
+        if hist:
+            last = hist[-10:]
+            L.append('Start-up history (last %d sessions): first fix median %.0f s (fastest %.0f s, slowest %.0f s)' % (
+                len(last), float(np.median([s['first_fix_s'] for s in last])), min(s['first_fix_s'] for s in last),
+                max(s['first_fix_s'] for s in last)))
+            ws = [s['first_waas_s'] for s in last if s.get('first_waas_s') is not None]
+            if ws:
+                L.append('   our solver\'s first fix: median %.0f s over %d sessions' % (float(np.median(ws)), len(ws)))
+        return ('\n\nStart-up\n' + '\n'.join('   ' + x if not x.startswith('   ') else x for x in L)) if L else ''
 
     def _integrity_running(self, on):
         """the receiver started / stopped: the Integrity watch follows (with the receiver's settings, which go into

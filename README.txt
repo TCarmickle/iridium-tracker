@@ -413,9 +413,9 @@ GNU General Public License v3 (LICENSES\GPL-3.0.txt). The source code is the .py
 
 CATALOG SAFETY
 --------------
-data\catalog-data.json (everything received) is saved to a temporary file first and swapped in,
-with the previous good copy kept as catalog-data.previous.json; if the main file can't be read,
-the previous copy is used. (Before this, an interrupted save on 5 Nov 2026 cut the file off and the
+The catalog (everything received) is now one file per capture in data\catalog, each saved to a
+temporary file first and swapped in (see below); the old catalog-data.json and its previous copy
+are still read if the new folder isn't there yet. (Before this, an interrupted save on 5 Nov 2026 cut the file off and the
 tracker showed no history until it was repaired: the complete entries were recovered and the
 captures still on disk were analyzed again.)
 PC CLOCK FROM GPS
@@ -469,6 +469,40 @@ still pulling in, and that start would stay in the average - seen against a Garm
 beside the antenna); fixes then start once 4 satellites have been smoothed for 30 s (about two
 minutes after starting the receiver), and only with good geometry (HDOP 6 or better). GPS's own ionosphere model is kept in data\gnss-solver.json
 between sessions. Galileo joins when 2 or more Galileo satellites have decoded orbits.
+WARM START, SATELLITES NOT HEARD, REFERENCE POINTS, GPX
+-------------------------------------------------------
+Ideas taken from how a Garmin GPSMAP 64st works (its chip keeps orbit predictions and its last
+position between uses; its data is many small standard files):
+  - Warm start: every orbit decoded is kept in data\gnss-solver.json (with GPS's ionosphere
+    model); at the next start our own solver has them at once and gives a quick first fix as soon
+    as 4 satellites are locked (measured: 4-11 s before pocket_trk's own; most of the start-up is
+    pocket_trk finding and syncing to the satellites). Quick fixes count as the first fix but not
+    in the accuracy figures, which wait for the smoothing.
+  - 'Up but not heard': while receiving GNSS L1 (GPS), the position panel lists satellites whose
+    own orbits put them 15 degrees or more up but that aren't being tracked - a long list means the
+    antenna's view of the sky is blocked (a handheld lying on it did exactly that).
+  - Start-up history: the tooltip shows this session's first fixes and the median of the last ten.
+  - Searching only for the satellites that are up (gnss_rx.py --narrow-search) is there but off:
+    on a recording it locked fewer satellites, as pocket_trk already searches all in parallel.
+  - pocket_trk's own settings: a data\pocket_trk.opt file (lines like 'thres_cn0_l = 33') is
+    passed to it. Tested on a recording: lowering its lock thresholds finds weak satellites but
+    can't hold them, so the defaults stay; a better view of the sky added them for real.
+  - Catalog: one file per capture in data\catalog (plus index.json) instead of one big file - a
+    bad write costs at most one capture, and a save rewrites only what changed. The old
+    catalog-data.json is read once and left in place. Each GNSS capture also keeps its session
+    statistics (first-fix times, satellites, signal, middle position, accuracy).
+  - Reference points (right-click the position panel): save your long-term average, or import a
+    GPX file - waypoints near home and stretches where a track sat still 3+ minutes become points.
+    A Garmin plugged in as a drive is imported by itself (its GPX files are copied to
+    data\garmin). Star the one beside the antenna (or name one 'antenna'): the panel then measures
+    against it instead of the home location.
+  - GPX export (right-click): every session's fixes, pocket_trk's and the WAAS-corrected, as
+    tracks, and the reference points as waypoints - for BaseCamp, Google Earth or QGIS.
+  - Sea-level heights: a Garmin on the live USB link reports the local gap between GPS's ellipsoid
+    and sea level (-19.3 m here, saved in data\geoid.json); heights in the tooltip and in GPX
+    exports are then above sea level.
+  - garmin_usb.py reads a Garmin handheld live over USB (with Garmin's USB driver; Interface set
+    to Garmin Spanner/Serial and No to mass storage): 'python garmin_usb.py log FILE'.
 JAMMING AND SPOOFING WATCH (Integrity section)
 ----------------------------------------------
 The Integrity section (header button) watches the GNSS L1 (GPS) band - GPS, Galileo and WAAS -
