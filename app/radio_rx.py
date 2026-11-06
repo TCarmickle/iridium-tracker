@@ -21,6 +21,7 @@ ap.add_argument('--rate', type=float, default=2048000)
 ap.add_argument('--center', type=float, default=100.25e6)
 ap.add_argument('--gain', type=float, default=30.0)
 ap.add_argument('--auto-gain', action='store_true')
+ap.add_argument('--if-gain', type=float, default=60.0)   # E4000 IF gain (sdr_settings.if_gain; others ignore it)
 ap.add_argument('--ppm', type=float, default=0.0)
 ap.add_argument('--no-dc', action='store_true')
 ap.add_argument('--start-file', default='')
@@ -55,6 +56,8 @@ class Receiver(gr.top_block):
         else:
             _try('Gain: manual', src.set_gain_mode, False, 0)
             _try('Gain: %.1f dB' % opts.gain, src.set_gain, opts.gain, 0)
+            if opts.if_gain:
+                _try('IF gain: %.1f dB' % opts.if_gain, src.set_if_gain, opts.if_gain, 0)
         _try('DC correction: %s' % ('off' if opts.no_dc else 'on'), src.set_dc_offset_mode, 0 if opts.no_dc else 2, 0)
         self.spectrum = None
         self.taps = []

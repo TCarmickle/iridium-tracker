@@ -22,7 +22,7 @@ class SignalBars(QtWidgets.QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(260)
+        self.setMinimumHeight(150)
         self.bars = []
         self.hits = []
 
@@ -97,7 +97,7 @@ class SignalHistory(QtWidgets.QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(150)
+        self.setMinimumHeight(90)
         self.name, self.points, self.scale = None, [], (0, 1, '')
 
     def set_history(self, name, points, scale):

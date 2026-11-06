@@ -156,7 +156,7 @@ class GlobeView(QtWidgets.QWidget):
 
     def __init__(self, home, load_tile, map_theme='dark'):
         super().__init__()
-        self.setMinimumSize(500, 500)
+        self.setMinimumSize(300, 240)   # (small: the main window's view stack keeps room for its tallest view)
         self.setMouseTracking(True)
         self.home = home                    # (lat, lon)
         self.lat0, self.lon0 = home[0], home[1]     # the point the camera looks at

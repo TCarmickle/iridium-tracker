@@ -46,7 +46,7 @@ class SpectrumView(QtWidgets.QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumHeight(220)
+        self.setMinimumHeight(150)
         self.setMouseTracking(True)
         self.sock = QtNetwork.QUdpSocket(self)
         self.sock.bind(QtNetwork.QHostAddress.LocalHost, 0)
@@ -95,6 +95,7 @@ class SpectrumView(QtWidgets.QWidget):
             x = np.frombuffer(d[20:], np.float32).astype(np.float64)
             if d[:4] == b'IRS2':        # peak and average of every FFT in the frame
                 v, av = x[:len(x) // 2], x[len(x) // 2:]
+                self.input_level = input_level(av)
             else:                       # a single snapshot
                 v = av = x
             if self.paused or not np.all(np.isfinite(x)):
@@ -114,6 +115,8 @@ class SpectrumView(QtWidgets.QWidget):
             if self.auto and self.frames % 15 == 1:
                 self._auto_range()
             self.dirty = True
+
+    input_level = None          # the samples' RMS as a fraction of the ADC's full scale (input_level)
 
     def _reset(self, center, rate, n):
         self.center, self.rate, self.n = center, rate, n
@@ -583,8 +586,11 @@ class SpectrumPanel(QtWidgets.QWidget):
         bar = QtWidgets.QHBoxLayout()
         bar.setContentsMargins(0, 0, 0, 0)
         title = QtWidgets.QLabel('<span style="color:%s; font-weight:600">SPECTRUM</span>' % MUTED)
+        self.level = QtWidgets.QLabel()         # how much of the ADC's range the samples use
+        self.level.setToolTip(LEVEL_TIP)
         self.info = QtWidgets.QLabel()
         self.info.setStyleSheet('color: %s;' % MUTED)
+        self.info.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)  # (long text)
         self.auto = QtWidgets.QCheckBox('Auto range')
         self.auto.setChecked(True)
         self.auto.toggled.connect(self._auto)
@@ -630,6 +636,8 @@ class SpectrumPanel(QtWidgets.QWidget):
             self.pop_btns[part] = b
         bar.addWidget(title)
         bar.addSpacing(10)
+        bar.addWidget(self.level)
+        bar.addSpacing(6)
         bar.addWidget(self.info, 1)
         for wdg in (self.sound, self.volume, self.audio_btn, self.auto, self.lo, self.hi, self.peak, self.pause,
                     self.pop_btns['trace'], self.pop_btns['water']):
@@ -839,8 +847,46 @@ class SpectrumPanel(QtWidgets.QWidget):
                 sb.blockSignals(True)
                 sb.setValue(int(round(val)))
                 sb.blockSignals(False)
+        self.level.setText(level_text(v.input_level if v.n and v.live else None))
         if v.n:
             self.info.setText('%.4f MHz centre  ·  %.2f MS/s  ·  %d-point FFT  ·  line = peak, fill = average  ·  MHz  ·  %s'
                               % (v.center / 1e6, v.rate / 1e6, v.n, 'live' if v.live else 'stopped'))
         else:
             self.info.setText('waiting for the receiver')
+
+
+# ---------------------------------------------------------------- input level
+_W = np.blackman(4)     # (placeholder; replaced below)
+LEVEL_TIP = ('Input: how much of the SDR\'s 8-bit converter the samples use (their RMS, % of full scale).\n'
+             'Under ~2%: too low - weak signals are lost in the rounding; raise the IF gain (Source).\n'
+             '5-30%: good.  Over ~40%: strong signals may clip; lower the gain.')
+
+
+def _enbw(n):
+    """the receivers' FFT window (Blackman-Harris, sdr_taps.add_spectrum): N * sum(w^2) / sum(w)^2"""
+    k = np.arange(n)
+    a = (0.35875, 0.48829, 0.14128, 0.01168)
+    w = a[0] - a[1] * np.cos(2 * np.pi * k / (n - 1)) + a[2] * np.cos(4 * np.pi * k / (n - 1)) - a[3] * np.cos(6 * np.pi * k / (n - 1))
+    return n * np.sum(w ** 2) / np.sum(w) ** 2
+
+
+_ENBW = {}
+
+
+def input_level(avg_db):
+    """the average spectrum (dB, a full-scale tone = 0 dB) -> the samples' RMS per I/Q component as a fraction
+    of full scale (Parseval: the bins' power adds up to the samples' power, times the window's noise bandwidth)"""
+    n = len(avg_db)
+    if n not in _ENBW:
+        _ENBW[n] = _enbw(n)
+    p = float(np.sum(10 ** (np.asarray(avg_db) / 10))) / _ENBW[n]
+    return float(np.sqrt(p / 2))
+
+
+def level_text(level):
+    if level is None:
+        return ''
+    pct = level * 100
+    colour = '#e05050' if pct < 2 or pct > 50 else '#e0a040' if pct < 5 or pct > 35 else '#4caf50'
+    return '<span style="color:%s">Input %s%%</span>' % (colour, ('%.1f' % pct) if pct < 10 else '%.0f' % pct)
+

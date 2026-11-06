@@ -74,6 +74,10 @@ The "Source" button next to Start receiver works like SDR++'s source menu:
 - Gain (or Auto), PPM correction, Bias-T (powers an active antenna or LNA through the coax),
   offset tuning and DC correction. IQ correction is off by default: gr-osmosdr's automatic IQ
   balance creates a mirror image of every burst, which can't be decoded.
+- IF gain (E4000 tuners), per band. Too low and weak signals are lost in the SDR's 8-bit
+  rounding - GPS went from 0-2 satellites to 5+ when it was raised. Tune gain finds the best
+  value for a band in about 10 seconds (receiver stopped, the band's antenna connected). The
+  'Input' level next to the spectrum shows how much of the converter is used: 5-30% is good.
 - Burst threshold: how far over the noise a burst must be. 14 dB is the minimum - lower floods
   the decoder with false bursts and can run the PC out of memory.
 Changes apply the next time you start the receiver.
@@ -399,3 +403,10 @@ This package contains open-source software; see the LICENSES folder.
                                   is from CommPy, BSD-3-Clause; notices in app\orbcomm)
 The tracker itself (the files in app\ other than iridium-toolkit and orbcomm) is free software under the
 GNU General Public License v3 (LICENSES\GPL-3.0.txt). The source code is the .py files in app\.
+
+PC CLOCK FROM GPS
+-----------------
+While the GNSS L1 (GPS) receiver has a position fix, Settings (the cog) > PC clock shows how far
+this PC's clock is from GPS time (accurate to a few milliseconds - the receiver times each fix
+from the SDR's sample count). 'Set PC clock to GPS time' moves the Windows clock by that much;
+Windows asks for permission first.

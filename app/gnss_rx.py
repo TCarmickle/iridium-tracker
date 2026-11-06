@@ -26,8 +26,12 @@ Lines (from its log):
                                            WAAS (sat S31 = PRN 131): 'SBAS,t0,x,y,z,vx,vy,vz,ax,ay,az' - its own
                                            position from its message type 9 (m, m/s, m/s2)
   GPOS: t lat lon height_m nsat            a position fix from the satellites
+  GTIME: t offset_s nsat spread_s          GPS time minus this PC's clock (live mode, every 10 s): the median
+                                           over the last fixes, each fix's GPS time against the PC time its
+                                           samples were taken at (from the SDR's sample count)
 """
 import argparse
+import collections
 import ctypes
 import datetime
 import os
@@ -218,6 +222,9 @@ class Lines:
         self.fixes = 0
         self.sbas_types = {}    # WAAS message type -> how many decoded (for the status line)
         self.glo_slot = {}      # GLONASS frequency channel -> the satellite's slot ('R16')
+        self.clock = False      # live mode: when() is the PC time a sample was taken, so fixes time the PC clock
+        self.offsets = collections.deque(maxlen=10)
+        self.last_gtime = 0.0
 
     def orbits(self, ephs, t):
         for sat, sig, fields in ephs:      # in the field order of a $EPH line, so gnss.parse_eph reads it
@@ -265,6 +272,13 @@ class Lines:
                 t = gpst_to_unix([float(v) for v in f[2:8]])
                 emit('GPOS: %.3f %s %s %s %s' % (t, f[8], f[9], f[10], f[12]))
                 self.fixes += 1
+                if self.clock and int(f[12]) >= 4:
+                    self.offsets.append(t - when(float(f[1])))
+                    if len(self.offsets) >= 5 and time.time() - self.last_gtime >= 10:
+                        self.last_gtime = time.time()
+                        o = np.array(self.offsets)
+                        emit('GTIME: %.3f %.4f %s %.4f' % (time.time(), float(np.median(o)), f[12],
+                                                          float(o.max() - o.min())))
         except ValueError:
             pass
 
@@ -375,6 +389,24 @@ class PipeFeeder(gr.sync_block):
         return len(x)
 
 
+def usb_latency():
+    """seconds between a sample being taken and it reaching the flowgraph, beyond what the arrival times show:
+    gr-osmosdr's RTL-SDR source keeps two USB buffers in hand (default 256 KiB = 64 ms at 2.048 MS/s each).
+    Measured against internet time (NTP): 133 ms with the default buffers, 38 ms with 64 KiB ones - two buffers
+    plus ~5 ms both times. Other devices: unknown (0)."""
+    dev = opts.device.lower()
+    if not dev.startswith('rtl'):
+        return 0.0
+    buflen = 262144
+    for part in dev.split(','):
+        if part.strip().startswith('buflen='):
+            try:
+                buflen = int(part.split('=', 1)[1])
+            except ValueError:
+                pass
+    return 2 * (buflen / 2) / opts.rate + 0.005
+
+
 class LiveTracker(threading.Thread):
     """runs pocket_trk on the pipe for the whole session (restarting it if it stops), feeds it, and reads its
     log and decoded orbits as they grow"""
@@ -388,12 +420,27 @@ class LiveTracker(threading.Thread):
         self.folder = tempfile.mkdtemp(prefix='gnss_live_')
         self.dropped = 0            # samples dropped because pocket_trk fell behind
         self.runs = 0
+        self.out.clock = True
+        # The PC time of the stream's first sample: each block arrives a little after its last sample was taken
+        # (USB buffering, scheduling), so the earliest 'arrival - samples so far / rate' over the last 10 s is the
+        # best estimate (sliding, so the SDR's crystal error can't build up)
+        self.received = 0
+        self.t0_cands = collections.deque()
 
     def feed(self, data, n):
+        now = time.time()
+        k = self.received
+        self.received += n
+        self.t0_cands.append((now, now - self.received / self.rate))
+        while self.t0_cands[0][0] < now - 10:
+            self.t0_cands.popleft()
         try:
-            self.q.put_nowait((data, n))
+            self.q.put_nowait((data, n, k))
         except queue.Full:
             self.dropped += n
+
+    def t_stream0(self):
+        return min(c for _, c in list(self.t0_cands)) - usb_latency()
 
     def run(self):
         while True:
@@ -418,29 +465,40 @@ class LiveTracker(threading.Thread):
             raise OSError('pocket_trk did not open the pipe')
         while not self.q.empty():   # start from fresh samples
             self.q.get_nowait()
-        t0 = time.time()            # unix time of receiver time 0
         written = 0                 # samples given to pocket_trk
-        gaps = []                   # (receiver time, seconds dropped there): its clock skips over them
+        # (receiver time, the stream's sample number there): pocket_trk's clock counts only the samples it was
+        # given, so it skips over dropped ones; a new anchor at each jump
+        anchors = []
+
+        def when(rt):
+            """pocket_trk receiver time -> the PC (unix) time that sample was taken"""
+            a = [x for x in anchors if x[0] <= rt]
+            art, k = a[-1] if a else (anchors[0] if anchors else (0.0, 0))
+            return self.t_stream0() + k / self.rate + (rt - art)
+
         log('GNSS: live tracking started (pocket_trk run %d)' % self.runs)
-        reader = threading.Thread(target=self.read, args=(proc, logf, rtcmf, lambda rt: t0 + rt + sum(
-            s for at, s in gaps if at <= rt)), daemon=True)
-        reader.start()
-        dropped = self.dropped
+        reader = threading.Thread(target=self.read, args=(proc, logf, rtcmf, when), daemon=True)
+        next_k = None
+        started_reader = False
         while proc.poll() is None:
             try:
-                data, n = self.q.get(timeout=1.0)
+                data, n, k = self.q.get(timeout=1.0)
             except queue.Empty:
                 continue
-            if self.dropped != dropped:     # samples were dropped before this block
-                gaps.append((written / self.rate, (self.dropped - dropped) / self.rate))
-                dropped = self.dropped
+            if k != next_k:                 # the first block, or samples were dropped before this one
+                anchors.append((written / self.rate, k))
+            next_k = k + n
+            if not started_reader:
+                reader.start()
+                started_reader = True
             if not pipe.write(data):
                 break
             written += n
         pipe.close()
         if proc.poll() is None:
             proc.kill()
-        reader.join(timeout=5)
+        if started_reader:
+            reader.join(timeout=5)
         log('GNSS: pocket_trk run %d stopped after %.0f s' % (self.runs, written / self.rate))
 
     def read(self, proc, logf, rtcmf, when):

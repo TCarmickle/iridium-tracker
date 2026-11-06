@@ -1104,7 +1104,7 @@ class MapView(QtWidgets.QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(600, 400)
+        self.setMinimumSize(400, 240)
         self.setMouseTracking(True)
         self.zoom = 2.3
         self.cx, self.cy = merc(-100, 25)
@@ -1736,6 +1736,11 @@ class Tracker(QtWidgets.QMainWindow):
                 self.restoreGeometry(QtCore.QByteArray.fromBase64(geo.encode()))
             except (TypeError, ValueError):
                 pass
+            # a saved size bigger than the screen (saved while the window had spilled over it): back to the default
+            n = self.normalGeometry()
+            if not n.isValid() or n.width() > avail.width() or n.height() > avail.height():
+                self.setGeometry(QtWidgets.QStyle.alignedRect(QtCore.Qt.LeftToRight, QtCore.Qt.AlignCenter, QtCore.QSize(
+                    int(min(1700, avail.width() * 0.95)), int(min(1000, avail.height() * 0.92))), avail))
         self.data = Data()
         self.t = time.time()
         self.playing, self.following = False, True
@@ -2107,8 +2112,13 @@ class Tracker(QtWidgets.QMainWindow):
         cv.setSpacing(2)
         cv.addWidget(header)
         cv.addWidget(self.sections, 1)
+        # A fixed minimum for the whole content: without it the window's minimum is the sum of every panel's, which
+        # grew past a 1080p screen's height (the window then spilled under the taskbar and out of maximised); now the
+        # panels share whatever room the screen has
+        central.setMinimumSize(900, 560)
         self.setCentralWidget(central)
         self.status = QtWidgets.QLabel()
+        self.status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)   # (long text)
         self.statusBar().addWidget(self.status, 1)
 
         self.reload_lists()

@@ -42,6 +42,16 @@ DEFAULTS = {
     'radio_gain': 30.0,         # Radio (any frequency): strong broadcast stations overload higher gains
     'radio_auto_gain': False,
     'radio_freq_mhz': 100.0,    # the frequency the Radio section listens to (remembered)
+    # IF gain (E4000 tuners; others ignore it): the driver's default leaves the samples at under 1% of the ADC's
+    # range - weak signals lost in the 8-bit rounding. Per band, measured on the air (see BUILDING.md)
+    'if_gain': 60.0,
+    'orbcomm_if_gain': 60.0,
+    'ham2m_if_gain': 60.0,
+    'ham70_if_gain': 60.0,
+    'gnss1_if_gain': 60.0,
+    'glo1_if_gain': 60.0,
+    'meteor_if_gain': 50.0,     # (at 137 MHz with gain 40, IF 60 gave a lower level than 50)
+    'radio_if_gain': 60.0,
 }
 # the decoder needs sample_rate / decimation to be a multiple of 250 kHz
 RATES = [2000000, 2250000, 2500000, 3000000, 4000000, 5000000, 6000000, 8000000, 10000000, 12500000, 20000000]
@@ -99,6 +109,12 @@ def gain(s):
     return (s['gain'], s['auto_gain']) if key == 'iridium' else (s[key + '_gain'], s[key + '_auto_gain'])
 
 
+def if_gain(s):
+    """the IF gain (dB) for the band being received"""
+    key = s.get('system', 'iridium')
+    return s['if_gain'] if key == 'iridium' else s[key + '_if_gain']
+
+
 def center_hz(s):
     """the tuning frequency. Iridium: as set, or automatic - the widest slice of the band the rate
     allows, keeping the top (the ring-alert and messaging channels at 1626.0-1626.5 MHz) inside.
@@ -141,6 +157,7 @@ def write_conf(s, path):
              'center_freq=%d' % center_hz(s)]
     if not s['auto_gain']:
         lines.append('gain=%d' % round(s['gain']))
+        lines.append('if_gain=%d' % round(s['if_gain']))      # (gr-iridium sets the source's 'IF' gain from it)
     lines += ['', '[demodulator]', 'decimation=%d' % decimation(s['sample_rate'])]
     with open(path, 'w') as f:
         f.write('\n'.join(lines) + '\n')

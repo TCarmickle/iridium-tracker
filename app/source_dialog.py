@@ -1,4 +1,6 @@
 """Source panel: which satellite system to receive, which SDR, and how it is tuned (like SDR++'s Source menu)."""
+import os
+
 from PyQt5 import QtCore, QtWidgets
 
 import sdr_settings as sdr
@@ -113,6 +115,31 @@ class SourceDialog(QtWidgets.QDialog):
         row.addWidget(self.gain_lbl)
         row.addWidget(self.auto_gain)
         form.addRow('Gain:', row)
+        row = QtWidgets.QHBoxLayout()
+        self.if_gain = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.if_gain.setRange(0, 70)
+        self.if_gain.setValue(int(sdr.if_gain(self.s)))
+        self.if_gain_lbl = QtWidgets.QLabel('%d dB' % sdr.if_gain(self.s))
+        self.if_gain_lbl.setMinimumWidth(56)
+        self.if_gain.valueChanged.connect(lambda v: self.if_gain_lbl.setText('%d dB' % v))
+        self.if_gain.setToolTip('The tuner\'s second amplifier (E4000 tuners; others ignore it). Too low and weak\n'
+                                'signals are lost in the 8-bit rounding: watch the "Input" level next to the spectrum -\n'
+                                'it should read roughly 5-30%. The Tune gain button finds the best value for a band.')
+        row.addWidget(self.if_gain, 1)
+        row.addWidget(self.if_gain_lbl)
+        self.tune_btn = QtWidgets.QPushButton('Tune gain')
+        self.tune_btn.setToolTip('About 10 seconds: steps the IF gain for this band and picks the one that fills\n'
+                                 'the SDR\'s converter most without clipping (the receiver must be stopped).\n'
+                                 'Run it with the band\'s antenna connected - its signals set how much room is needed.')
+        self.tune_btn.clicked.connect(self._tune)
+        row.addWidget(self.tune_btn)
+        form.addRow('IF gain:', row)
+        self.tune_note = QtWidgets.QLabel()
+        self.tune_note.setWordWrap(True)
+        theme.style(self.tune_note, 'color: %(MUTED)s;')
+        self.tune_note.hide()
+        form.addRow('', self.tune_note)
+        self.tuner = None
         self.ppm = QtWidgets.QDoubleSpinBox()
         self.ppm.setRange(-200, 200)
         self.ppm.setDecimals(1)
@@ -221,17 +248,19 @@ class SourceDialog(QtWidgets.QDialog):
     # ---- which system
     @staticmethod
     def _gains(s):
-        """band -> (gain, auto) from saved settings"""
-        return {sy['key']: sdr.gain(dict(s, system=sy['key'])) for sy in systems.ORDER}
+        """band -> (gain, auto, IF gain) from saved settings"""
+        return {sy['key']: sdr.gain(dict(s, system=sy['key'])) + (sdr.if_gain(dict(s, system=sy['key'])),)
+                for sy in systems.ORDER}
 
     def _system_changed(self, *_):
         """each band keeps its own gain; every band but Iridium has its rate and frequency set by its decoders"""
-        self.gains[self.shown_system] = (self.gain.value() / 10, self.auto_gain.isChecked())
+        self.gains[self.shown_system] = (self.gain.value() / 10, self.auto_gain.isChecked(), self.if_gain.value())
         key = self.system.currentData()
         self.shown_system = key
-        g, auto = self.gains[key]
+        g, auto, ifg = self.gains[key]
         self.gain.setValue(int(g * 10))
         self.auto_gain.setChecked(auto)
+        self.if_gain.setValue(int(ifg))
         fixed = key != 'iridium'
         for w in self.tuning_rows:
             if w is not None:
@@ -249,13 +278,13 @@ class SourceDialog(QtWidgets.QDialog):
         label = self.device.currentData()[0] if self.device.currentData() else self.s['label']
         key = self.system.currentData()
         gains = dict(self.gains)
-        gains[key] = (self.gain.value() / 10, self.auto_gain.isChecked())
+        gains[key] = (self.gain.value() / 10, self.auto_gain.isChecked(), float(self.if_gain.value()))
         per_band = {}
-        for k, (g, auto) in gains.items():
+        for k, (g, auto, ifg) in gains.items():
             if k == 'iridium':
-                per_band.update(gain=g, auto_gain=auto)
+                per_band.update(gain=g, auto_gain=auto, if_gain=ifg)
             else:
-                per_band.update({k + '_gain': g, k + '_auto_gain': auto})
+                per_band.update({k + '_gain': g, k + '_auto_gain': auto, k + '_if_gain': ifg})
         return dict(self.s, system=key, device=self.args.text().strip() or 'rtl=0', label=label or 'SDR',
                     sample_rate=self.rate.currentData(), center_mhz=0.0 if self.center_auto.isChecked() else self.center.value(),
                     ppm=self.ppm.value(), **per_band,
@@ -290,9 +319,10 @@ class SourceDialog(QtWidgets.QDialog):
                       system=self.system.currentData())
         d = self.s
         self.gains = self._gains(d)
-        g, auto = self.gains[self.shown_system]
+        g, auto, ifg = self.gains[self.shown_system]
         self.gain.setValue(int(g * 10))
         self.auto_gain.setChecked(auto)
+        self.if_gain.setValue(int(ifg))
         self.rate.setCurrentIndex(self.rate.findData(d['sample_rate']))
         self.center_auto.setChecked(True)
         self.ppm.setValue(d['ppm'])
@@ -314,3 +344,59 @@ class SourceDialog(QtWidgets.QDialog):
         sdr.save(v)
         self.result = v
         self.accept()
+
+    # ---- IF gain tuning (gain_tune.py)
+    def _tune(self):
+        import receiver
+        if self.tuner is not None:
+            return
+        rx = getattr(self.parent(), 'receiver', None)
+        if (rx is not None and rx.busy) or receiver.active_capture():
+            self._tune_say('Stop the receiver first - the tuner needs the SDR.')
+            return
+        v = self._values()
+        g, auto = sdr.gain(v)
+        args = [os.path.join(receiver.HERE, 'gain_tune.py'), '--device', sdr.device_args(v),
+                '--rate', str(sdr.sample_rate(v)), '--center', str(sdr.center_hz(v)), '--gain', '%g' % g,
+                '--ppm', '%g' % v['ppm']] + ['--auto-gain'] * auto
+        self.tuner = QtCore.QProcess(self)
+        if rx is not None:
+            self.tuner.setProcessEnvironment(rx.env)
+        self.tuner.setWorkingDirectory(receiver.HERE)
+        self.tuner_out, self.tuner_steps = '', []
+        self.tuner.readyReadStandardOutput.connect(self._tune_output)
+        self.tuner.finished.connect(self._tune_done)
+        self.tune_btn.setEnabled(False)
+        self._tune_say('Tuning %s: measuring the input level at each IF gain...' % systems.get(v['system'])['label'])
+        self.tuner.start(receiver.PY, args)
+
+    def _tune_say(self, text):
+        self.tune_note.setText(text)
+        self.tune_note.show()
+
+    def _tune_output(self):
+        self.tuner_out += bytes(self.tuner.readAllStandardOutput()).decode(errors='replace')
+        lines = self.tuner_out.split('\n')
+        self.tuner_out = lines.pop()
+        for line in lines:
+            f = line.split()
+            if f[:1] == ['STEP'] and len(f) >= 4:
+                self.tuner_steps.append('%s dB: %s%%%s' % (f[1], f[2], ' (clips)' if float(f[3]) > 0.01 else ''))
+                self._tune_say('IF gain - input level: ' + ',  '.join(self.tuner_steps))
+            elif f[:1] == ['BEST'] and len(f) >= 3:
+                self.if_gain.setValue(int(float(f[1])))
+                self.gains[self.shown_system] = (self.gain.value() / 10, self.auto_gain.isChecked(),
+                                                 self.if_gain.value())
+                self._tune_say('IF gain - input level: %s.<br><b>Best: %s dB (input %s%%)</b> - press Save to keep it.'
+                               % (',  '.join(self.tuner_steps), f[1], f[2]))
+            elif f[:1] == ['ERROR']:
+                self._tune_say('Could not tune: ' + line[6:])
+
+    def _tune_done(self, *_):
+        self._tune_output()
+        self.tune_btn.setEnabled(True)
+        if not self.tuner_steps and 'Best' not in self.tune_note.text():
+            err = bytes(self.tuner.readAllStandardError()).decode(errors='replace').strip().splitlines()
+            self._tune_say('Could not open the SDR%s' % (': ' + err[-1] if err else ''))
+        self.tuner = None
+

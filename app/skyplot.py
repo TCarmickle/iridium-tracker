@@ -64,7 +64,7 @@ class SkyPlot(QtWidgets.QWidget):
 
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(420, 420)
+        self.setMinimumSize(300, 240)
         self.fixes, self.frames = [], []
         self.now = []           # satellites up now: dicts with el, az, name, selected, live, el colour, system
         self.path = []          # the selected satellite's pass: [(el, az, t)]

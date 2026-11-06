@@ -1,8 +1,12 @@
-"""The Settings window (the cog in the header): your antenna location, and data and storage.
+"""The Settings window (the cog in the header): your antenna location, data and storage, and the PC clock
+(set from GPS time).
 
 Each tab is one of the existing panels (location_dialog.LocationDialog, data_dialog.DataDialog) shown inside
 the window instead of on its own.
 """
+import ctypes
+import time
+
 from PyQt5 import QtCore, QtWidgets
 from PyQt5.QtCore import Qt
 
@@ -69,6 +73,10 @@ class SettingsDialog(QtWidgets.QDialog):
         self.storage.setWindowFlags(Qt.Widget)
         self.tabs.addTab(self.storage, '\U0001F4BE  Data and storage')
 
+        # ---- PC clock
+        self.clock = ClockTab(tracker)
+        self.tabs.addTab(self.clock, '\U0001F552  PC clock')
+
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(self.tabs)
         self.tabs.setCurrentIndex(page)
@@ -87,3 +95,103 @@ class SettingsDialog(QtWidgets.QDialog):
     def _pick(self):
         self.accept()
         self.tracker.start_pick()
+
+
+# ---------------------------------------------------------------- PC clock from GPS time
+FRESH_S = 60            # a measurement older than this isn't used
+MAX_SPREAD_S = 0.05     # the fixes behind it must agree this well
+
+
+def clock_text(offset):
+    """'0.412 s behind GPS time' / 'right on GPS time'"""
+    a = abs(offset)
+    if a < 0.0015:
+        return 'right on GPS time (within a millisecond or so)'
+    amount = '%.0f ms' % (a * 1000) if a < 1 else '%.3f s' % a if a < 120 else '%.1f minutes' % (a / 60)
+    return '%s %s GPS time' % (amount, 'behind' if offset > 0 else 'ahead of')
+
+
+def set_pc_clock(offset):
+    """move the PC clock by offset seconds (GPS minus PC): an elevated PowerShell runs Set-Date -Adjust, so the
+    time it takes to say yes to Windows' prompt doesn't matter. True if it was started (the user may still say no)."""
+    ticks = int(round(offset * 1e7))
+    cmd = '-NoProfile -WindowStyle Hidden -Command "Set-Date -Adjust ([TimeSpan]::FromTicks(%d)) | Out-Null"' % ticks
+    r = ctypes.windll.shell32.ShellExecuteW(None, 'runas', 'powershell.exe', cmd, None, 0)
+    return r > 32
+
+
+class ClockTab(QtWidgets.QWidget):
+    """how far the PC clock is from GPS time (measured by the GNSS receiver), and a button to set it"""
+
+    def __init__(self, tracker):
+        super().__init__()
+        self.tracker = tracker
+        v = QtWidgets.QVBoxLayout(self)
+        intro = QtWidgets.QLabel(
+            'While the GNSS receiver tracks GPS / Galileo satellites and has a position fix, each fix also gives the '
+            'exact time. The receiver compares it with this PC\'s clock at the moment the samples were taken.')
+        intro.setWordWrap(True)
+        v.addWidget(intro)
+        self.state = QtWidgets.QLabel()
+        self.state.setWordWrap(True)
+        self.state.setStyleSheet('font-size: 15px; padding: 10px 0;')
+        v.addWidget(self.state)
+        self.detail = QtWidgets.QLabel()
+        self.detail.setWordWrap(True)
+        v.addWidget(self.detail)
+        row = QtWidgets.QHBoxLayout()
+        self.set_btn = QtWidgets.QPushButton('\U0001F552  Set PC clock to GPS time')
+        self.set_btn.setToolTip('Moves the Windows clock by the measured difference.\n'
+                                'Windows asks for permission first (changing the clock needs administrator rights).')
+        self.set_btn.clicked.connect(self._set)
+        row.addWidget(self.set_btn)
+        row.addStretch(1)
+        v.addLayout(row)
+        self.result = QtWidgets.QLabel()
+        self.result.setWordWrap(True)
+        v.addWidget(self.result)
+        note = QtWidgets.QLabel(
+            'Accuracy: a few milliseconds (limited by the SDR\'s USB timing). Windows may also set the clock itself '
+            'from the internet (Settings > Time & language) - that is fine; this is for when it can\'t, or to check it.')
+        note.setWordWrap(True)
+        note.setStyleSheet('color: #8b93a7;')
+        v.addStretch(1)
+        v.addWidget(note)
+        self.timer = QtCore.QTimer(self)
+        self.timer.timeout.connect(self._update)
+        self.timer.start(1000)
+        self._update()
+
+    def measurement(self):
+        rx = getattr(self.tracker, 'receiver', None)
+        m = getattr(rx, 'gps_clock', None)
+        if not m:
+            return None, None
+        age = time.time() - m['t']
+        ok = age < FRESH_S and m['nsat'] >= 4 and m['spread'] <= MAX_SPREAD_S
+        return m, ok
+
+    def _update(self):
+        m, ok = self.measurement()
+        if m is None:
+            self.state.setText('No GPS time yet')
+            self.detail.setText('Start the receiver on <b>GNSS L1 (GPS)</b>; once it has a position fix (usually '
+                                'within a few minutes) the clock difference shows here.')
+        else:
+            age = time.time() - m['t']
+            self.state.setText('Your PC clock is <b>%s</b>' % clock_text(m['offset']))
+            self.detail.setText('Measured %.0f s ago from a %d-satellite fix; the last fixes agreed to within %.0f ms.%s'
+                                % (age, m['nsat'], m['spread'] * 1000,
+                                   '' if ok else '<br><span style="color:#e0a040">Too old or too uncertain to set the '
+                                   'clock from - keep the GNSS receiver running.</span>'))
+        self.set_btn.setEnabled(bool(ok))
+
+    def _set(self):
+        m, ok = self.measurement()
+        if not ok:
+            return
+        if set_pc_clock(m['offset']):
+            self.result.setText('Asked Windows to move the clock by %+.3f s. Within about 10 s the next measurement '
+                                'here should read close to zero.' % m['offset'])
+        else:
+            self.result.setText('The clock was not changed (Windows\' permission prompt was declined or failed).')

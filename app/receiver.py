@@ -225,6 +225,7 @@ class Receiver(QtCore.QObject):
         if self.audio_port:
             args += ['--audio-port', str(self.audio_port)]
         args += ['--auto-gain'] * auto + ['--no-dc'] * (not s['dc_correction']) + ['--parent-pid', str(os.getpid())]
+        args += ['--if-gain', '%g' % sdr_settings.if_gain(s)]
         self.extractor.start(PY, args)
         if not self.extractor.waitForStarted(5000):
             self.status.emit('Could not start the %s receiver: %s' % (self.system['label'], self.extractor.errorString()))
@@ -351,13 +352,21 @@ class Receiver(QtCore.QObject):
             return
         lines = (self.out_rest + data.replace('\r\n', '\n')).split('\n')
         self.out_rest = lines.pop()
-        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS|MSIG): ', l)]
+        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS|MSIG|GTIME): ', l)]
         if not lines:
             return
         with open(self.live_path, 'a', newline='') as f:
-            f.write(''.join(l + '\r\n' for l in lines))
+            f.write(''.join(l + '\r\n' for l in lines if not l.startswith('GTIME')))
         for line in lines:
             kind = line.split(':', 1)[0]
+            if kind == 'GTIME':         # GNSS: GPS time minus the PC clock (Settings > PC clock); not saved
+                try:
+                    f = line.split()
+                    self.gps_clock = {'t': float(f[1]), 'offset': float(f[2]), 'nsat': int(f[3]),
+                                      'spread': float(f[4])}
+                except (IndexError, ValueError):
+                    pass
+                continue
             if kind == 'MSIG':          # Meteor: its signal strength (not a frame)
                 try:
                     self.meteor_snr = float(line.split()[2])

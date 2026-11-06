@@ -41,7 +41,7 @@ ap.add_argument('--auto-gain', action='store_true')
 # E4000 tuner: its IF gain left at the driver's default leaves the samples at ~0.6% of the ADC's range (under
 # one 8-bit step), losing weak signals in the rounding; 60 dB lifts them to ~10% (measured on GPS: 5 satellites
 # at ~37 dB-Hz instead of 0-2 at ~33). Other tuners ignore it.
-ap.add_argument('--if-gain', type=float, default=60.0)
+ap.add_argument('--if-gain', type=float, default=50.0)
 ap.add_argument('--ppm', type=float, default=0.0)
 ap.add_argument('--no-dc', action='store_true')
 ap.add_argument('--start-file', default='')
