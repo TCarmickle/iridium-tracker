@@ -450,7 +450,11 @@ class Data:
         if catalog.HOME is None:      # first run: nothing to fit until the antenna location is set
             return
         for n in names:
-            self._fit_one(n)
+            try:
+                self._fit_one(n)
+            except Exception as e:      # one satellite's bad fit must never stop the tracker
+                self.orbits.pop(n, None)
+                self.no_orbit[n] = 'orbit fit failed (%s)' % type(e).__name__
         # a single fix can't tell whether the satellite was heading north or south; once the other
         # orbits are in, keep the direction that lines up with one of the planes we have measured
         for n in names:

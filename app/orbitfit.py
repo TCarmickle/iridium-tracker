@@ -53,6 +53,7 @@ def site_xyz(lat, lon, h):
 
 def rate_for_radius(a, inc):
     """argument-of-latitude rate (rad/s) of a circular orbit of radius a, including J2"""
+    a = max(float(a), 0.5 * RE)     # (the fit can wander through nonsense radii on a bad start: keep it finite)
     n0 = math.sqrt(MU / a ** 3)
     k = J2 * (RE / a) ** 2
     s2 = math.sin(inc) ** 2
