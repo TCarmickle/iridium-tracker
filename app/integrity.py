@@ -1,5 +1,6 @@
-r"""The Integrity section: is anyone jamming or spoofing satellite navigation here? It watches whatever GNSS band the
-receiver is on (GPS / Galileo / WAAS, GLONASS, BeiDou) and checks what it hears against physics and against itself.
+r"""The Integrity section: is anyone jamming or spoofing satellite navigation here? It watches the GPS L1 band
+(WATCH_BANDS: GPS / Galileo / WAAS; GLONASS and BeiDou are received but not watched - a steady spur near B1I kept
+alerting) and checks what it hears against physics and against itself.
 
 Jamming (someone drowning the signals): GNSS signals arrive under the noise, so with the gain fixed the band's
 power IS the noise - a jammer raises it, or shows as a peak above the band's usual shape (gnss_rx's GNOISE lines,
@@ -13,8 +14,14 @@ the ground, and that shows -
     SDR's frequency error, which is the same for all of them)
   - a satellite is heard that its own orbit puts below the horizon
   - the signals are too strong, or all the same strength (real ones differ with elevation)
+Not radio at all, but it looks like it: the SDR's USB sample stream breaks for 100-140 ms a few times a day. Every
+satellite drops together (C/N0 "at loss" 12-20 dB-Hz) and most are back at their previous strength within 2-15 s.
+gnss_rx reports such a gap (GGAP) and pocket_trk's own log (GLOG); the fingerprint is also recognised here from the
+satellites alone. A signal drop that coincides is shown as "stream gap (SDR/USB) - not RF", at most a watch, and
+gets no raw-sample recording (except the first of a session, as evidence).
 Each check has two levels (watch, alert); a level must hold a few seconds before it shows, and clears only after
-it has been quiet a while. Changes go to the event list (kept in integrity-events.jsonl).
+it has been quiet a while and the value has come back below the line by a margin (no flapping on a steady spur).
+Changes go to the event list (kept in integrity-events.jsonl).
 Each event also gets a snapshot folder (data\integrity\<time>-<check>\): every receiver line from 2 minutes before
 to 90 s after it cleared (lines.txt), event.json (the receiver's settings, the checks and satellites at the start and
 end, and a summary: how long, how the noise rose and fell, what kind of signal and where in the band, each
@@ -44,6 +51,24 @@ NA, OK, WATCH, ALERT = -1, 0, 1, 2
 LEVEL_WORD = {NA: 'not checked', OK: 'clear', WATCH: 'watch', ALERT: 'ALERT'}
 HISTORY_S = 1800        # the charts: last 30 minutes
 RAISE_S, CLEAR_S = 3.0, 20.0     # a level must hold this long to show; and be gone this long to clear
+# Hysteresis: a level is raised the moment its threshold is reached, but dropped only once the value has stayed
+# below the threshold by a margin for CLEAR_S. Without it a steady spur at 11.8-12.0 dB against the 12 dB alert
+# line (BeiDou B1I, 2026-11-06) flipped watch / alert four times in six minutes. dB checks: 1 dB; the rest 20 %
+HYST_DB = {'noise': 1.0, 'peak': 1.0, 'cn0': 1.0, 'strength': 1.0}
+HYST_FRAC = 0.2
+# Stream gaps (not RF): the SDR's USB stream loses 100-140 ms of samples a few times a day (rarely 1-3 ms). Every
+# channel loses lock within half a second, C/N0 "at loss" 12-20 dB-Hz, and most satellites are re-found at their
+# previous strength within 2-15 s (review 2026-11-06, four such "blocked antenna" events in one day). gnss_rx
+# reports a gap it measured (GGAP) and pocket_trk's own log (GLOG LOST/FOUND); failing those the fingerprint is
+# recognised here: most of the satellites reported LOST within a second below GAP_LOST_CN0, or most of the
+# long-locked ones (over GAP_OLD_S) back with a lock age under GAP_RESET_S, all having vanished within 2 s
+GAP_RECENT_S = 10.0     # a GGAP this recent classifies a signal drop or lock loss as a stream gap
+GAP_HOLD_S = 60.0       # a gap keeps colouring the C/N0 and lock checks this long (they look 15-70 s back)
+GAP_LOST_CN0 = 25.0
+GAP_RESET_S, GAP_OLD_S = 3.0, 60.0
+GAP_REACQ_S = 15.0      # one gap's re-acquisitions arrive staggered over about this long
+GAP_IQ_WAIT_S = 8.0     # a C/N0 or lock event waits this long for a gap sign before asking for raw samples
+                        # (gnss_rx keeps the 20 s before the request, so nothing is lost by waiting)
 
 # thresholds (watch, alert)
 NOISE_RISE_DB = (3.0, 6.0)      # the band's power above its quiet baseline
@@ -104,6 +129,11 @@ def expected_doppler(orbit, t, home, carrier):
     return -rr * carrier / C
 
 
+def _ms(ms):
+    """a gap length for people: '110 ms', '1.5 ms', '0.25 ms'"""
+    return '%.0f ms' % ms if ms >= 10 else '%.1f ms' % ms if ms >= 1 else '%.2f ms' % ms
+
+
 def distance_m(lat1, lon1, lat2, lon2):
     a, b = math.radians(lat1), math.radians(lat2)
     dl = math.radians(lon2 - lon1)
@@ -120,8 +150,9 @@ class Check:
         self.raw, self.since = NA, 0.0
         self.pending = None
 
-    def update(self, now, raw, value):
-        """the new raw level; returns the old level when the shown one changed (else None)"""
+    def update(self, now, raw, value, at_once=False):
+        """the new raw level; returns the old level when the shown one changed (else None). at_once: a rise needs
+        no hold-off (the stream-gap fingerprint is itself the proof, and is over before RAISE_S)"""
         self.value = value
         cur = self.level
         if raw == cur:
@@ -133,7 +164,7 @@ class Check:
         if self.pending is None or self.pending[0] != raw:
             self.pending = (raw, now)
         hold = RAISE_S if raw > cur else CLEAR_S
-        if now - self.pending[1] >= hold:
+        if now - self.pending[1] >= hold or (at_once and raw > cur):
             self.level, self.pending = raw, None
             return cur
         return None
@@ -203,6 +234,17 @@ class Monitor:
         self.good_since = self.poor_since = None
         self.arm_note = ''
         self.t_start = time.time()
+        # stream gaps (see the module notes): what gnss_rx and pocket_trk reported, and the fingerprint's inputs
+        self.lock_s = {}                            # sat -> (t, lock seconds) from its last GCH line
+        self.gaps = collections.deque(maxlen=500)   # (t, ms, source) GGAP lines this session
+        self.log = collections.deque(maxlen=2000)   # (t, event, sat, values) GLOG lines
+        self.restarts = []                          # GLOG RESTART times
+        self.losts = collections.deque(maxlen=200)  # (t, sat, cn0) GLOG LOST
+        self.resets = collections.deque(maxlen=200)  # (t, sat, t_lost): a young lock after a long one
+        self.gap_t, self.gap_why = None, ''         # when a stream gap was last seen or recognised, and how
+        self.gap_count, self.gap_last = 0, None     # this session; (t, ms or None, source / how)
+        self.gap_iq_kept = False                    # raw samples of one gap event kept already (the evidence)
+        self._gap_event_t = -1e9
         for c in self.checks:
             c.level, c.value, c.pending = NA, '', None
 
@@ -242,6 +284,19 @@ class Monitor:
                 q.append((t, cn0))
                 while q and q[0][0] < t - 120:
                     q.popleft()
+                if len(f) >= 7:
+                    self._lock_age(t, sat, float(f[6]))
+            elif kind == 'GGAP' and len(f) >= 3:
+                self._gap(t, float(f[2]), f[3] if len(f) > 3 else 'usb')
+            elif kind == 'GLOG' and len(f) >= 3:
+                ev = f[2].upper()
+                sat = f[3] if len(f) > 3 and ev in ('FOUND', 'LOST', 'FALSELOCK') else ''
+                self.log.append((t, ev, sat, f[4:] if sat else f[3:]))
+                if ev == 'RESTART':
+                    self.restarts.append(t)
+                elif ev == 'LOST':
+                    self.losts.append((t, sat, float(f[4]) if len(f) > 4 else 0.0))
+                    self._lost_burst(t)
             elif kind == 'GPOS' and len(f) >= 6:
                 fx = (t, float(f[2]), float(f[3]), float(f[4]), int(f[5]))
                 if fx[4] >= 4:
@@ -258,6 +313,69 @@ class Monitor:
                 self.gtimes.append((t, float(f[2]) + step, float(f[4])))
         except (IndexError, ValueError):
             pass
+
+    # ---- stream gaps: reported by gnss_rx / pocket_trk, or recognised from the satellites
+    def _gap(self, t, ms, source):
+        """gnss_rx saw the sample stream break (GGAP): count it and let the checks know"""
+        self.gaps.append((t, ms, source))
+        self.gap_count += 1
+        self.gap_last = (t, ms, source)
+        self._mark_gap(t, source, ms=ms)
+
+    def _lock_age(self, t, sat, lock):
+        """a satellite back with a young lock after a long one (and a short absence): one re-acquisition"""
+        prev = self.lock_s.get(sat)
+        self.lock_s[sat] = (t, lock)
+        if prev and lock < GAP_RESET_S and prev[1] > GAP_OLD_S and t - prev[0] < 30:
+            self.resets.append((t, sat, prev[0]))
+            self._reset_burst(t)
+
+    def _reset_burst(self, t):
+        """the re-acquired fingerprint: within GAP_REACQ_S most of the long-locked satellites are back with young
+        locks, and they all vanished within the same second or two (setting satellites go one by one; a blocked
+        antenna does not bring them back)"""
+        recent = [r for r in self.resets if t - r[0] <= GAP_REACQ_S]
+        back = {}
+        for _, sat, t_lost in recent:
+            back[sat] = max(back.get(sat, 0.0), t_lost)
+        if len(back) < 2 or max(back.values()) - min(back.values()) > 2.0:
+            return
+        old = {s for s, (tt, lk) in self.lock_s.items() if t - tt < 30 and lk > GAP_OLD_S} | set(back)
+        if len(back) >= len(old) / 2:
+            self._mark_gap(t, 're-acquired together', n=len(back), of=len(old))
+
+    def _lost_burst(self, t):
+        """pocket_trk reported most of the satellites lost within a second, at the weak C/N0 of a stream gap"""
+        burst = {s for tt, s, c in self.losts if t - tt <= 1.5 and c < GAP_LOST_CN0}
+        heard = {s for s, v in self.last.items() if t - v[0] < 10} | burst
+        if len(burst) >= 2 and len(burst) >= len(heard) / 2:
+            self._mark_gap(t, 'lost together', n=len(burst), of=len(heard))
+
+    def _mark_gap(self, t, why, ms=None, n=0, of=0):
+        fresh = self.gap_t is None or t - self.gap_t > 30
+        self.gap_t, self.gap_why = t, why
+        if ms is None and fresh:        # recognised from the satellites alone: counts as a gap too
+            self.gap_count += 1
+            self.gap_last = (t, None, why)
+        if fresh and t - self._gap_event_t > 30:
+            self._gap_event_t = t
+            if ms is not None:
+                what = 'the SDR lost %s of samples (%s)' % (_ms(ms), why)
+            else:
+                what = '%d of %d satellites %s (SDR/USB)' % (n, of, why)
+            self.event(t, OK, 'Stream gap: %s - not an RF event (%d this session)' % (what, self.gap_count))
+
+    def gap_recent(self, now, within=GAP_HOLD_S):
+        return self.gap_t is not None and -5.0 <= now - self.gap_t < within
+
+    def gap_note(self):
+        """for the verdict card: '3 stream gaps this session, last 110 ms at 12:20'"""
+        if not self.gap_count or not self.gap_last:
+            return ''
+        t, ms, why = self.gap_last
+        size = _ms(ms) if ms is not None else 'recognised from the satellites'
+        return '%d stream gap%s this session, last %s at %s' % (
+            self.gap_count, '' if self.gap_count == 1 else 's', size, time.strftime('%H:%M', time.localtime(t)))
 
     # ---- events
     def event(self, t, level, text, snap=None):
@@ -302,6 +420,7 @@ class Monitor:
         if not self.active:
             return
         raw = {}
+        self.now = now
         # the PC clock stepped (time.time against the monotonic clock): no time-jump verdicts for a while
         wm = time.time() - time.monotonic()
         if abs(wm - getattr(self, '_wm_last', wm)) > 0.02:
@@ -316,14 +435,15 @@ class Monitor:
         elif n['learning']:
             for k in ('noise', 'peak'):
                 raw[k] = (NA, 'learning the quiet band (%d s)' % 30)
-            raw['clip'] = (self._grade(n['clip'], CLIP_PCT), '%.2f %% clipped' % n['clip'])
+            raw['clip'] = (self._grade(n['clip'], CLIP_PCT, 'clip'), '%.2f %% clipped' % n['clip'])
         else:
             if self.auto_gain:
                 raw['noise'] = (NA, 'automatic gain: the level means nothing')
             else:
-                raw['noise'] = (self._grade(n['rise'], NOISE_RISE_DB), '%+.1f dB (band %.1f dBFS)' % (n['rise'], n['power']))
-            raw['peak'] = (self._grade(n['peak'], PEAK_DB), '%.1f dB at %.4f MHz' % (n['peak'], n['peak_mhz']))
-            raw['clip'] = (self._grade(n['clip'], CLIP_PCT), '%.2f %% clipped' % n['clip'])
+                raw['noise'] = (self._grade(n['rise'], NOISE_RISE_DB, 'noise'),
+                                '%+.1f dB (band %.1f dBFS)' % (n['rise'], n['power']))
+            raw['peak'] = (self._grade(n['peak'], PEAK_DB, 'peak'), '%.1f dB at %.4f MHz' % (n['peak'], n['peak_mhz']))
+            raw['clip'] = (self._grade(n['clip'], CLIP_PCT, 'clip'), '%.2f %% clipped' % n['clip'])
             self._push('rise', now, n['rise'])
             self._push('peak', now, n['peak'])
         noisy = bool(n and not n['learning'] and (n['rise'] >= 2.0 and not self.auto_gain or n['peak'] >= PEAK_DB[0]))
@@ -340,20 +460,39 @@ class Monitor:
             new = [c for t, c in q if t >= now - 5]
             if len(old) >= 20 and new:
                 drops.append(float(np.median(old)) - float(np.median(new)))
+        # a stream gap (SDR/USB) drops every satellite too - but it is the receiver, not radio: at most a watch,
+        # said so, and the lock check raises at once on the fingerprint of satellites actually dropping together
+        # (it is over before RAISE_S; a GGAP alone, with the lost samples zero-filled, may cost no satellite).
+        # With extra noise at the same time the radio evidence wins (a short jammer burst drops and re-acquires too)
+        gap = self.gap_recent(now) and not noisy
+        gap_text = 'stream gap (SDR/USB) - not RF'
+        fingerprint = gap and self.gap_why in ('re-acquired together', 'lost together')
+        lock_now = False
         if len(drops) >= 3:
             d = float(np.median(drops))
-            g = self._grade(d, CN0_DROP_DB)
+            g = self._grade(d, CN0_DROP_DB, 'cn0')
             if g == ALERT and not noisy:
                 g = WATCH           # weaker without more noise: blocked, not jammed
-            raw['cn0'] = (g, '%+.1f dB over %d satellites%s' % (-d, len(drops), '' if noisy or d < CN0_DROP_DB[0]
-                                                                 else ' (noise normal: blocked?)'))
+            if gap:
+                raw['cn0'] = (min(g, WATCH), '%+.1f dB over %d satellites (%s)' % (-d, len(drops), gap_text))
+            else:
+                raw['cn0'] = (g, '%+.1f dB over %d satellites%s' % (-d, len(drops), '' if noisy or d < CN0_DROP_DB[0]
+                                                                     else ' (noise normal: blocked?)'))
         else:
             raw['cn0'] = (NA, 'needs 3 satellites tracked for a minute')
         before = [c for t, c in self.counts if now - 70 <= t < now - 15]
         if before and max(before) >= 4:
             was = float(np.median(before))
             lost = len(locked) <= was / 3
-            raw['lock'] = ((ALERT if noisy else WATCH) if lost else OK, '%d locked (was %.0f)' % (len(locked), was))
+            if gap:
+                lock_now = fingerprint and self.gap_recent(now, GAP_REACQ_S)
+                raw['lock'] = (WATCH if lost or lock_now else OK,
+                               '%d locked (was %.0f) - %s' % (len(locked), was, gap_text))
+            else:
+                raw['lock'] = ((ALERT if noisy else WATCH) if lost else OK, '%d locked (was %.0f)' % (len(locked), was))
+        elif fingerprint and self.gap_recent(now, GAP_REACQ_S):
+            lock_now = True
+            raw['lock'] = (WATCH, '%d locked - %s' % (len(locked), gap_text))
         else:
             raw['lock'] = (NA, 'needs 4 satellites')
         if locked:
@@ -364,7 +503,7 @@ class Monitor:
         # -- strength
         if len(locked) >= 3:
             cs = np.array([v[1] for v in locked.values()])
-            g = self._grade(float(cs.max()), CN0_HIGH)
+            g = self._grade(float(cs.max()), CN0_HIGH, 'strength')
             even = len(cs) >= 5 and float(cs.std()) < CN0_SPREAD_DB and float(cs.mean()) > 40
             if even:
                 g = max(g, WATCH) if g < WATCH else ALERT
@@ -377,13 +516,14 @@ class Monitor:
         if len(recent) >= 3 and home:
             lat, lon = float(np.median([f[1] for f in recent])), float(np.median([f[2] for f in recent]))
             d = distance_m(home[0], home[1], lat, lon)
-            raw['pos_home'] = (self._grade(d, POS_HOME_M), '%.0f m from home (%d satellites)' % (d, recent[-1][4]))
+            raw['pos_home'] = (self._grade(d, POS_HOME_M, 'pos_home'),
+                               '%.0f m from home (%d satellites)' % (d, recent[-1][4]))
             self._push('pos', now, d)
             first = self.first_fixes
             if len(first) >= 10 and now - first[-1][0] > 0:
                 flat, flon = float(np.median([f[1] for f in first])), float(np.median([f[2] for f in first]))
                 dd = distance_m(flat, flon, lat, lon)
-                raw['pos_drift'] = (self._grade(dd, POS_DRIFT_M), '%.0f m since the start' % dd)
+                raw['pos_drift'] = (self._grade(dd, POS_DRIFT_M, 'pos_drift'), '%.0f m since the start' % dd)
             else:
                 raw['pos_drift'] = (NA, 'needs the first fixes')
         else:
@@ -394,7 +534,7 @@ class Monitor:
         ref = [x[1] for x in self.gtimes if now - 150 <= x[0] < now - 30]
         if g and len(ref) >= 3 and now - self.pc_step_t > 30:
             j = (g[-1][1] - float(np.median(ref))) * 1000
-            raw['clock'] = (self._grade(abs(j), CLOCK_MS), '%+.0f ms against the last 2 min' % j)
+            raw['clock'] = (self._grade(abs(j), CLOCK_MS, 'clock'), '%+.0f ms against the last 2 min' % j)
             self._push('clock', now, j)
         elif now - self.pc_step_t <= 30:
             raw['clock'] = (NA, 'the PC clock was just set')
@@ -452,7 +592,7 @@ class Monitor:
             lv, text = raw.get(c.key, (NA, ''))
             if not self.armed:          # nothing is raised until the signal has proven itself (values still shown)
                 lv = NA
-            old = c.update(now, lv, text)
+            old = c.update(now, lv, text, at_once=(c.key == 'lock' and lock_now))
             if old is None:
                 continue
             if c.level > max(old, OK):
@@ -489,10 +629,23 @@ class Monitor:
                                         'listed' % today)
                 return
             name = '%s-%s' % (time.strftime('%Y%m%d-%H%M%S', time.localtime(now)), raised[0].key)
+            # the raw samples: a signal drop or lock loss may be a stream gap, whose sign (GGAP, GLOG or the
+            # re-acquired fingerprint) can arrive a few seconds after the trigger - wait for it before asking
+            # (gnss_rx keeps the 20 s before the request); other checks ask at once
             s = self.snap = {'name': name, 'folder': os.path.join(self.snap_dir, name), 't_trigger': now,
                              'lines': list(self.ring), 'raised': [], 'worst': {}, 't_clear': None, 'home': home,
-                             'at_trigger': self._state(), 'sats_at_trigger': self._sats(), 'bias_at_trigger': self.bias}
-            if self.on_open:
+                             'at_trigger': self._state(), 'sats_at_trigger': self._sats(), 'bias_at_trigger': self.bias,
+                             'gap': False, 'iq_due': now + (GAP_IQ_WAIT_S if raised[0].key in ('cn0', 'lock') else 0.0)}
+        if self.gap_t is not None and s['t_trigger'] - GAP_REACQ_S <= self.gap_t <= s['t_trigger'] + GAP_REACQ_S + 5:
+            s['gap'] = True
+        if s['iq_due'] is not None and now >= s['iq_due']:
+            s['iq_due'] = None
+            if s['gap'] and self.gap_iq_kept:
+                self.event(now, OK, 'Raw samples not requested: a stream gap (SDR/USB), not RF - one gap\'s samples '
+                                    'are already kept as evidence')
+            elif self.on_open:
+                if s['gap']:
+                    self.gap_iq_kept = True
                 self.on_open(os.path.join(s['folder'], 'samples'))
         for c in raised:
             s['raised'].append({'t': now, 'check': c.key, 'title': c.title, 'level': LEVEL_WORD[c.level],
@@ -518,7 +671,7 @@ class Monitor:
         s, self.snap = self.snap, None
         t_clear = s['t_clear'] or now
         lines = sorted(s['lines'])
-        summary = summarize(lines, s['t_trigger'], t_clear, s['home'])
+        summary = summarize(lines, s['t_trigger'], t_clear, s['home'], gap=s.get('gap', False))
         lv = max([w['rank'] for w in s['worst'].values()] or [WATCH])
         info = {
             'event': s['name'],
@@ -536,7 +689,8 @@ class Monitor:
             'lines': {'file': 'lines.txt', 'count': len(lines), 'from_unix': lines[0][0] if lines else None,
                       'to_unix': lines[-1][0] if lines else None,
                       'kinds': 'GCH satellite tracked, GPOS position fix, GNOISE band noise, GSPEC spectrum vs baseline, '
-                               'GTIME GPS minus PC clock (see gnss_rx.py)'},
+                               'GTIME GPS minus PC clock, GGAP sample-stream gap (ms, source), GLOG pocket_trk\'s own '
+                               'log (FOUND/LOST/FALSELOCK/EPOCH/RESTART/START) (see gnss_rx.py)'},
         }
         try:
             os.makedirs(s['folder'], exist_ok=True)
@@ -552,9 +706,19 @@ class Monitor:
         if self.on_saved:
             self.on_saved(s['folder'])
 
-    @staticmethod
-    def _grade(v, lim):
-        return ALERT if v >= lim[1] else WATCH if v >= lim[0] else OK
+    def _grade(self, v, lim, key=None):
+        """OK / WATCH / ALERT for a value against its (watch, alert) thresholds. With a check key: hysteresis - a
+        level is raised the moment its line is reached, but the level already shown is kept until the value is
+        below that line by a margin (HYST_DB, else HYST_FRAC of the line); Check.update then still waits CLEAR_S.
+        The shown value itself is the raw one"""
+        g = ALERT if v >= lim[1] else WATCH if v >= lim[0] else OK
+        if key is None:
+            return g
+        cur = self.by_key[key].level
+        if g >= cur or cur < WATCH:
+            return g
+        line = lim[cur - 1]
+        return cur if v >= line - HYST_DB.get(key, HYST_FRAC * line) else g
 
     def _push(self, key, t, v):
         q = self.series[key]
@@ -613,23 +777,26 @@ class Monitor:
         """(level, one line) for jamming / spoofing"""
         if not self.active:
             return NA, self.idle_note or 'not watching - start GNSS L1 (GPS) on the receiver'
+        tail = ('; ' + self.gap_note()) if group == 'jam' and self.gap_note() else ''
         if not self.armed:
-            return NA, self.arm_note or 'waiting for a good signal'
+            return NA, (self.arm_note or 'waiting for a good signal') + tail
         cs = [c for c in self.checks if c.group == group]
         lv = max(c.level for c in cs)
         hot = [c.title.lower() for c in cs if c.level == lv and lv >= WATCH]
         if lv >= WATCH:
-            return lv, ', '.join(hot)
+            if group == 'jam' and self.gap_recent(getattr(self, 'now', time.time())):
+                tail = ' - a stream gap (SDR/USB), not RF' + tail
+            return lv, ', '.join(hot) + tail
         judged = sum(1 for c in cs if c.level != NA)
         if not judged:
-            return NA, 'waiting for satellites'
-        return OK, 'no sign (%d of %d checks running)' % (judged, len(cs))
+            return NA, 'waiting for satellites' + tail
+        return OK, 'no sign (%d of %d checks running)%s' % (judged, len(cs), tail)
 
 
 # ---------------------------------------------------------------- what an event looked like
 def parse_lines(lines):
     """[(t, kind, line)] -> per kind lists of parsed values"""
-    out = {'noise': [], 'spec': [], 'ch': collections.defaultdict(list), 'pos': [], 'time': []}
+    out = {'noise': [], 'spec': [], 'ch': collections.defaultdict(list), 'pos': [], 'time': [], 'gaps': [], 'log': []}
     for t, kind, line in lines:
         f = line.split()
         try:
@@ -637,24 +804,73 @@ def parse_lines(lines):
                 out['noise'].append((t, float(f[3]), float(f[4]), float(f[5]), float(f[6])))  # rise clip peak MHz
             elif kind == 'GSPEC' and len(f) >= 5:
                 out['spec'].append((t, float(f[2]), float(f[3]), [int(v) / 10 for v in f[4].split(',')]))
-            elif kind == 'GCH' and len(f) >= 6:
-                out['ch'][f[2]].append((t, float(f[4]), float(f[5])))
+            elif kind == 'GCH' and len(f) >= 6:         # (t, cn0, doppler, lock seconds or None)
+                out['ch'][f[2]].append((t, float(f[4]), float(f[5]), float(f[6]) if len(f) >= 7 else None))
             elif kind == 'GPOS' and len(f) >= 6 and int(f[5]) >= 4:
                 out['pos'].append((t, float(f[2]), float(f[3]), float(f[4]), int(f[5])))
             elif kind == 'GTIME' and len(f) >= 5:
                 out['time'].append((t, float(f[2])))
+            elif kind == 'GGAP' and len(f) >= 3:        # (t, ms, source)
+                out['gaps'].append((t, float(f[2]), f[3] if len(f) > 3 else 'usb'))
+            elif kind == 'GLOG' and len(f) >= 3:        # (t, EVENT, sat or '', values)
+                ev = f[2].upper()
+                sat = f[3] if len(f) > 3 and ev in ('FOUND', 'LOST', 'FALSELOCK') else ''
+                out['log'].append((t, ev, sat, f[4:] if sat else f[3:]))
         except (ValueError, IndexError):
             pass
     return out
 
 
-def summarize(lines, t_trigger, t_clear, home):
+def _onset(p, t_trigger):
+    """(when it really began, how that was found). The checks look 5 s back and wait RAISE_S, so the trigger comes
+    seconds after the collapse - and with the onset taken as trigger - RAISE_S a satellite that fell 2 s earlier
+    showed as unaffected (G18 0.8 dB, G32 1.6 dB in the 03:56 event, though all nine fell to 8-29 dB-Hz). Looked
+    for in the 10 s before the trigger: the first second where the satellites' median C/N0 was more than 3 dB
+    below the previous minute's, pocket_trk's first LOST, or the moment a satellite vanished that came back with
+    a young lock"""
+    lo, hi = t_trigger - 10.0, t_trigger
+    cands = []
+    by_sec = collections.defaultdict(list)
+    for v in p['ch'].values():
+        for t, c, *_ in v:
+            by_sec[int(t)].append((t, c))
+    secs = sorted(by_sec)
+    for sec in secs:
+        if sec < lo - 1 or sec > hi:
+            continue
+        ref = [c for s2 in secs if sec - 60 <= s2 < sec for _, c in by_sec[s2]]
+        cur = [c for _, c in by_sec[sec]]
+        if len(ref) >= 10 and cur and float(np.median(ref)) - float(np.median(cur)) > 3.0:
+            cands.append((min(t for t, _ in by_sec[sec]), 0, 'median C/N0 fell'))
+            break
+    lost = [t for t, ev, _, _ in p['log'] if ev == 'LOST' and lo <= t <= hi]
+    if lost:
+        cands.append((min(lost), 1, 'pocket_trk LOST'))
+    for v in p['ch'].values():      # a lock age under GAP_RESET_S after one over GAP_OLD_S: it vanished at t_prev
+        prev = None
+        for t, c, _, lock in v:
+            if lock is not None and prev is not None and lock < GAP_RESET_S and prev[1] > GAP_OLD_S \
+                    and lo <= prev[0] <= hi and t <= hi + GAP_REACQ_S:
+                cands.append((prev[0], 2, 'lock age reset'))
+                break
+            if lock is not None:
+                prev = (t, lock)
+    if not cands:
+        return t_trigger - RAISE_S, 'trigger - %.0f s (no clearer sign in the data)' % RAISE_S
+    t, _, why = min(cands)
+    return min(max(t, lo), hi), why
+
+
+def summarize(lines, t_trigger, t_clear, home, gap=False):
     """the event in numbers and a best-guess description: when it began and ended, how the noise rose and fell,
-    what kind of signal (carrier, swept, broadband) and where, what it did to each satellite, the position, time"""
+    what kind of signal (carrier, swept, broadband) and where, what it did to each satellite, the position, time;
+    and whether it was a stream gap (SDR/USB) rather than radio (gap: the monitor already saw one live)"""
     p = parse_lines(lines)
-    onset = t_trigger - RAISE_S
+    onset, onset_from = _onset(p, t_trigger)
     s = {'local_time': time.strftime('%H:%M:%S', time.localtime(t_trigger)),
          'weekday': time.strftime('%A', time.localtime(t_trigger)),
+         'onset_unix': round(onset, 3), 'onset_local': time.strftime('%H:%M:%S', time.localtime(onset)),
+         'onset_from': onset_from,
          'duration_s': round(max(0.0, t_clear - onset), 1)}
     notes = []
     # -- noise: level, shape in time, kind of signal
@@ -730,9 +946,10 @@ def summarize(lines, t_trigger, t_clear, home):
     # -- satellites: C/N0 before and at the worst, who was lost
     sats = {}
     lost = []
+    long_locked, reacq = 0, []
     for sat, v in p['ch'].items():
-        pre = [c for t, c, _ in v if onset - 60 <= t < onset - 2]
-        win = [(t, c) for t, c, _ in v if onset - 2 <= t <= t_clear + 5]
+        pre = [c for t, c, *_ in v if onset - 60 <= t < onset - 2]
+        win = [(t, c) for t, c, *_ in v if onset - 2 <= t <= t_clear + 5]
         e = {'cn0_before': round(float(np.median(pre)), 1) if pre else None}
         if win:
             e['cn0_min'] = round(min(c for _, c in win), 1)
@@ -740,11 +957,20 @@ def summarize(lines, t_trigger, t_clear, home):
                 e['drop_db'] = round(e['cn0_before'] - e['cn0_min'], 1)
         if pre:     # tracked before: lost if it went quiet for 10 s or more during the event
             ts = [onset] + sorted(t for t, _ in win) + [t_clear]
-            gap = max(b - a for a, b in zip(ts, ts[1:]))
-            if gap >= 10:
+            quiet = max(b - a for a, b in zip(ts, ts[1:]))
+            if quiet >= 10:
                 lost.append(sat)
                 e['lost'] = True
-                e['longest_gap_s'] = round(gap, 1)
+                e['longest_gap_s'] = round(quiet, 1)
+            # the stream-gap fingerprint: a long lock before, a young one soon after
+            locks_pre = [lk for t, _, _, lk in v if t < onset + 0.5 and lk is not None and onset - 60 <= t]
+            if locks_pre and locks_pre[-1] > GAP_OLD_S:
+                long_locked += 1
+                young = [t for t, _, _, lk in v if onset + 0.5 <= t <= onset + GAP_REACQ_S + 5
+                         and lk is not None and lk < GAP_RESET_S]
+                if young:
+                    e['reacquired_after_s'] = round(young[0] - onset, 1)
+                    reacq.append(young[0] - onset)
         sats[sat] = e
     s['satellites'] = sats
     drops = [e['drop_db'] for e in sats.values() if 'drop_db' in e]
@@ -752,9 +978,37 @@ def summarize(lines, t_trigger, t_clear, home):
         s['median_cn0_drop_db'] = round(float(np.median(drops)), 1)
     if lost:
         s['satellites_lost'] = sorted(lost)
-    if not jam and drops and float(np.median(drops)) >= CN0_DROP_DB[0]:
+    # -- a stream gap (SDR/USB) rather than radio? gnss_rx's own report, pocket_trk's LOST burst, or the
+    #    re-acquired fingerprint (most long-locked satellites back young within GAP_REACQ_S)
+    gaps = [g for g in p['gaps'] if onset - GAP_RECENT_S <= g[0] <= t_trigger + 5]
+    s['gaps'] = [{'local': time.strftime('%H:%M:%S', time.localtime(t)), 'unix': round(t, 3), 'ms': ms,
+                  'source': src} for t, ms, src in p['gaps']]
+    s['restarts'] = [time.strftime('%H:%M:%S', time.localtime(t)) for t, ev, _, _ in p['log'] if ev == 'RESTART']
+    burst = {sat for t, ev, sat, vals in p['log'] if ev == 'LOST' and onset - 2 <= t <= onset + 5
+             and (not vals or float(vals[0]) < GAP_LOST_CN0)}
+    tracked = sum(1 for e in sats.values() if e['cn0_before'] is not None)
+    lost_burst = len(burst) >= 2 and len(burst) >= tracked / 2
+    reacquired = len(reacq) >= 2 and len(reacq) >= long_locked / 2
+    # (the fingerprint alone does not outweigh a noise rise or peak at the same time - a short jammer burst drops
+    # and re-acquires too; a measured GGAP does)
+    if gaps or ((lost_burst or reacquired or gap) and not jam):
+        s['kind'] = 'stream_gap'
+        back = ('%d of %d satellites re-acquired within %.0f s' % (len(reacq), long_locked, max(reacq))
+                if reacq else '%d satellites reported lost within a second' % len(burst) if burst else
+                'the satellites dropped together')
+        if gaps:
+            ms = max(g[1] for g in gaps)
+            notes.append('The SDR lost %s of samples (%s), %s - not an RF event' % (_ms(ms), gaps[0][2], back))
+        else:
+            notes.append('The sample stream broke (SDR/USB): %s at their previous strength - not an RF event' % back)
+    elif jam:
+        s['kind'] = 'interference'
+    elif drops and float(np.median(drops)) >= CN0_DROP_DB[0]:
+        s['kind'] = 'signal_drop'
         notes.append('Signals weakened %.0f dB without more noise - the antenna blocked or disconnected (or a '
                      'spoofer taking over)' % float(np.median(drops)))
+    else:
+        s['kind'] = 'other'
     # -- position and time
     if home and p['pos']:
         d = [(t, distance_m(home[0], home[1], la, lo)) for t, la, lo, _, _ in p['pos']]
@@ -939,6 +1193,7 @@ class SnapshotDialog(QtWidgets.QDialog):
         s = info.get('summary', {})
         t0 = lines[0][0] if lines else info['trigger_unix'] - PRE_S
         t1 = lines[-1][0] if lines else info['closed_unix']
+        mark = s.get('onset_unix') or info['trigger_unix'] - RAISE_S      # (older snapshots have no onset)
 
         text = QtWidgets.QTextBrowser()
         html = ['<h3>%s</h3>' % info.get('trigger_local', ''),
@@ -948,17 +1203,26 @@ class SnapshotDialog(QtWidgets.QDialog):
                     _fmt(s.get('duration_s', '?')), info.get('closed_because', ''))]
         for n in s.get('notes', []):
             html.append('<p>• %s</p>' % n)
+        if s.get('onset_local'):
+            html.append('<p>Began %s (%s)%s</p>' % (s['onset_local'], s.get('onset_from', ''),
+                                                    ' · kind: %s' % s['kind'].replace('_', ' ') if s.get('kind') else ''))
         for key, title in (('noise', 'Noise'), ('spectrum', 'Spectrum (max over the event)'), ('position', 'Position'),
                            ('gps_minus_pc_s', 'GPS time minus PC clock (s)')):
             if s.get(key):
                 html.append('<p><b>%s</b>: %s</p>' % (title, '; '.join('%s %s' % (k.replace('_', ' '), _fmt(v))
                                                                        for k, v in s[key].items())))
+        if s.get('gaps'):
+            html.append('<p><b>Stream gaps</b> (the SDR\'s samples went missing; GGAP lines in this window): %s</p>'
+                        % ', '.join('%s %s ms (%s)' % (g['local'], _fmt(g['ms']), g['source']) for g in s['gaps']))
+        if s.get('restarts'):
+            html.append('<p><b>Receiver restarts</b> (pocket_trk): %s</p>' % ', '.join(s['restarts']))
         if s.get('satellites'):
-            rows = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
+            rows = ''.join('<tr><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>' % (
                 catalog.gnss_name(k), _fmt(v.get('cn0_before', '-')), _fmt(v.get('cn0_min', '-')),
-                _fmt(v.get('drop_db', '-')), 'lost' if v.get('lost') else '') for k, v in sorted(s['satellites'].items()))
+                _fmt(v.get('drop_db', '-')), '%s s' % _fmt(v['reacquired_after_s']) if 'reacquired_after_s' in v else '',
+                'lost' if v.get('lost') else '') for k, v in sorted(s['satellites'].items()))
             html.append('<p><b>Satellites</b> (C/N0 dB-Hz)</p><table cellspacing=6><tr><th align=left>Satellite</th>'
-                        '<th>before</th><th>lowest</th><th>drop</th><th></th></tr>%s</table>' % rows)
+                        '<th>before</th><th>lowest</th><th>drop</th><th>back after</th><th></th></tr>%s</table>' % rows)
         iq = os.path.join(folder, 'samples.cs8')
         html.append('<p><b>Raw samples</b>: %s</p>' % (
             'samples.cs8 (%.0f MB, 20 s before to 20 s after; see samples.json) - open in SDR++ or inspectrum'
@@ -969,7 +1233,7 @@ class SnapshotDialog(QtWidgets.QDialog):
 
         wf = QtWidgets.QLabel()
         wf.setAlignment(Qt.AlignCenter)
-        img = waterfall_image(p['spec'], info['trigger_unix'] - RAISE_S)
+        img = waterfall_image(p['spec'], mark)
         if img is not None:
             wf.setPixmap(QtGui.QPixmap.fromImage(img.scaled(512, min(max(img.height(), 200), 600))))
             if p['spec']:
@@ -994,7 +1258,7 @@ class SnapshotDialog(QtWidgets.QDialog):
                   'cn0': [], 'nsat': []}
         by_t = collections.defaultdict(list)
         for sat, v in p['ch'].items():
-            for t, c, _ in v:
+            for t, c, *_ in v:
                 by_t[int(t)].append(c)
         for t in sorted(by_t):
             series['cn0'].append((t, float(np.median(by_t[t]))))
@@ -1002,7 +1266,6 @@ class SnapshotDialog(QtWidgets.QDialog):
         home = info.get('home')
         if home:
             series['pos'] = [(t, distance_m(home['lat'], home['lon'], la, lo)) for t, la, lo, _, _ in p['pos']]
-        mark = info['trigger_unix'] - RAISE_S
         charts = [StripChart('Noise above the quiet baseline', 'dB', [('rise', '#4c9aff', 'band power'),
                                                                       ('peak', '#c792ea', 'narrowband peak')],
                              NOISE_RISE_DB, 2.0, window=(t0, t1), marker=mark),
@@ -1174,7 +1437,7 @@ class IntegrityView(QtWidgets.QWidget):
 
     # ---- the receiver
     def on_line(self, kind, line):
-        if kind in ('GCH', 'GPOS', 'GNOISE', 'GTIME', 'GSPEC'):
+        if kind in ('GCH', 'GPOS', 'GNOISE', 'GTIME', 'GSPEC', 'GGAP', 'GLOG'):
             self.mon.line(kind, line)
 
     def on_running(self, on, system=None, auto_gain=False, meta=None):
@@ -1213,7 +1476,8 @@ class IntegrityView(QtWidgets.QWidget):
                     f = line.split()
                     lines.append((float(f[1]), 'GSPEC', line.strip()))
             info = json.load(open(os.path.join(folder, 'event.json')))
-            img = waterfall_image(parse_lines(lines)['spec'], info['trigger_unix'] - RAISE_S)
+            img = waterfall_image(parse_lines(lines)['spec'],
+                                  info.get('summary', {}).get('onset_unix') or info['trigger_unix'] - RAISE_S)
             if img is not None:
                 img.save(os.path.join(folder, 'waterfall.png'))
         except Exception as e:

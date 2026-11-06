@@ -264,7 +264,7 @@ class Console(QtCore.QObject):
 
     def frame(self, line, quiet=False):
         kind = line.split(':', 1)[0]
-        if kind in ('GCH', 'GEPH', 'GPOS'):
+        if kind in ('GCH', 'GEPH', 'GPOS', 'GGAP', 'GLOG'):
             return self._gnss(kind, line.split()[1:], quiet)
         if kind in ('OEP', 'OSY', 'OPK', 'OBAD'):
             return self._orbcomm(kind, line.split()[1:], quiet)
@@ -464,6 +464,18 @@ class Console(QtCore.QObject):
                 print('%s[%s]  POSITION %sfix from %d satellites: %+.5f, %+.5f, %.0f m%s%s' % (
                     CYAN, when, BOLD, n, lat, lon, h, home, RESET))
                 self.beep('ira')
+        elif kind == 'GGAP' and len(f) >= 3:     # samples lost upstream, filled with zeros so the locks survive
+            self.kinds['stream gap'] += 1
+            if not quiet:
+                print('%s[%s]  GAP      %s ms of samples lost (%s) - filled with zeros%s' % (
+                    YELLOW, when, f[1], 'the SDR / USB path' if f[2] == 'usb' else f[2], RESET))
+        elif kind == 'GLOG' and len(f) >= 2:     # pocket_trk's own events; only the ones worth a line here
+            if f[1] == 'RESTART':
+                self.kinds['restart'] += 1
+                if not quiet:
+                    print('%s[%s]  RESTART  pocket_trk restarted (%s)%s' % (YELLOW, when, ' '.join(f[2:]), RESET))
+            elif f[1] == 'START' and not quiet and f[2:] != ['1']:
+                print('%s[%s]  START    pocket_trk run %s%s' % (GREY, when, ' '.join(f[2:]), RESET))
 
     def _gnss_lost(self):
         if not self.gnss_last or self.last_t is None:

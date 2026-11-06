@@ -352,8 +352,11 @@ class Solver:
             return None
         out = None
         if self.pending and abs(t - self.pending[0][0]) > 1e-3:
-            out = self.solve(self.pending[0][0], [p[1] for p in self.pending])
+            # the finished epoch leaves the queue before it is solved: if solve() raises (a diverged solution can
+            # reach math.sin(inf)), the next observation starts a fresh epoch instead of re-solving the same one for ever
+            epoch, obs_list = self.pending[0][0], [p[1] for p in self.pending]
             self.pending = []
+            out = self.solve(epoch, obs_list)
         self.t_epoch = (t, float(f[1]))
         if o['sat'][0] in self.systems and o['P'] > 1e7:
             self.pending.append((t, o))
@@ -490,6 +493,9 @@ class Solver:
             except np.linalg.LinAlgError:
                 return None
             dx = N @ H.T @ W @ v
+            if not np.all(np.isfinite(dx)) or np.linalg.norm(dx[:3]) > 1e7:
+                self.x = np.array([-1.3e6, -4.9e6, 4.0e6])     # diverged: start the next epoch from scratch
+                return None
             x = x + dx[:3]
             clk = clk + dx[3:]
             if np.linalg.norm(dx[:3]) < 1e-3 and it > 2:

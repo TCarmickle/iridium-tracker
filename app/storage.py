@@ -22,7 +22,7 @@ import paths
 import systems
 
 DEFAULTS = {'keep_raw_days': 7, 'max_raw_mb': 1024, 'max_tiles_mb': 200, 'min_free_gb': 1.0}
-RAW_EXT = ('.bits', '.parsed', '.live', '.log')
+RAW_EXT = ('.bits', '.parsed', '.live', '.log', '.rtcm')    # (.trkN.log / .trkN.rtcm: pocket_trk's own record of a GNSS run)
 REDUCED = '.frames.gz'
 KEEP_KINDS = systems.keep_kinds()     # every system's position / pass frames
 HEADER = '#iridium-tracker-frames '

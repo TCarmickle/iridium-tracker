@@ -43,6 +43,16 @@ Lines (from its log):
   GSPEC: t f_lo_mhz f_hi_mhz v1,v2,...     with each GNOISE (once learned): the spectrum against the baseline
                                            in 128 bins from f_lo to f_hi, tenths of a dB (each bin the max of
                                            its group)
+  GGAP: t gap_ms source                    samples went missing upstream (source usb: the SDR / USB path stalled;
+                                           queue: pocket_trk fell behind) - that many zero samples were fed in
+                                           their place so pocket_trk's sample clock stays on GPS time. Measured
+                                           2026-11-06: the USB path loses 100-140 ms a few times a day; left as a
+                                           cut, every satellite is lost and a loss over ~90 ms stops pocket_trk's
+                                           positioning for good (every range 'out of range'); as zeros, nothing is lost
+  GLOG: t EVENT [sat] [values]             pocket_trk's own events: FOUND sat cn0 dop, LOST sat cn0 pli, FALSELOCK
+                                           sat, EPOCH dt_s (its clock stepped), SYNC COARSE|FINE, START run,
+                                           RESTART reason (this receiver restarted it: clock-lost after a gap that
+                                           got past the zero filling, no-fix, reader-died)
 With --snap-trigger, the last 20 s of raw samples are kept in memory and saved, with the next 20 s, when the
 tracker asks (IQRecorder: an Integrity event began).
 """
@@ -54,6 +64,8 @@ import json
 import math
 import os
 import queue
+import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -114,6 +126,8 @@ ap.add_argument('--no-spp', action='store_true')    # no GSPP lines (our own WAA
 ap.add_argument('--home', default='')               # lat,lon,alt_km: which satellites are up (warm start)
 ap.add_argument('--narrow-search', action='store_true')     # search only the satellites up (from saved orbits)
 ap.add_argument('--pocket-opts', default='')        # pocket_trk options file (-opt), e.g. its lock thresholds
+ap.add_argument('--work-stem', default='')          # pocket_trk's log and RTCM as STEM.trkN.log / .rtcm (receiver.py:
+#                                                     beside the capture, so they are kept and trimmed with it)
 ap.add_argument('--constellation', choices=('gps', 'glonass', 'beidou'), default='gps')   # gps = GPS + Galileo + WAAS
 opts = ap.parse_args()
 if opts.constellation == 'glonass':     # every frequency channel (the SDR's slice holds the middle ones);
@@ -127,9 +141,35 @@ def log(text):
     print(text, file=sys.stderr, flush=True)
 
 
+_emit_lock = threading.Lock()
+
+
 def emit(line):
-    sys.stdout.write(line + '\n')
-    sys.stdout.flush()
+    with _emit_lock:        # the live tracker's reader and the sample thread both write lines
+        sys.stdout.write(line + '\n')
+        sys.stdout.flush()
+
+
+_NUM = re.compile(r'-?\d+\.?\d*(?:[eE][-+]?\d+)?')
+_RECORD = re.compile(r'(?<!^)(?=\$(?:CH|OBS|NAV|EPH|POS|TIME|SAT|LOG),)')    # pocket_trk writes from several threads:
+# about 1 % of its lines are two records with the newline missing between them - split, so neither is lost
+
+
+def _log_sat(sig, prn):
+    """the satellite a pocket_trk $LOG line is about (its signal name and PRN) -> G05 / E11 / S31 / R-3 / C23"""
+    if sig.startswith('L1') or sig.startswith('L2') or sig.startswith('L5'):    # GPS, with WAAS and QZSS PRNs
+        if 120 <= prn <= 158:
+            return 'S%02d' % (prn - 100)
+        if prn > 192:
+            return 'J%02d' % (prn - 192)
+        return 'G%02d' % prn
+    if sig.startswith('E'):
+        return 'E%02d' % prn
+    if sig.startswith('G1') or sig.startswith('G2'):        # GLONASS: by frequency channel until its slot is known
+        return 'R%+d' % prn
+    if sig.startswith('B'):
+        return 'C%02d' % prn
+    return '%s%d' % (sig[:1], prn)
 
 
 def _try(what, fn, *a):
@@ -622,6 +662,9 @@ class Lines:
         self.bds = BeidouNames() if opts.constellation == 'beidou' else None
         self.offsets = collections.deque(maxlen=10)
         self.last_gtime = 0.0
+        self.last_epoch = {}    # satellite -> the receiver second of its last GCH line
+        self.errors = {}        # exception text -> when it was last logged (a bad line must not kill the reader)
+        self.reset_run()
         # our own position solution (spp.py: WAAS corrections + carrier smoothing) from pocket_trk's raw measurements,
         # GPS L1 band only; GPS's ionosphere model is kept between sessions (it takes up to 12.5 min to arrive)
         self.spp = None
@@ -640,6 +683,63 @@ class Lines:
                     n += 1
             log('GNSS position solver: warm start with %d saved orbits%s' % (
                 n, ' and the ionosphere model' if self.spp.ion else ''))
+
+    def reset_run(self):
+        """a new pocket_trk run: its receiver time starts again, and so does the watchdog's memory of it"""
+        self.oor = collections.deque()      # receiver times of 'PSEUDORANGE OUT OF RANGE' for GPS / Galileo
+        self.clock_lost = None              # set to a reason when pocket_trk must be restarted
+        self.rt_now = 0.0                   # the latest receiver time seen
+        self.last_pos_rt = None             # receiver time of its last position fix
+        self.fsync = {}                     # satellite -> receiver time it last had frame sync
+
+    def watchdog(self):
+        """why pocket_trk should be restarted now, or None.
+        After a sample loss of ~90 ms or more that got past the zero filling (or happened before it existed),
+        pocket_trk's clock is that much early: every GPS range falls below its accepted window and it logs
+        'PSEUDORANGE OUT OF RANGE' every epoch for ever - it only re-aligns its clock when it has a fix, and it can't
+        get one (seen 2026-11-03 and 2026-11-06: 6 and 8 hours of locked satellites without a position). A restart
+        costs under a minute; our own solver keeps its orbits and state."""
+        if self.clock_lost:
+            return self.clock_lost
+        # no fix for a long time although plenty of satellites have their frames: its clock is lost some other way
+        synced = sum(1 for s, rt in self.fsync.items() if s[0] == 'G' and self.rt_now - rt < 5)
+        if self.last_pos_rt is not None and synced >= 5 and self.rt_now - self.last_pos_rt > 300:
+            return 'no-fix'
+        return None
+
+    def _event(self, f, when):
+        """pocket_trk's own log events ($LOG,rt,sig,prn,text) -> GLOG lines, and the clock-lost watchdog"""
+        # two layouts: '$LOG,rt,sig,prn,TEXT' (SIGNAL FOUND / LOST, FALSE LOCK) and '$LOG,rt,sat,sig,prn,TEXT'
+        # (PSEUDORANGE OUT OF RANGE and the other navigation messages); receiver-wide ones have no satellite at all
+        rt = float(f[1])
+        if re.match(r'^[GERCJS][-+]?\d+$', f[2].strip()):
+            sat, text = f[2].strip(), ','.join(f[5:]).strip()
+        else:
+            sig = f[2].strip()
+            try:
+                prn = int(f[3])
+            except ValueError:
+                prn = 0
+            sat = _log_sat(sig, prn) if sig and prn else ''
+            text = ','.join(f[4 if prn or sig else 2:]).strip()
+        t = when(rt)
+        nums = _NUM.findall(text.split('(', 1)[1]) if '(' in text else []
+        if text.startswith('SIGNAL FOUND'):
+            emit('GLOG: %.3f FOUND %s %s' % (t, sat, ' '.join(nums[:2])))
+        elif text.startswith('SIGNAL LOST'):
+            emit('GLOG: %.3f LOST %s %s' % (t, sat, ' '.join(nums[:2])))
+        elif text.startswith('FALSE LOCK'):
+            emit('GLOG: %.3f FALSELOCK %s' % (t, sat))
+        elif text.startswith('PVT EPOCH ADJUSTED'):
+            emit('GLOG: %.3f EPOCH %s' % (t, nums[0] if nums else '?'))
+        elif text.startswith('RECEIVER SYNC'):
+            emit('GLOG: %.3f SYNC %s' % (t, text.split()[-1]))
+        elif text.startswith('PSEUDORANGE OUT OF RANGE') and sat[:1] in 'GE':
+            self.oor.append(rt)
+            while self.oor and self.oor[0] < rt - 10:
+                self.oor.popleft()
+            if len(self.oor) >= 20 and not self.clock_lost:    # most satellites, every epoch, for 10 s: it is stuck
+                self.clock_lost = 'clock-lost'
 
     def orbits(self, ephs, t):
         for sat, sig, fields in ephs:      # in the field order of a $EPH line, so gnss.parse_eph reads it
@@ -696,56 +796,84 @@ class Lines:
                     s['iono'].get('sbas', 0), s['fast'], s['lt'], s['smoothed']))
 
     def line(self, line, when):
-        """one log line; when(receiver time) -> unix time"""
+        """one log line; when(receiver time) -> unix time. Nothing a line can contain may stop the reader: a dead
+        reader would leave pocket_trk running and the tracker saying 'Receiving' with no output at all."""
+        try:
+            self._line(line, when)
+        except Exception as e:      # (ValueError and IndexError are the usual ones: a cut or odd line)
+            key = '%s: %s' % (type(e).__name__, e)
+            if time.time() - self.errors.get(key, 0) > 60:
+                self.errors[key] = time.time()
+                log('GNSS: a pocket_trk line was not understood (%s): %s' % (key, line.strip()[:120]))
+
+    def _line(self, line, when):
         f = line.strip().split(',')
         if not f or not f[0].startswith('$'):
             return
+        if len(f) > 1:
+            try:
+                self.rt_now = max(self.rt_now, float(f[1]))
+            except ValueError:
+                pass
         if self.spp and f[0] in ('$NAV', '$OBS', '$EPH'):
-            self._spp(f, line)
-        try:
-            if f[0] == '$CH' and len(f) > 10:
-                rt, sat, sig, lock, cn0, fd = float(f[1]), f[4], f[5], float(f[7]), float(f[8]), float(f[10])
-                if sat.startswith('R'):         # GLONASS: by its slot number, once that has been decoded
-                    if sat[1:].isdigit():
-                        self.glo_slot[f[6]] = sat
-                    elif f[6] in self.glo_slot:
-                        sat = self.glo_slot[f[6]]
-                    else:
-                        return
-                chan = sat
-                if self.bds and sat.startswith('C'):    # BeiDou: by the satellite its orbit says it is
-                    sat = self.bds.alias.get(chan, chan)
-                if lock < 1.0 or rt - self.last_ch.get(sat, -9) < 1.0:
+            try:
+                self._spp(f, line)
+            except Exception as e:      # our solver must never stop the tracking
+                key = 'solver %s: %s' % (type(e).__name__, e)
+                if time.time() - self.errors.get(key, 0) > 60:
+                    self.errors[key] = time.time()
+                    log('GNSS position solver: %r on %s' % (e, line.strip()[:80]))
+        if f[0] == '$CH' and len(f) > 10:
+            rt, sat, sig, lock, cn0, fd = float(f[1]), f[4], f[5], float(f[7]), float(f[8]), float(f[10])
+            if sat.startswith('R'):         # GLONASS: by its slot number, once that has been decoded
+                if sat[1:].isdigit():
+                    self.glo_slot[f[6]] = sat
+                elif f[6] in self.glo_slot:
+                    sat = self.glo_slot[f[6]]
+                else:
                     return
-                self.last_ch[sat] = rt
-                self.seen.add(sat)
-                extra = ''
-                if len(f) > 25:     # sync flags and counters ($CH fields 12-15 and 23-25)
-                    sync = ''.join(c if f[12 + k].strip() not in ('', '0') else '-' for k, c in enumerate('SBFR'))
-                    extra = ' %s %d %d %d' % (sync, int(f[23]), int(f[24]), int(f[25]))
-                text = 'GCH: %.3f %s %s %.1f %.1f %.1f%s' % (when(rt), sat, sig, cn0, fd, lock, extra)
-                if not (self.bds and chan.startswith('C') and self.bds.hold(chan, text)):
-                    emit(text)
-            elif f[0] == '$NAV' and len(f) > 7 and f[2].startswith('S'):
-                self.sbas(f, when)
-            elif f[0] == '$EPH' and len(f) > 4:
-                sat, fields = f[2], ','.join(f[3:])
-                if self.eph.get(sat) != fields:
-                    self.eph[sat] = fields
-                    emit('GEPH: %.3f %s %s' % (when(float(f[1])), sat, fields))
-            elif f[0] == '$POS' and len(f) > 11:
-                t = gpst_to_unix([float(v) for v in f[2:8]])
-                emit('GPOS: %.3f %s %s %s %s' % (t, f[8], f[9], f[10], f[12]))
-                self.fixes += 1
-                if self.clock and int(f[12]) >= 4:
-                    self.offsets.append(t - when(float(f[1])))
-                    if len(self.offsets) >= 5 and time.time() - self.last_gtime >= 10:
-                        self.last_gtime = time.time()
-                        o = np.array(self.offsets)
-                        emit('GTIME: %.3f %.4f %s %.4f' % (time.time(), float(np.median(o)), f[12],
-                                                          float(o.max() - o.min())))
-        except ValueError:
-            pass
+            chan = sat
+            if self.bds and sat.startswith('C'):    # BeiDou: by the satellite its orbit says it is
+                sat = self.bds.alias.get(chan, chan)
+            # one line a second per satellite - by the receiver second, not 'rt - last < 1.0' on floats, which
+            # skipped a whole second for every satellite about twice an hour
+            epoch = int(math.floor(rt))
+            if lock < 1.0 or self.last_epoch.get(sat) == epoch:
+                return
+            self.last_epoch[sat] = epoch
+            self.last_ch[sat] = rt
+            self.seen.add(sat)
+            extra = ''
+            if len(f) > 25:     # sync flags and counters ($CH fields 12-15 and 23-25)
+                sync = ''.join(c if f[12 + k].strip() not in ('', '0') else '-' for k, c in enumerate('SBFR'))
+                extra = ' %s %d %d %d' % (sync, int(f[23]), int(f[24]), int(f[25]))
+                if 'F' in sync:
+                    self.fsync[sat] = rt
+            text = 'GCH: %.3f %s %s %.1f %.1f %.1f%s' % (when(rt), sat, sig, cn0, fd, lock, extra)
+            if not (self.bds and chan.startswith('C') and self.bds.hold(chan, text)):
+                emit(text)
+        elif f[0] == '$NAV' and len(f) > 7 and f[2].startswith('S'):
+            self.sbas(f, when)
+        elif f[0] == '$EPH' and len(f) > 4:
+            sat, fields = f[2], ','.join(f[3:])
+            if self.eph.get(sat) != fields:
+                self.eph[sat] = fields
+                emit('GEPH: %.3f %s %s' % (when(float(f[1])), sat, fields))
+        elif f[0] == '$POS' and len(f) > 12:
+            rt = float(f[1])
+            t = gpst_to_unix([float(v) for v in f[2:8]])
+            emit('GPOS: %.3f %s %s %s %s' % (t, f[8], f[9], f[10], f[12]))
+            self.fixes += 1
+            self.last_pos_rt = rt
+            if self.clock and int(f[12]) >= 4:
+                self.offsets.append(t - when(rt))
+                if len(self.offsets) >= 5 and time.time() - self.last_gtime >= 10:
+                    self.last_gtime = time.time()
+                    o = np.array(self.offsets)
+                    emit('GTIME: %.3f %.4f %s %.4f' % (time.time(), float(np.median(o)), f[12],
+                                                      float(o.max() - o.min())))
+        elif f[0] == '$LOG' and len(f) > 4:
+            self._event(f, when)
 
 
 def _bits(hexstr, n):
@@ -826,9 +954,26 @@ class Pipe:
         if self.h == wintypes.HANDLE(-1).value:
             raise OSError('CreateNamedPipe failed (%d)' % ctypes.get_last_error())
 
-    def connect(self):
-        """wait for pocket_trk to open it"""
-        return bool(self.k32.ConnectNamedPipe(self.h, None)) or ctypes.get_last_error() == 535   # already connected
+    def connect(self, proc, timeout=15.0):
+        """wait for pocket_trk to open it - but not for ever: a pocket_trk that never opens the pipe (it refused an
+        option, it crashed at start) used to hang the receiver here with nothing logged"""
+        done = []
+
+        def wait():
+            done.append(bool(self.k32.ConnectNamedPipe(self.h, None)) or ctypes.get_last_error() == 535)  # 535: connected already
+
+        th = threading.Thread(target=wait, daemon=True)
+        th.start()
+        t_end = time.time() + timeout
+        while th.is_alive() and time.time() < t_end and proc.poll() is None:
+            th.join(0.25)
+        if th.is_alive():       # still waiting: cancel the call, or CloseHandle would wait for it too
+            h = self.k32.OpenThread(0x0001, False, th.native_id)        # THREAD_TERMINATE is what CancelSynchronousIo needs
+            if h:
+                self.k32.CancelSynchronousIo(h)
+                self.k32.CloseHandle(h)
+            th.join(2.0)
+        return bool(done and done[0])
 
     def write(self, data):
         n = self.wt.DWORD()
@@ -876,14 +1021,22 @@ class LiveTracker(threading.Thread):
     """runs pocket_trk on the pipe for the whole session (restarting it if it stops), feeds it, and reads its
     log and decoded orbits as they grow"""
     QUEUE_S = 4.0       # samples waiting for pocket_trk; beyond this they are dropped (it is falling behind)
+    BLOCK = 4096        # GNU Radio hands the feeder blocks of this size (2 ms); the queue is sized in samples
+    # A stall in the SDR / USB path loses samples before they ever reach this program (measured 2026-11-06: 96-143 ms
+    # a few times a day, never a buffer's worth, no overflow message anywhere). Every block after it arrives that much
+    # 'late' against the stream's start time. Jitter of the arrival times is 1-5 ms, so a steady excess of 20 ms is a
+    # gap; a burst of blocks after a scheduling stall is told apart because its excess shrinks by 2 ms per block.
+    GAP_MIN_S = 0.020
+    GAP_BLOCKS = 30         # 60 ms of samples with a steady excess before it counts
 
     def __init__(self, rate):
         super().__init__(daemon=True)
         self.rate = rate
-        self.q = queue.Queue(maxsize=int(self.QUEUE_S * 20))     # ~50 ms blocks
+        self.q = queue.Queue(maxsize=max(100, int(self.QUEUE_S * rate / self.BLOCK)))
         self.out = Lines()
-        self.folder = tempfile.mkdtemp(prefix='gnss_live_')
-        self.dropped = 0            # samples dropped because pocket_trk fell behind
+        self.folder = None if opts.work_stem else tempfile.mkdtemp(prefix='gnss_live_')
+        self.dropped = 0            # samples dropped because pocket_trk fell behind (filled with zeros too)
+        self.gaps = []              # (PC time, seconds, source) of every gap filled
         self.runs = 0
         self.out.clock = True
         # The PC time of the stream's first sample: each block arrives a little after its last sample was taken
@@ -891,16 +1044,44 @@ class LiveTracker(threading.Thread):
         # best estimate (sliding, so the SDR's crystal error can't build up)
         self.received = 0
         self.t0_cands = collections.deque()
+        self.base_min = None        # that minimum over the candidates 1-10 s old (updated once a second)
+        self.base_t = 0.0
+        self.pend = collections.deque(maxlen=self.GAP_BLOCKS)     # recent blocks' start-time estimates, all 'late'
 
     def feed(self, data, n):
         now = time.time()
+        c = now - (self.received + n) / self.rate
+        if now - self.base_t >= 1.0:
+            old = [v for t, v in self.t0_cands if t < now - 1.0]
+            if len(old) >= 100:
+                self.base_min = min(old)
+            self.base_t = now
+        if self.base_min is not None and c - self.base_min > self.GAP_MIN_S:
+            self.pend.append(c)
+            if len(self.pend) == self.GAP_BLOCKS and max(self.pend) - min(self.pend) < 0.010:
+                gap = min(self.pend) - self.base_min
+                n_gap = int(round(gap * self.rate))
+                # the lost samples take their place as zeros: the pipe writer puts them in before this block
+                try:
+                    self.q.put_nowait((None, n_gap, self.received, 'usb'))
+                except queue.Full:          # pocket_trk is behind as well: the block itself is dropped below and the
+                    self.pend.clear()       # queue drop handles the count; try again with the next blocks
+                else:
+                    self.received += n_gap
+                    self.gaps.append((now, gap, 'usb'))
+                    c = now - (self.received + n) / self.rate
+                    self.t0_cands.clear()
+                    self.base_min = c
+                    self.pend.clear()
+        else:
+            self.pend.clear()
         k = self.received
         self.received += n
-        self.t0_cands.append((now, now - self.received / self.rate))
+        self.t0_cands.append((now, c))
         while self.t0_cands[0][0] < now - 10:
             self.t0_cands.popleft()
         try:
-            self.q.put_nowait((data, n, k))
+            self.q.put_nowait((data, n, k, None))
         except queue.Full:
             self.dropped += n
 
@@ -918,8 +1099,13 @@ class LiveTracker(threading.Thread):
     def session(self):
         self.runs += 1
         pipe = Pipe('gnss_rx_%d_%d' % (os.getpid(), self.runs))
-        logf = os.path.join(self.folder, 'trk-%d.log' % self.runs)
-        rtcmf = os.path.join(self.folder, 'trk-%d.rtcm' % self.runs)
+        if self.folder:
+            logf = os.path.join(self.folder, 'trk-%d.log' % self.runs)
+            rtcmf = os.path.join(self.folder, 'trk-%d.rtcm' % self.runs)
+        else:       # beside the capture: the raw measurements ($OBS), navigation bits and RTCM observables are the
+            # only complete record of a session - kept and trimmed like the capture's other raw files
+            logf = '%s.trk%d.log' % (opts.work_stem, self.runs)
+            rtcmf = '%s.trk%d.rtcm' % (opts.work_stem, self.runs)
         signals = live_signals()
         # a narrowed search list covers SEARCH_HOURS: before it runs out, pocket_trk is restarted with a fresh one
         # (the satellites are picked up again within a minute; our solver keeps its state)
@@ -928,15 +1114,25 @@ class LiveTracker(threading.Thread):
                                         '-log', logf, '-rtcm', rtcmf, pipe.path] + POCKET_OPTS
         proc = subprocess.Popen(cmd, cwd=os.path.dirname(POCKET_TRK), stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL, creationflags=0x08000000)
-        if not pipe.connect():
+        if self.runs == 1:      # (what this session ran with: option changes can then be judged capture by capture)
+            log('GNSS: pocket_trk command: ' + ' '.join(cmd[1:]))
+            if POCKET_OPTS:
+                try:
+                    text = ' | '.join(l.split('#')[0].strip() for l in open(POCKET_OPTS[1]) if l.split('#')[0].strip())
+                    log('GNSS: pocket_trk options: ' + (text or '(none)'))
+                except OSError:
+                    pass
+        if not pipe.connect(proc):
             pipe.close()
-            proc.kill()
-            raise OSError('pocket_trk did not open the pipe')
+            if proc.poll() is None:
+                proc.kill()
+            raise OSError('pocket_trk did not open the pipe (exit code %s)' % proc.poll())
+        self.out.reset_run()
         while not self.q.empty():   # start from fresh samples
             self.q.get_nowait()
-        written = 0                 # samples given to pocket_trk
-        # (receiver time, the stream's sample number there): pocket_trk's clock counts only the samples it was
-        # given, so it skips over dropped ones; a new anchor at each jump
+        written = 0                 # samples given to pocket_trk (zeros for gaps included)
+        # (receiver time, the stream's sample number there): pocket_trk's clock counts the samples it was given,
+        # which now include zeros for every lost one, so the stream time stays continuous; an anchor at the start
         anchors = []
 
         def when(rt):
@@ -946,19 +1142,45 @@ class LiveTracker(threading.Thread):
             return self.t_stream0() + k / self.rate + (rt - art)
 
         log('GNSS: live tracking started (pocket_trk run %d)' % self.runs)
+        emit('GLOG: %.3f START %d' % (time.time(), self.runs))
         reader = threading.Thread(target=self.read, args=(proc, logf, rtcmf, when), daemon=True)
         next_k = None
         started_reader = False
+        why = ''
         while proc.poll() is None:
             if renew_at and time.time() > renew_at and live_signals() != signals:
                 log('GNSS: renewing the satellite search list')
                 break
+            reason = self.out.watchdog()
+            if reason:
+                why = reason
+                break
+            if started_reader and not reader.is_alive():
+                why = 'reader-died'
+                break
             try:
-                data, n, k = self.q.get(timeout=1.0)
+                data, n, k, source = self.q.get(timeout=1.0)
             except queue.Empty:
                 continue
-            if k != next_k:                 # the first block, or samples were dropped before this one
+            if data is None:                # a gap found by feed(): zeros in its place
+                if not self._zeros(pipe, n):
+                    break
+                written += n
+                emit('GGAP: %.3f %.1f %s' % (time.time(), 1000.0 * n / self.rate, source))
+                log('GNSS: %.0f ms of samples lost (%s) - filled with zeros' % (1000.0 * n / self.rate, source))
+                next_k = k + n
+                continue
+            if next_k is None:              # the first block
                 anchors.append((written / self.rate, k))
+            elif k > next_k:                # blocks were dropped from the queue (pocket_trk fell behind): zeros too
+                lost = min(k - next_k, int(self.QUEUE_S * self.rate))
+                if not self._zeros(pipe, lost):
+                    break
+                written += lost
+                self.gaps.append((time.time(), lost / self.rate, 'queue'))
+                emit('GGAP: %.3f %.1f queue' % (time.time(), 1000.0 * lost / self.rate))
+                if k - next_k > lost:       # more than the zeros cover: the stream time must start again from here
+                    anchors.append((written / self.rate, k))
             next_k = k + n
             if not started_reader:
                 reader.start()
@@ -971,7 +1193,23 @@ class LiveTracker(threading.Thread):
             proc.kill()
         if started_reader:
             reader.join(timeout=5)
+        if why:
+            text = {'clock-lost': 'pocket_trk lost its clock (a sample gap got past the zero filling): every range '
+                                  'out of range, no fix possible', 'no-fix': 'no fix for 5 min with 5+ satellites synced',
+                    'reader-died': 'its log reader stopped'}.get(why, why)
+            log('GNSS: restarting pocket_trk - %s' % text)
+            emit('GLOG: %.3f RESTART %s' % (time.time(), why))
         log('GNSS: pocket_trk run %d stopped after %.0f s' % (self.runs, written / self.rate))
+
+    def _zeros(self, pipe, n):
+        """n zero samples into the pipe (in pieces: a long queue drop could be seconds)"""
+        step = 1 << 19
+        while n > 0:
+            m = min(n, step)
+            if not pipe.write(bytes(2 * m)):
+                return False
+            n -= m
+        return True
 
     def read(self, proc, logf, rtcmf, when):
         """follow pocket_trk's log and RTCM output while it runs"""
@@ -988,7 +1226,9 @@ class LiveTracker(threading.Thread):
             lines = (rest + text).split('\n')
             rest = lines.pop()              # a line still being written
             for line in lines:
-                self.out.line(line, when)
+                for rec in _RECORD.split(line) if line.count('$') > 1 else (line,):
+                    if rec.strip():
+                        self.out.line(rec, when)
             try:
                 with open(rtcmf, 'rb') as f:        # the orbits it decoded since the last look
                     f.seek(rpos)
@@ -999,15 +1239,16 @@ class LiveTracker(threading.Thread):
                 self.out.orbits([e for e in (rtcm3.decode(pl, now) for pl in payloads) if e], now)
             except OSError:
                 pass
+            except Exception as e:          # a bad RTCM frame must not stop the reader either
+                log('GNSS: RTCM not understood (%r)' % e)
             if time.time() - last_note > 60:
                 last_note = time.time()
                 locked = sorted(s for s, rt in self.out.last_ch.items() if when(rt) > time.time() - 5)
                 log('%d | GNSS live: %d satellites locked now (%s), %d broadcast orbits, %d position fixes '
-                    '(%d WAAS-corrected), %.0f s of samples dropped%s' % (
+                    '(%d WAAS-corrected), %d stream gaps (%.2f s filled with zeros), %.2f s dropped from the queue%s' % (
                         time.time(), len(locked), ' '.join(locked) or 'none', len(self.out.eph), self.out.fixes,
-                        self.out.spp_fixes, self.dropped / self.rate,
-                                                    ', WAAS messages %s' % self.out.sbas_types if self.out.sbas_types
-                                                    else ''))
+                        self.out.spp_fixes, len(self.gaps), sum(g[1] for g in self.gaps), self.dropped / self.rate,
+                        ', WAAS messages %s' % self.out.sbas_types if self.out.sbas_types else ''))
             if not alive:
                 return
             time.sleep(0.5)
@@ -1034,10 +1275,35 @@ class Receiver(gr.top_block):
         self.writer = sink
         self.connect(src, self.writer)
         self.taps = []
-        if opts.spectrum_port:
-            self.taps.append(sdr_taps.add_spectrum(self, src, opts.spectrum_port, center, rate))
+        if opts.spectrum_port:      # (every 8th FFT frame: the signals are under the noise, and every frame cost 0.2 core)
+            self.taps.append(sdr_taps.add_spectrum(self, src, opts.spectrum_port, center, rate, every=8))
         if opts.audio_port:
             self.taps.append(sdr_taps.add_audio(self, src, opts.audio_port, rate, channel_hz=36e3, demod='am'))
+
+
+def clean_temp():
+    """earlier versions left pocket_trk's working folders in %TEMP% for ever (13 GB on one PC, with position fixes
+    in them); now the files live beside the capture. Old leftovers go: the chunk-mode sample files (gnss_rx_*, up to
+    740 MB each, no use once processed) after a day, the live logs (gnss_live_*, small, worth keeping a while for
+    analysis) after 30 days - never a folder still being written to"""
+    root = tempfile.gettempdir()
+    now = time.time()
+    freed = 0
+    for name in os.listdir(root):
+        if not name.startswith(('gnss_live_', 'gnss_rx_')):
+            continue
+        p = os.path.join(root, name)
+        keep_s = 30 * 86400 if name.startswith('gnss_live_') else 86400
+        try:
+            files = [os.path.join(p, f) for f in os.listdir(p)]
+            newest = max([os.path.getmtime(f) for f in files] + [os.path.getmtime(p)])
+            if now - newest > keep_s:
+                freed += sum(os.path.getsize(f) for f in files)
+                shutil.rmtree(p, ignore_errors=True)
+        except OSError:
+            pass
+    if freed:
+        log('GNSS: removed %.0f MB of old working files from the temporary folder' % (freed / 2 ** 20))
 
 
 def main():
@@ -1046,6 +1312,10 @@ def main():
         sys.exit(2)
     global NOISE, SNAP
     STATE.update(load_state())
+    try:
+        clean_temp()
+    except Exception as e:
+        log('GNSS: could not tidy the temporary folder (%r)' % e)
     if opts.pocket_opts and os.path.exists(opts.pocket_opts):
         POCKET_OPTS[:] = ['-opt', opts.pocket_opts]
         log('GNSS: pocket_trk options from %s' % opts.pocket_opts)

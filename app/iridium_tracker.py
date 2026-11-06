@@ -301,6 +301,83 @@ def fmt_clock(t):
     return datetime.datetime.fromtimestamp(t).strftime('%I:%M:%S %p').lstrip('0')
 
 
+# ---------------------------------------------------------------- GNSS live state
+# When a GNSS satellite counts as tracked, when it is lost, when a fix is lost - and the words for why there is none.
+GNSS_TRACK_S = 5        # consecutive seconds of GCH lines at GNSS_TRACK_CN0+ before a satellite counts as tracked
+GNSS_TRACK_CN0 = 25.0   # (55 of 302 catalogued passes were under 10 s, one a single line at 14 dB-Hz for a satellite
+#                         below the horizon: pocket_trk's false locks); a decoded orbit says 'tracked' at once
+GNSS_LOST_S = 10        # no GCH line for this long: the satellite is lost (the panel's own rule too)
+FIX_LOST_S = 30         # no fix line for this long: the fix is lost (one FIX LOST event, not one per missing second)
+FIX_OLD_S = 60          # the headline goes grey ('No fix for ...') when the own solver's last fix is older than this
+SOLVER_MIN_SATS = 4     # spp.py's rules, repeated here only to word the reason: 4+ GPS satellites with orbits,
+SOLVER_MAX_HDOP = 6.0   # HDOP <= 6, each satellite settled 30 s + smoothed 30 s after lock
+SOLVER_SETTLE_S = 60
+GNSS_LABELS = {'G': 'GPS', 'E': 'Galileo', 'R': 'GLONASS', 'C': 'BeiDou', 'J': 'QZSS', 'S': 'WAAS'}
+EVENTS_MAX = 2000       # rows kept in the LIVE FROM THE RECEIVER list (a day of lines, not a day of per-fix lines)
+
+
+def sat_counts(sats):
+    """'4 GPS + 1 Galileo' for satellite ids (the WAAS GEOs left out: they give no position)"""
+    n = collections.Counter(s[0] for s in sats if s and s[0] != 'S')
+    return ' + '.join('%d %s' % (n[k], GNSS_LABELS.get(k, k)) for k in 'GERCJ' if n[k]) or 'no satellites'
+
+
+def fix_reason(tracked, ages, now, hdop, n_orbit=None, restart_t=None, who='own'):
+    """why there is no position fix right now, in a few words. tracked: satellite ids with a GCH line in the last
+    GNSS_LOST_S; ages: {id: seconds tracked so far}; hdop: of the tracked GPS satellites from their own broadcast
+    orbits (None: fewer than 4 usable); n_orbit: how many tracked GPS satellites have an orbit and are 10 deg+ up;
+    restart_t: when pocket_trk was last restarted after a sample gap; who: 'own' (spp.py's rules) or 'pocket'"""
+    if restart_t is not None and 0 <= now - restart_t < 120:
+        return 'pocket_trk lost its clock after a sample gap, restarting'
+    if not tracked:
+        return 'no satellites tracked'
+    gps = [s for s in tracked if s[0] == 'G']
+    if who != 'own':
+        return 'tracking %s' % sat_counts(tracked)
+    if not gps and any(s[0] in 'RC' for s in tracked):
+        return 'it works on the GPS band only'
+    names = ' '.join(gps)
+    if len(gps) < SOLVER_MIN_SATS:
+        return '%d GPS (needs %d)%s' % (len(gps), SOLVER_MIN_SATS, ': ' + names if gps else '')
+    if n_orbit is not None and n_orbit < SOLVER_MIN_SATS:
+        return '%d GPS tracked (%s), only %d with an orbit and 10\u00b0+ up (needs %d) - wait for their data' % (
+            len(gps), names, n_orbit, SOLVER_MIN_SATS)
+    if hdop is None:
+        return '%d GPS tracked (%s), HDOP not computable yet' % (len(gps), names)
+    if hdop > SOLVER_MAX_HDOP:
+        return '%d GPS tracked (%s), HDOP %.1f > %.0f' % (len(gps), names, hdop, SOLVER_MAX_HDOP)
+    settling = [s for s in gps if ages.get(s, SOLVER_SETTLE_S) < SOLVER_SETTLE_S]
+    if len(gps) - len(settling) < SOLVER_MIN_SATS:
+        return '%d GPS tracked (%s), HDOP %.1f, %d still settling (%d s after lock)' % (
+            len(gps), names, hdop, len(settling), SOLVER_SETTLE_S)
+    return '%d GPS tracked (%s), HDOP %.1f - the solver has no solution yet' % (len(gps), names, hdop)
+
+
+def fix_status(tracked, ages, last_gpos_t, last_gspp_t, now, hdop, n_orbit=None, restart_t=None, own=None):
+    """one line on the position fix right now, for the panel and its tooltip (pure: give it the facts).
+    tracked / ages / hdop / n_orbit / restart_t as in fix_reason(); last_gpos_t and last_gspp_t: pocket_trk's and
+    the own solver's last fix (None: never); own: the last own fix's {'nsat', 'hdop', 'quick', 'waas'}"""
+    own_fix = last_gspp_t is not None and 0 <= now - last_gspp_t <= FIX_LOST_S
+    pk_fix = last_gpos_t is not None and 0 <= now - last_gpos_t <= FIX_LOST_S
+    if own_fix:
+        o = own or {}
+        text = 'Own solver: %sfix - %d satellites%s%s%s' % (
+            'quick ' if o.get('quick') else '', o.get('nsat', 0),
+            ', HDOP %.1f' % o['hdop'] if o.get('hdop') is not None else '',
+            ', WAAS-corrected' if o.get('waas') else '', ' (still settling)' if o.get('quick') else '')
+    else:
+        text = 'Own solver: no fix%s - %s' % (
+            ' for ' + fmt_age(now - last_gspp_t) if last_gspp_t is not None else '',
+            fix_reason(tracked, ages, now, hdop, n_orbit, restart_t, 'own'))
+    if pk_fix:
+        text += '; pocket_trk fixing with %s' % sat_counts(tracked)
+    elif last_gpos_t is not None:
+        text += '; pocket_trk: no fix for %s' % fmt_age(now - last_gpos_t)
+    else:
+        text += '; pocket_trk: no fix yet'
+    return text
+
+
 # ---------------------------------------------------------------- data
 class Data:
     """catalog-data.json plus whatever the receiver is decoding right now"""
@@ -328,6 +405,14 @@ class Data:
         self.live_doppler = {}  # (capture, name) -> Doppler curve [(t, Hz), ...]
         self.heartbeat = 0      # last time the newest capture's files changed (its decoder log: every 10 s)
         self.last_burst = 0     # last time that capture received a burst
+        # GNSS live state (the newest capture only): which satellites count as tracked, the fixes' state - the
+        # events are on changes of these, never one per line (see _read_live_gnss, gnss_state_events)
+        self.gnss_tracking = {}     # sat id -> {'name', 'since', 'last', 'cn0', 'best'}: tracked now (past the gate)
+        self.gnss_glimpsed = {}     # sat id -> {'first', 'last', 'run', 'cn0', 'dop'}: heard, not yet counted
+        self.gnss_last = {}         # 'gpos' / 'gspp' (last fix times), '<key>_fixing', '<key>_since', 'own' (the last
+        #                             own fix's nsat / hdop / quick / waas), 'gap', 'restart', 'start'
+        self._gnss_eph_live = set()     # (capture, sat id) whose orbit arrived live
+        self.gnss_bad_lines = 0     # GNSS live lines skipped because a field would not convert
         self.load_catalog()
 
     def identify(self, net_id, t, lat, lon):
@@ -742,7 +827,7 @@ class Data:
         lives = sorted((f for p in systems.capture_prefixes() for f in glob.glob(os.path.join(paths.CAPTURES, p + '*.live'))),
                        key=os.path.getmtime)
         if not lives:
-            return events
+            return events + self.gnss_state_events(time.time())
         done = {c['name'] for c in self.captures}
         refit = set()
         for path in lives:
@@ -777,6 +862,7 @@ class Data:
                               % (len(self.live_fixes) - n_before, cap))
         if refit:
             self.fit_orbits(refit)
+        events += self.gnss_state_events(time.time())
         self.link_slots(events)
         return events
 
@@ -903,50 +989,176 @@ class Data:
 
     def _read_live_gnss(self, text, cap, newest, refit):
         """GNSS lines from a capture's live file: tracked satellites (Doppler, signal), their broadcast orbits,
-        and position fixes of the receiver"""
+        position fixes of the receiver, and what happened to the sample stream (gaps, pocket_trk restarts).
+        Only the newest capture (the one being received) feeds the live state - which satellites count as tracked,
+        the fixes' state - and its events are on state changes: a satellite seen or lost, a fix found or lost, never
+        one line per fix. A damaged line is skipped and counted (gnss_bad_lines), never the whole 2 s batch.
+        Kinds this version doesn't know are ignored."""
         events = []
+        st = self.gnss_last if newest else {}
         for kind, t, f in catalog.read_gnss(text.splitlines()):
             if newest:
                 self.frame_queue.append((kind, '%s: %.3f %s' % (kind, t, ' '.join(f))))
-            if kind == 'GCH' and len(f) >= 4:
-                sat = f[0]
-                name = catalog.gnss_name(sat)
-                systems.register(name, 'gnss')
-                i = self._info(name)
-                new = 'tracked' not in i['how']
-                i['how'].add('tracked')
-                i['sat'] = sat
-                i['frames'] = i.get('frames', 0) + 1
-                i['last'] = max(i['last'], t)
-                i['best'] = max(i['best'], float(f[2]))
-                self.heard(name, t, float(f[2]))
-                if not self.live_doppler.get((cap, name)):
-                    self.live_doppler[(cap, name)] = []
-                    self.doppler.setdefault(name, []).append(self.live_doppler[(cap, name)])
-                self.live_doppler[(cap, name)].append((t, catalog.GNSS_L1 + float(f[3])))
-                # its latest live signal (the details panel shows it while it is being tracked)
-                now = {'t': t, 'cn0': float(f[2]), 'dop': float(f[3]), 'lock': float(f[4]) if len(f) > 4 else 0.0}
-                if len(f) > 8:
-                    now.update(sync=f[5], nav=int(f[6]), err=int(f[7]), lol=int(f[8]))
-                i['now'] = now
-                if new:
-                    events.append('%s  TRACKING  %s  (%.0f dB-Hz, Doppler %+.0f Hz)' % (fmt_clock(t), name, float(f[2]), float(f[3])))
-            elif kind == 'GEPH' and len(f) >= 2:
-                self.gnss_eph[f[0]] = (t, ' '.join(f[1:]))
-                refit.add(catalog.gnss_name(f[0]))
-                events.append('%s  ORBIT  %s broadcast its ephemeris' % (fmt_clock(t), catalog.gnss_name(f[0])))
-            elif kind == 'GPOS' and len(f) >= 4:
-                fx = {'t': t, 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]), 'nsat': int(f[3])}
-                self.gnss_fixes.append(fx)
-                events.append('%s  GNSS FIX  %+.5f, %+.5f, %.0f m (%d satellites)' % (fmt_clock(t), fx['lat'], fx['lon'],
-                                                                                  fx['height_m'], fx['nsat']))
-            elif kind == 'GSPP' and len(f) >= 5:      # our own WAAS-corrected fix (no event line: one a second)
-                fx = {'t': t, 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
-                      'nsat': int(f[3]), 'hdop': float(f[4])}
-                if len(f) >= 9 and int(f[8]) < 4:
-                    fx['quick'] = True      # before smoothing settled: shown as the first fix, not in the accuracy
-                self.gnss_spp.append(fx)
+            try:
+                if kind == 'GCH' and len(f) >= 4:
+                    sat, cn0, dop = f[0], float(f[2]), float(f[3])
+                    if newest and sat not in self.gnss_tracking:
+                        # the gate: GNSS_TRACK_S consecutive seconds at GNSS_TRACK_CN0+, or its orbit decoded (then
+                        # it is tracked for sure) - until then only glimpsed: no row, no event, no chime, no count
+                        g = self.gnss_glimpsed.get(sat)
+                        if g is None or t - g['last'] > 2.5:         # (gnss_rx drops an epoch now and then)
+                            g = self.gnss_glimpsed[sat] = {'first': t, 'run': 0}
+                        g.update(last=t, cn0=cn0, dop=dop, run=g['run'] + 1 if cn0 >= GNSS_TRACK_CN0 else 0)
+                        if g['run'] < GNSS_TRACK_S and (cap, sat) not in self._gnss_eph_live:
+                            continue
+                        events.append(self._gnss_track(sat, t, cn0, dop))
+                    name = catalog.gnss_name(sat)
+                    systems.register(name, 'gnss')
+                    i = self._info(name)
+                    i['how'].add('tracked')
+                    i['sat'] = sat
+                    i['frames'] = i.get('frames', 0) + 1
+                    i['last'] = max(i['last'], t)
+                    i['best'] = max(i['best'], cn0)
+                    self.heard(name, t, cn0)
+                    if not self.live_doppler.get((cap, name)):
+                        self.live_doppler[(cap, name)] = []
+                        self.doppler.setdefault(name, []).append(self.live_doppler[(cap, name)])
+                    self.live_doppler[(cap, name)].append((t, catalog.GNSS_L1 + dop))
+                    # its latest live signal (the details panel shows it while it is being tracked)
+                    now = {'t': t, 'cn0': cn0, 'dop': dop, 'lock': float(f[4]) if len(f) > 4 else 0.0}
+                    if len(f) > 8:
+                        now.update(sync=f[5], nav=int(f[6]), err=int(f[7]), lol=int(f[8]))
+                    i['now'] = now
+                    if newest:
+                        tr = self.gnss_tracking[sat]
+                        tr.update(last=t, cn0=cn0, best=max(tr['best'], cn0))
+                elif kind == 'GEPH' and len(f) >= 2:
+                    self.gnss_eph[f[0]] = (t, ' '.join(f[1:]))
+                    refit.add(catalog.gnss_name(f[0]))
+                    events.append('%s  ORBIT  %s broadcast its ephemeris' % (fmt_clock(t), catalog.gnss_name(f[0])))
+                    if newest:
+                        self._gnss_eph_live.add((cap, f[0]))
+                        g = self.gnss_glimpsed.get(f[0])
+                        if f[0] not in self.gnss_tracking and g and t - g['last'] <= GNSS_LOST_S:
+                            events.append(self._gnss_track(f[0], t, g['cn0'], g['dop']))
+                elif kind == 'GPOS' and len(f) >= 4:
+                    fx = {'t': t, 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]), 'nsat': int(f[3])}
+                    self.gnss_fixes.append(fx)
+                    if newest:
+                        st['gpos'] = t
+                        if not st.get('gpos_fixing'):
+                            st['gpos_fixing'], st['gpos_since'] = True, t
+                            events.append('%s  FIX  pocket_trk: %d satellites' % (fmt_clock(t), fx['nsat']))
+                elif kind == 'GSPP' and len(f) >= 5:      # our own WAAS-corrected fix (no event line: one a second)
+                    fx = {'t': t, 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
+                          'nsat': int(f[3]), 'hdop': float(f[4])}
+                    if len(f) >= 9 and int(f[8]) < 4:
+                        fx['quick'] = True      # before smoothing settled: shown as the first fix, not in the accuracy
+                    self.gnss_spp.append(fx)
+                    if newest:
+                        waas = len(f) >= 7 and (int(f[5]) > 0 or int(f[6]) > 0)
+                        st['gspp'] = t
+                        st['own'] = {'nsat': fx['nsat'], 'hdop': fx['hdop'], 'quick': fx.get('quick', False), 'waas': waas}
+                        how = '%d satellites, HDOP %.1f%s' % (fx['nsat'], fx['hdop'], ', WAAS-corrected' if waas else '')
+                        if not st.get('gspp_fixing'):
+                            st['gspp_fixing'], st['gspp_since'] = True, t
+                            st['gspp_quick'] = fx.get('quick', False)
+                            events.append('%s  FIX  own solver: %s%s' % (fmt_clock(t), how,
+                                                                         ' (quick - still settling)' if fx.get('quick') else ''))
+                        elif st.get('gspp_quick') and not fx.get('quick'):
+                            st['gspp_quick'] = False
+                            events.append('%s  FIX  own solver settled: %s' % (fmt_clock(t), how))
+                elif kind == 'GGAP' and len(f) >= 1:     # a hole in the sample stream, zero-filled by gnss_rx
+                    if newest:
+                        st['gap'] = t
+                        events.append('%s  STREAM GAP  %.0f ms of samples lost (%s) - filled' % (
+                            fmt_clock(t), float(f[0]), f[1].upper() if len(f) > 1 and f[1].lower() == 'usb' else
+                            f[1] if len(f) > 1 else '?'))
+                elif kind == 'GLOG' and len(f) >= 1:     # pocket_trk's own events (FOUND / LOST / FALSELOCK / EPOCH /
+                    if newest:                           # RESTART / START): only the ones the tracker doesn't see itself
+                        ev = f[0].upper()
+                        if ev == 'RESTART':
+                            st['restart'] = t
+                            events.append('%s  RESTART  pocket_trk lost its clock after a gap - restarted' % fmt_clock(t))
+                        elif ev == 'START':
+                            st['start'] = t
+            except (ValueError, IndexError, KeyError):
+                self.gnss_bad_lines += 1
         return events
+
+    def _gnss_track(self, sat, t, cn0, dop):
+        """a satellite passed the gate: tracked from now (its first glimpse counts as the start); the event text"""
+        g = self.gnss_glimpsed.pop(sat, None)
+        name = catalog.gnss_name(sat)
+        self.gnss_tracking[sat] = {'name': name, 'since': g['first'] if g else t, 'last': t, 'cn0': cn0, 'best': cn0}
+        return '%s  TRACKING  %s  (%.0f dB-Hz, Doppler %+.0f Hz)' % (fmt_clock(t), name, cn0, dop)
+
+    def gnss_state_events(self, now):
+        """GNSS state changes since the last look (every poll): satellites whose GCH lines stopped, fixes that stopped.
+        All satellites going at once (Stop, a stalled stream) is one line, not one per satellite."""
+        events = []
+        lost = [(s, tr) for s, tr in self.gnss_tracking.items() if now - tr['last'] > GNSS_LOST_S]
+        if lost:
+            if len(lost) >= 3 and len(lost) == len(self.gnss_tracking):
+                events.append('%s  LOST  all %d satellites at once (%s) - the stream stopped' % (
+                    fmt_clock(now), len(lost), ' '.join(s for s, _ in lost)))
+            else:
+                for s, tr in lost:
+                    events.append('%s  LOST  %s after %s, last %.0f dB-Hz' % (
+                        fmt_clock(now), tr['name'], fmt_age(tr['last'] - tr['since']), tr['cn0']))
+            for s, _ in lost:
+                del self.gnss_tracking[s]
+        for s in [s for s, g in self.gnss_glimpsed.items() if now - g['last'] > 30]:
+            del self.gnss_glimpsed[s]
+        st = self.gnss_last
+        for key, label in (('gspp', 'own solver'), ('gpos', 'pocket_trk')):
+            if st.get(key + '_fixing') and now - st.get(key, 0) > FIX_LOST_S:
+                st[key + '_fixing'] = False
+                live = self.gnss_live(now)
+                events.append('%s  FIX LOST  %s after %s: %s' % (
+                    fmt_clock(now), label, fmt_age(st[key] - st.get(key + '_since', st[key])),
+                    fix_reason(live['tracked'], live['ages'], now, live['hdop'], live['n_orbit'], live['restart_t'],
+                               'own' if key == 'gspp' else 'pocket')))
+        return events
+
+    def gnss_geometry(self, now):
+        """(HDOP, n) of the GPS satellites tracked now, from their own broadcast orbits, the way the own solver sees
+        them: 10 deg mask, Galileo joining only when 2+ of them have orbits; n = GPS with an orbit and up; HDOP None
+        when fewer than 4 are usable"""
+        if not catalog.HOME:
+            return None, 0
+        import gnss
+        import integrity
+        import posquality
+        home = (HOME_LAT, HOME_LON, HOME_H)
+        by_sys = {'G': [], 'E': []}
+        for sat, tr in self.gnss_tracking.items():
+            if sat[0] not in by_sys or now - tr['last'] > GNSS_LOST_S:
+                continue
+            o = self.orbits.get(tr['name'])
+            if not isinstance(o, gnss.EphemerisOrbit):
+                continue
+            try:
+                if float(np.asarray(o.sigma_km(now)).reshape(-1)[0]) >= 20:
+                    continue
+                el, az, _ = integrity.enu(home, o.ecef(now))
+            except Exception:
+                continue
+            if el >= 10:
+                by_sys[sat[0]].append((az, el))
+        g = posquality.dop(by_sys['G'] + (by_sys['E'] if len(by_sys['E']) >= 2 else []))
+        return (g['hdop'] if g else None), len(by_sys['G'])
+
+    def gnss_live(self, now):
+        """the live GNSS facts for fix_status() / fix_reason(): satellites tracked (a GCH line in the last
+        GNSS_LOST_S) and for how long, their geometry, the last fixes"""
+        tracked = sorted(s for s, tr in self.gnss_tracking.items() if now - tr['last'] <= GNSS_LOST_S)
+        hdop, n_orbit = self.gnss_geometry(now)
+        st = self.gnss_last
+        return {'tracked': tracked, 'ages': {s: now - self.gnss_tracking[s]['since'] for s in tracked},
+                'last_gpos_t': st.get('gpos'), 'last_gspp_t': st.get('gspp'), 'now': now, 'hdop': hdop,
+                'n_orbit': n_orbit, 'restart_t': st.get('restart'), 'own': st.get('own')}
 
 
 # ---------------------------------------------------------------- map tiles
@@ -2415,8 +2627,9 @@ class Tracker(QtWidgets.QMainWindow):
             return None
 
     def _update_position_quality(self):
-        """the 'Your position' line in the GNSS view: accuracy from the scatter of your recent fixes, their drift and
-        the tracked satellites' geometry (posquality.py)"""
+        """the 'Your position' panel in the GNSS view, every 2 s: the fix right now and why there is none
+        (fix_status), the accuracy from the scatter of your recent fixes, their drift and the tracked satellites'
+        geometry (posquality.py), and the satellites that should be heard but aren't"""
         show = self.view_key() == 'gnss'
         self.pos_label.setVisible(show)
         if not show:
@@ -2425,14 +2638,19 @@ class Tracker(QtWidgets.QMainWindow):
         import integrity
         now = time.time()
         home = (HOME_LAT, HOME_LON, HOME_H) if catalog.HOME else None
-        fixes = self.data.gnss_fixes
+        d = self.data
+        rx = self.receiver
+        receiving = (rx.busy and getattr(rx, 'system', {}).get('system') == 'gnss') or bool(d.gnss_tracking)
+        fixes = d.gnss_fixes
         last = max((f['t'] for f in fixes), default=None)
-        live = last is not None and now - last < 60
+        own_t = max((f['t'] for f in d.gnss_spp), default=None)
+        pk_fresh = last is not None and now - last <= FIX_OLD_S
+        own_fresh = own_t is not None and now - own_t <= FIX_OLD_S
         azel = []
-        if live and home:       # the geometry of the satellites tracked now (their own broadcast orbits)
-            for name, i in self.data.info.items():
+        if home:       # the geometry of the satellites tracked now (their own broadcast orbits)
+            for name, i in d.info.items():
                 sat, cur = i.get('sat'), i.get('now')
-                if not sat or not cur or sat[0] == 'S' or now - cur['t'] > 10:
+                if not sat or not cur or sat[0] == 'S' or now - cur['t'] > GNSS_LOST_S:
                     continue
                 o = self._gnss_orbit_of(sat)
                 if o is None:
@@ -2445,25 +2663,24 @@ class Tracker(QtWidgets.QMainWindow):
                     azel.append((az, el))
         try:
             q = posquality.quality(fixes, None, home, azel)
-            # our own WAAS-corrected, carrier-smoothed fixes (spp.py) when there are enough recent ones
-            spp_last = max((f['t'] for f in self.data.gnss_spp), default=None)
-            qs = posquality.quality(self.data.gnss_spp, None, home, azel) if spp_last and (
-                last is None or spp_last > last - 120) else None
+            qs = posquality.quality(d.gnss_spp, None, home, azel) if own_t else None
         except Exception as e:
             q = qs = None
             print('position quality: %r' % e)
-        plain = q
-        if qs and qs['enough']:
-            q = qs
+        plain, source = q, 'pocket'
+        # whose figures: the own solver's (WAAS-corrected, smoothed) while it is fixing; pocket_trk's while only it
+        # is - said so below, not switched silently; with neither fixing, the newer of the two, dated
+        if qs and qs['enough'] and (own_fresh or (not pk_fresh and (last is None or own_t >= last - 120))):
+            q, source = qs, 'waas'
             q['source'] = 'waas'
             if plain and plain['enough']:
                 q['pocket_r95_m'] = plain['r95_m']
         if q and q.get('enough'):
             # over time: every session in the catalog (our own WAAS fixes once there are 3+ sessions of them)
-            key = (len(self.data.gnss_spp), len(fixes), home)
+            key = (len(d.gnss_spp), len(fixes), home)
             if getattr(self, '_long_key', None) != key:
                 self._long_key = key
-                lt = posquality.long_term(self.data.gnss_spp, home)
+                lt = posquality.long_term(d.gnss_spp, home)
                 if lt and lt['sessions'] >= 3:
                     lt['label'] = 'WAAS-corrected'
                 else:
@@ -2484,22 +2701,56 @@ class Tracker(QtWidgets.QMainWindow):
                 if q.get('long'):
                     q['long']['ref_m'] = refpoints._dist(q['long']['lat'], q['long']['lon'], ref['lat'], ref['lon'])
             q['geoid_sep'] = refpoints.geoid_sep()
+        # the fix right now, and why there is none (recomputed every time: HDOP from the tracked satellites' orbits)
+        try:
+            live = d.gnss_live(now)
+            if not live['tracked'] and not receiving:
+                reason = 'not receiving GNSS L1'
+            else:
+                reason = fix_reason(live['tracked'], live['ages'], now, live['hdop'], live['n_orbit'], live['restart_t'])
+            status = fix_status(**live)
+        except Exception as e:
+            reason, status = 'status unknown', ''
+            print('fix status: %r' % e)
         text = posquality.headline(q)
-        if q and q.get('t_last') and not live:
-            text += '  ·  (from your last fixes, %s)' % time.strftime('%d %b %H:%M', time.localtime(q['t_last']))
-        col = {'excellent': GOOD, 'good': GOOD, 'fair': theme.PAL['WARN'], 'poor': theme.PAL['ALERT'],
-               'bad': theme.PAL['ALERT']}.get(q.get('grade') if q else None, MUTED)
-        head, _, rest = text.partition('  ·  ')
+        if own_fresh:
+            col = {'excellent': GOOD, 'good': GOOD, 'fair': theme.PAL['WARN'], 'poor': theme.PAL['ALERT'],
+                   'bad': theme.PAL['ALERT']}.get(q.get('grade') if q else None, MUTED)
+            if source == 'pocket' and q and q.get('enough'):
+                # the own solver is fixing but has under MIN_FIXES settled fixes yet: pocket_trk's figures meanwhile
+                text = text.replace('Your position', 'pocket_trk fixes meanwhile (own solver: %d of %d settled)' % (
+                    (qs or {}).get('n', 0), posquality.MIN_FIXES), 1)
+        else:
+            # no own fix for a minute (or ever): grey and say why - a green 'excellent' from old fixes used to stay up
+            # through a 30-minute solver outage and an 8-hour one
+            col = MUTED
+            head = 'No fix%s - %s' % (' for ' + fmt_age(now - own_t) if own_t else ' yet', reason)
+            if q and q.get('enough'):
+                lead = ('pocket_trk is fixing' if source == 'pocket' and pk_fresh else 'last %s fixes (%s)' % (
+                    'WAAS-corrected' if source == 'waas' else 'pocket_trk',
+                    time.strftime('%d %b %H:%M', time.localtime(q['t_last']))))
+                text = text.replace('Your position (WAAS-corrected)', lead, 1).replace('Your position', lead, 1)
+            else:
+                text = text.replace('Your position: ', '', 1)
+            text = head + '  \u00b7  ' + text
+        head, _, rest = text.partition('  \u00b7  ')
         html = '<span style="color:%s; font-weight:600">%s</span>%s' % (
-            col, head, ('<span style="color:%s">  ·  %s</span>' % (MUTED, rest)) if rest else '')
-        missing, tracked = self._missing_satellites(home, now) if live else ([], 0)
+            col, head, ('<span style="color:%s">  \u00b7  %s</span>' % (MUTED, rest)) if rest else '')
+        if status and (receiving or own_fresh or pk_fresh):
+            html += '<br><span style="color:%s">%s</span>' % (MUTED, status)
+        missing, tracked = self._missing_satellites(home, now)      # whenever the GNSS L1 band is receiving
         if missing:
-            html += ('<br><span style="color:%s">Up but not heard: %s</span><span style="color:%s">  ·  their own '
-                     'orbits put them %d°+ up - if this list is long, check the antenna\'s view of the sky</span>'
-                     % (theme.PAL['WARN'], ', '.join('%s %.0f°' % (s, el) for s, el in missing[:8]), MUTED,
+            html += ('<br><span style="color:%s">Up but not heard: %s</span><span style="color:%s">  \u00b7  their own '
+                     'orbits put them %d\u00b0+ up - if this list is long, check the antenna\'s view of the sky</span>'
+                     % (theme.PAL['WARN'], ', '.join('%s %.0f\u00b0' % (s, el) for s, el in missing[:8]), MUTED,
                         MISSING_EL))
         self.pos_label.setText(html)
-        self.pos_label.setToolTip(posquality.details(q) + self._startup_text())
+        tip = posquality.details(q)
+        if status:
+            tip += '\n\nRight now: ' + status
+        if d.gnss_bad_lines:
+            tip += '\n(%d damaged live lines skipped)' % d.gnss_bad_lines
+        self.pos_label.setToolTip(tip + self._startup_text())
 
     # ---- position: GPX, reference points, a Garmin as a drive
     def _pos_menu(self, at):
@@ -2916,13 +3167,12 @@ class Tracker(QtWidgets.QMainWindow):
     def start_pick(self):
         """the next click on the map sets the antenna location"""
         self.pick_cancel.setVisible(catalog.HOME is not None)
-        fix = self.gnss_location()
-        self.gps_loc_btn.setVisible(fix is not None)
-        if fix:
-            self.gps_loc_btn.setText('\U0001F6F0  Use GPS-tracked position')
-            self.gps_loc_btn.setToolTip('%.5f, %.5f, %.0f m - the middle of your %d most recent GNSS position fixes\n'
-                                        '(worked out from the GPS / Galileo satellites your antenna tracked)'
-                                        % (fix[0], fix[1], fix[2] * 1000, fix[3]))
+        fix, note = self.gnss_location()
+        # shown once there are GNSS fixes at all; enabled only when enough settled ones (the tooltip says why not)
+        self.gps_loc_btn.setVisible(bool(self.data.gnss_spp or self.data.gnss_fixes))
+        self.gps_loc_btn.setEnabled(fix is not None)
+        self.gps_loc_btn.setText('\U0001F6F0  Use GPS-tracked position')
+        self.gps_loc_btn.setToolTip(note + '\n(worked out from the GPS / Galileo satellites your antenna tracked)')
         self.pick_bar.show()
         self.map.set_picking(True)
 
@@ -2931,22 +3181,57 @@ class Tracker(QtWidgets.QMainWindow):
         self.map.set_picking(False)
 
     def gnss_location(self):
-        """(lat, lon, height km, n) from your most recent GNSS position fixes (their median), or None"""
-        # our own WAAS-corrected, smoothed fixes if there are any (the last 2 minutes of them), else pocket_trk's
-        fixes = sorted(self.data.gnss_spp, key=lambda f: f['t'])[-120:] or \
-            sorted(self.data.gnss_fixes, key=lambda f: f['t'])[-20:]
+        """your position from your recent GNSS fixes: ((lat, lon, height km, n), note) or (None, why not).
+        The own solver's settled fixes with 4+ satellites from the last 10 minutes, 30+ of them (the pre-settle
+        'quick' fixes were 11-31 m off beside the Garmin, so they never count); pocket_trk's with 5+ satellites only
+        when the own solver has none at all. The note carries how sure the average is."""
+        import posquality
+        now = time.time()
+
+        def settled(fixes, min_sat):
+            """(the last 10 minutes' settled fixes, all settled ones) with min_sat+ satellites, oldest first"""
+            fx = sorted((f for f in fixes if f.get('nsat', 0) >= min_sat and not f.get('quick')), key=lambda f: f['t'])
+            return [f for f in fx if f['t'] >= now - posquality.WINDOW_S], fx
+
+        own, own_all = settled(self.data.gnss_spp, SOLVER_MIN_SATS)
+        pk, pk_all = settled(self.data.gnss_fixes, 5) if not own else ([], [])
+        fixes, label = (own, 'settled WAAS-corrected') if own else (pk, 'pocket_trk (5+ satellites)')
         if not fixes:
-            return None
-        med = lambda k: float(np.median([f[k] for f in fixes]))     # noqa: E731
-        return med('lat'), med('lon'), med('height_m') / 1000, len(fixes)
+            newest = max((f['t'] for f in own_all + pk_all), default=None)
+            if newest:
+                return None, ('Your last settled GNSS fixes are %s old (%s) - receive GNSS L1 for 10 minutes for a '
+                              'fresh position' % (fmt_age(now - newest), fmt_time(newest)))
+            return None, ('No settled GNSS fixes yet (only quick first fixes, which can be 10-30 m off) - keep '
+                          'receiving GNSS L1 until the panel shows an accuracy figure'
+                          if self.data.gnss_spp or self.data.gnss_fixes else
+                          'No GNSS position fixes yet - receive GNSS L1 first')
+        if len(fixes) < posquality.MIN_FIXES:
+            return None, ('Only %d %s fixes in the last %d minutes - needs %d: keep receiving GNSS L1'
+                          % (len(fixes), label, posquality.WINDOW_S / 60, posquality.MIN_FIXES))
+        home = (HOME_LAT, HOME_LON, HOME_H) if catalog.HOME else None
+        try:
+            q = posquality.quality(fixes, None, home)
+        except Exception as e:
+            print('gnss_location: %r' % e)
+            q = None
+        if not q or not q.get('enough'):
+            med = lambda k: float(np.median([f[k] for f in fixes]))     # noqa: E731
+            q = {'lat': med('lat'), 'lon': med('lon'), 'height_m': med('height_m'), 'span_s': fixes[-1]['t'] - fixes[0]['t']}
+        note = '%.5f, %.5f, %.0f m - the middle of %d %s fixes over %.0f min, newest %s' % (
+            q['lat'], q['lon'], q['height_m'], len(fixes), label, q['span_s'] / 60, fmt_time(fixes[-1]['t']))
+        if q.get('avg95_m') is not None:
+            note += '\nthat average is good to \u00b1%.1f m horizontally, \u00b1%.1f m in height (95 %%)%s' % (
+                q['avg95_m'], q.get('avg_v95_m', 0.0),
+                '' if q['span_s'] >= posquality.AVG_MIN_S else ' - a longer stretch would tighten it')
+        return (q['lat'], q['lon'], q['height_m'] / 1000, len(fixes)), note
 
     def use_gnss_location(self):
-        fix = self.gnss_location()
+        fix, note = self.gnss_location()
         if fix:
             self.cancel_pick()
             self.apply_location(fix[:3])
-            self.events.insertItem(0, '%s  Location from your GNSS position fixes (%d of them)'
-                                   % (fmt_clock(time.time()), fix[3]))
+            self.events.insertItem(0, '%s  Location from your GNSS position fixes: %s' % (
+                fmt_clock(time.time()), ' - '.join(note.splitlines()[:2])))
 
     def type_location(self):
         home = (HOME_LAT, HOME_LON, HOME_H) if catalog.HOME else None
@@ -3372,6 +3657,8 @@ class Tracker(QtWidgets.QMainWindow):
         before = (len(self.data.all_fixes()), len(self.data.info), self.data.cat_mtime, self.data.links_version)
         for ev in self.data.poll():
             self.events.insertItem(0, ev)
+        while self.events.count() > EVENTS_MAX:     # (the newest on top; the oldest rows go)
+            self.events.takeItem(self.events.count() - 1)
         self._check_new_satellites()
         queue, self.data.frame_queue = self.data.frame_queue, []
         if queue and not self.receiver.busy:

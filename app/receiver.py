@@ -243,6 +243,7 @@ class Receiver(QtCore.QObject):
             opt = os.path.join(paths.DATA, 'pocket_trk.opt')
             if os.path.exists(opt):         # pocket_trk's own settings, if tuned (see README)
                 args += ['--pocket-opts', opt]
+            args += ['--work-stem', stem]   # pocket_trk's log and RTCM beside the capture (<name>.trk1.log / .rtcm)
             import integrity
             if self.system['key'] in integrity.WATCH_BANDS:     # (it keeps 20 s of samples in memory: ~80 MB)
                 args += ['--snap-trigger', snap_trigger()]
@@ -372,7 +373,7 @@ class Receiver(QtCore.QObject):
             return
         lines = (self.out_rest + data.replace('\r\n', '\n')).split('\n')
         self.out_rest = lines.pop()
-        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS|GSPP|MSIG|GTIME|GNOISE|GSPEC): ', l)]
+        lines = [l for l in lines if re.match(r'^(O[A-Z]{2,3}|HFR|HSIG|GCH|GEPH|GPOS|GSPP|GGAP|GLOG|MSIG|GTIME|GNOISE|GSPEC): ', l)]
         if not lines:
             return
         with open(self.live_path, 'a', newline='') as f:
@@ -398,6 +399,8 @@ class Receiver(QtCore.QObject):
                     pass
                 continue
             self.frame.emit(kind, line)
+            if kind in ('GGAP', 'GLOG'):    # receiver events (a sample gap filled, pocket_trk restarted): not frames
+                continue
             if kind in DAMAGED:
                 self.heard += 1
             else:

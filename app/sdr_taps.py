@@ -166,15 +166,22 @@ def parent_alive(pid):
         k.CloseHandle(h)
 
 
-def add_spectrum(tb, src, port, center, rate):
-    """attach the spectrum tap to a flowgraph's source block; returns its blocks (keep them alive)"""
+def add_spectrum(tb, src, port, center, rate, every=1):
+    """attach the spectrum tap to a flowgraph's source block; returns its blocks (keep them alive).
+    every: use only one FFT frame in this many (GNSS: its signals are under the noise, so no burst can be missed,
+    and the FFT of every sample cost 0.2 of a core there)"""
     win = window.blackmanharris(FFT_SIZE)
-    chain = [blocks.stream_to_vector(gr.sizeof_gr_complex, FFT_SIZE),
-             gr_fft.fft_vcc(FFT_SIZE, True, win, True),
-             blocks.complex_to_mag_squared(FFT_SIZE),
-             UdpSpectrum(port, center, rate, win)]
+    chain = [blocks.stream_to_vector(gr.sizeof_gr_complex, FFT_SIZE)]
+    if every > 1:
+        chain.append(blocks.keep_one_in_n(gr.sizeof_gr_complex * FFT_SIZE, every))
+    spec = UdpSpectrum(port, center, rate, win)
+    spec.per_frame = max(1, spec.per_frame // every)
+    chain += [gr_fft.fft_vcc(FFT_SIZE, True, win, True),
+              blocks.complex_to_mag_squared(FFT_SIZE),
+              spec]
     tb.connect(src, *chain)
-    print('Spectrum: %d-point FFT of every sample, peak + average %d times/s' % (FFT_SIZE, FRAME_RATE), file=sys.stderr)
+    print('Spectrum: %d-point FFT of %s, peak + average %d times/s' % (
+        FFT_SIZE, 'every sample' if every == 1 else 'one frame in %d' % every, FRAME_RATE), file=sys.stderr)
     return chain
 
 

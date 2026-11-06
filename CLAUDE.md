@@ -89,8 +89,11 @@ pictures via SatDump), **Radio** (SDR++-style listening 24 MHz-2.3 GHz), **Integ
   - Without the SDR: gr-osmosdr file device `file=C:/path/x.cf32,rate=2048000,freq=..,repeat=true,throttle=true`
     (forward slashes; complex64 only). Run receivers directly (`python gnss_rx.py --device file=... --spp-state ...`)
     and read their stdout lines.
-  - GNSS offline: pocket_trk logs survive in `%TEMP%\gnss_live_*\trk-<run>.log` (+ `trk-<run>.rtcm` orbits; never
-    cleaned up, contain position fixes). Replay through `spp.Solver` directly, or `gnss_rx.Lines` after setting
+  - GNSS offline: pocket_trk's log and RTCM of every run are kept beside the capture as
+    `data\captures\<capture>.trk<run>.log` / `.rtcm` (raw files: trimmed with the capture by storage.py; before
+    2026-11-06 they went to `%TEMP%\gnss_live_*\`, which gnss_rx now removes after a day). The log holds `$OBS`
+    (pseudorange, carrier, Doppler), `$NAV` bits and `$LOG` events; the RTCM holds MSM7 observables. Replay through
+    `spp.Solver` directly, or `gnss_rx.Lines` after setting
     `sys.argv = ['gnss_rx.py', ...]` *before* `import gnss_rx` (it parses argv and loads GNU Radio at import) - see
     `build\_tmp\spp_eval.py`, `warm_logs.py`.
   - Raw signal: while gnss1 runs (or gnss_rx by hand with `--snap-trigger FILE`), write an absolute stem path into
@@ -130,7 +133,7 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
 | iridium | `output-` | 1626.5 MHz − rate/2, default 2 MS/s | `sdr_source.py` (runs gr-iridium's extractor via runpy, monkey-patching osmosdr.source / FlowGraph.__init__) → `.bits` → iridium-toolkit `iridium-parser.py` | IRA, ITL, … (RAW/ERR damaged) |
 | orbcomm | `orbcomm-` | 137.5 MHz, 1.2288 MS/s | `orbcomm_rx.py` (vendored fbieberly decoder) | OEP OSY OPK OBAD |
 | ham2m / ham70 | `ham2m-`/`ham70-` | 145.55 MHz 2.048 / 436.725 MHz 2.4 | `ham_rx.py` (channelizer + gr-satellites) | HFR HSIG |
-| gnss1 | `gnss-` | 1575.42 MHz, 2.048 MS/s | `gnss_rx.py` (GPS L1C/A + Galileo E1B + WAAS) | GCH GEPH GPOS GSPP (+GTIME GNOISE GSPEC) |
+| gnss1 | `gnss-` | 1575.42 MHz, 2.048 MS/s | `gnss_rx.py` (GPS L1C/A + Galileo E1B + WAAS) | GCH GEPH GPOS GSPP GGAP GLOG (+GTIME GNOISE GSPEC) |
 | glo1 | `glo-` | 1602 MHz, 2.4 MS/s | `gnss_rx.py --constellation glonass` (~5 of 14 channels fit) | GCH GEPH GPOS (+GTIME GNOISE GSPEC) |
 | bds1 | `bds-` | 1561.098 MHz, 2.048 MS/s | `gnss_rx.py --constellation beidou` (B1I) | GCH GEPH GPOS (+GTIME GNOISE GSPEC) |
 | meteor | `meteor-` | 137.7 MHz, 1.024 MS/s | `meteor_rx.py` → `.s16` 256 kS/s → SatDump | MSIG |
@@ -144,7 +147,7 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
 - **A line format is parsed in five places**; a new/changed kind must be handled in all that apply:
   `receiver._orbcomm_output` regex/filters, `catalog.read_*`/`analyze_*`, the tracker's own live parsers
   (`Data._read_live`, `_read_live_orbcomm`, `_read_live_ham`, `_read_live_gnss`), console.py's describers, and
-  `integrity.Monitor.line`. Plus `systems.*['keep_kinds']` to survive in reduced files, and `receiver.DAMAGED` if it
+  `integrity.Monitor.line` (GGAP/GLOG were added to all of them on 2026-11-06 - follow that diff for the next kind). Plus `systems.*['keep_kinds']` to survive in reduced files, and `receiver.DAMAGED` if it
   is a failure. GTIME/GNOISE/GSPEC are never saved and reach Integrity only through the tracker's own Receiver
   signals (if the Console receives, Integrity sees nothing).
 - Receivers are stopped with `taskkill /T /F` - **their shutdown code never runs**; anything they must keep is written
@@ -157,9 +160,11 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
   frozen: changing an analyser does nothing until `catalog.py --redo` (which keeps old results for captures whose files
   are gone; the tracker runs a full redo when home moves > 2 km). After 7 days / 1 GB `storage.py` leaves only
   `.frames.gz` (the `keep_kinds` lines of the time). `save_data` writes only changed files atomically, **deletes
-  capture files not in the dict it is given - always pass the full catalog**, and rewrites `index.json` (the tracker
-  reloads on its mtime). **Nothing locks against two catalog runs at once** (tracker Stop, console Stop, a redo) -
-  overlapping runs can drop each other's new entries until the next run.
+  only the entries it loaded and that were dropped from the dict it is given** (never by glob), merges the on-disk
+  index names in, and rewrites `index.json` (the tracker reloads on its mtime). Runs take `catalog\.lock` (PID; a
+  second run waits up to 60 s, a stale lock is removed). One capture's failure writes a stub entry with an `error`
+  key (re-analysed by `--redo`) and the traceback to `tracker-error.log`; GNSS lines are converted per line
+  (`counts['bad']`), so one cut line can no longer wedge the catalog.
   - History: on 2026-11-05 an interrupted save truncated the old 11 MB single file; the tracker silently showed no
     history and every catalog run crashed. Recovered (56 complete entries + re-analysis); `data\
     catalog-data.truncated-20261105.json` is the damaged original. The per-capture layout is the fix.
@@ -176,11 +181,25 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
   mirror; without it every Doppler has the wrong sign). Orbits come only from the RTCM output (its `$EPH` log lines are
   masked) - keep `-rtcm`. RTCM decoded: 1019 GPS, 1045/1046 Galileo, 1042 BeiDou (BDT = GPST − 14 s, week+1356), 1020
   GLONASS. Chunks mode (`--mode chunks`) is an old fallback.
-- pocket_trk options file: `-opt FILE`, lines `name = value` (`thres_cn0_l`, `thres_cn0_u`, `thres_pli`, ...). The app
-  passes `data\pocket_trk.opt` if it exists (live mode only). Tested on a recording (2026-11-06): the default lock
-  threshold is ~35 dB-Hz; 32 *finds* weak satellites (G23, G27) but they drop within ~2 s whatever `thres_cn0_u` /
-  `thres_pli` are; ≤30 locks noise (22 satellites below the horizon). Defaults kept. pocket_trk runs are not
-  repeatable (search timing varies) - compare settings over several runs.
+- pocket_trk options file: `-opt FILE`, lines `name = value` (every key with its default: sdr_rcv.c `sdr_rcv_setopt`;
+  a source copy matching the shipped 0.21 binary is in `C:\Users\tucke\it_h\`). The app passes `data\pocket_trk.opt`
+  if it exists (live mode only) and logs the command and options into the capture .log. **Shipped since 2026-11-06:
+  `lost_th = 10` and `b_dll = 0.5`** (measured on recordings: the default `lost_th` 4 gave the phase loop one second
+  after the FLL pull-in, so 55 % of the satellites found at 34-36 dB-Hz were dropped at exactly 2.0 s with the signal
+  still there; the default `b_dll` 0.25 Hz lost every Galileo E1B lock in ~10 s at 2 samples per chip - Galileo's
+  missing orbits were the DLL, not weak signal). Lowering `thres_cn0_l` alone finds weak satellites but ≤32 locks
+  noise; `t_acq 0.04`, `bump_jump`, E1C pilot channels and notching the receiver's +22 dB spur at 1020 kHz changed
+  nothing; `fast_acq` needs a fix first and only adds below-horizon skipping. Replay at `-tscale 1`: faster replays
+  starve the one-channel-at-a-time search. pocket_trk runs are not repeatable (search timing varies) - compare
+  settings over several runs. Evidence: `build\_tmp\review-20261106\GNSS-review.md`.
+- **Sample-stream gaps**: the RTL-SDR/USB path loses 100-140 ms a few times a day (never a buffer's worth, no overflow
+  message anywhere). Left as a cut, every satellite is lost and a loss ≥ ~90 ms puts every GPS range below pocket_trk's
+  accepted window for the rest of the run (it re-aligns its clock only when it has a fix). Since 2026-11-06 gnss_rx
+  detects a gap from the arrival times (a steady ≥20 ms excess over 60 ms of blocks; a scheduling stall decays and is
+  told apart), feeds that many zero samples (locks survive - proven on a recording), writes `GGAP: t ms source` and
+  counts gaps in the status line; a watchdog restarts pocket_trk when 'PSEUDORANGE OUT OF RANGE' arrives for GPS
+  satellites 20 times in 10 s (`GLOG: t RESTART clock-lost`), after 5 min without a fix with 5+ synced satellites, or
+  when the log reader dies. pocket_trk's own events go out as `GLOG` (FOUND/LOST/FALSELOCK/EPOCH/SYNC/START/RESTART).
 - Lines emitted (exact formats in `Lines` / `NoiseMeter`):
   `GCH: t sat sig cn0 dop lock [sync nav err lol]`, `GEPH: t sat <fields|GLO,…|SBAS,…>`, `GPOS: t lat lon h nsat`,
   `GSPP: t lat lon h nsat hdop n_waas_iono n_fast n_longterm n_smoothed`, `GTIME: t offset_s nsat spread`,
@@ -198,9 +217,11 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
   decoded, then carry the slot name. BeiDou B1I: pocket_trk's channel PRNs are unreliable (its C38 carried C43's
   orbit) - `BeidouNames` names each by its decoded orbit vs the nearest catalog satellite (≤300 km), holding lines
   until then. A steady spur at ~1560.33 MHz sits near B1I.
-- Galileo is tracked but its orbits rarely decode at 33-36 dB-Hz; a second system needs ≥2 of its satellites with
-  orbits (own clock offset), so in practice fixes are GPS-only. GLONASS/BeiDou can't be received with GPS (the SDR
-  sees ~2 MHz).
+- Galileo: with pocket_trk's default DLL bandwidth 98 % of E1B locks died within 20 s (the orbit needs ~30 s of
+  unbroken frames), so its orbits rarely decoded; `b_dll = 0.5` in `pocket_trk.opt` held them in replay (live
+  confirmation pending). A second system still needs ≥2 of its satellites with orbits in spp.py (own clock offset),
+  so fixes are GPS-only until the solver's static mode (week 2: height prior, lone Galileo on the GPS clock) lands.
+  GLONASS/BeiDou can't be received with GPS (the SDR sees ~2 MHz).
 - **Own solver `spp.py`** (GSPP lines, GPS band only): pocket_trk `$OBS` (P, L, D, C/N0) → broadcast orbit/clock, TGD,
   Sagnac, Saastamoinen troposphere, ionosphere from the WAAS grid (MT18/26, pierce point 350 km, 5° grid, all 4
   corners needed) else Klobuchar (decoded from GPS subframe 4 page 18) → weighted LSQ (one clock per system, elevation
@@ -286,8 +307,6 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
 `pocket_trk.opt`.
 
 ## Known issues / stale text (fix when touching nearby)
-- `gnss_rx.Lines.line` `$POS` branch checks `len(f) > 11` but reads `f[12]` (IndexError in the reader thread on a
-  12-field line; only ValueError is caught).
 - The tracker's storage protection (`_housekeeping`, `show_settings` in iridium_tracker.py) hard-codes the Iridium
   prefix (`'output-%s' % self.receiver.stamp`) - a running non-Iridium capture isn't protected; use `receiver.capname`.
 - Messages still say "run 2-decode.bat" (iridium_tracker.py, receiver.py); the iridium_tracker docstring mentions
@@ -301,6 +320,10 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
   `IridiumTracker.zip` (make_package writes `SatelliteTracker.zip`).
 
 ## History (main milestones, newest first)
+- week1-gnss (2026-11-06, after the GNSS review in `build\_tmp\review-20261106\GNSS-review.md`): sample-gap
+  zero-fill + GGAP, pocket_trk watchdog restart + GLOG, `pocket_trk.opt` shipped (lost_th 10, b_dll 0.5),
+  pocket_trk files beside the capture, fix-status line and state-change events in the position panel, tracked gate,
+  catalog lock + per-line/per-capture guards, Integrity stream-gap classification + hysteresis
 - 7e3bdec warm start, per-capture catalog + session stats, reference points, GPX, sea-level heights, Garmin import
 - 5245d3b position line: average uncertainty + all-sessions figure
 - b3be6ea solver settle 30 s (found with the Garmin side by side); Garmin USB reader

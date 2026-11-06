@@ -185,8 +185,27 @@ running at least 10-15 minutes.
     It then goes on the map and globe at its real height (about 20,200 km) with a full orbit,
     and the summary box counts it under "with broadcast orbit".
   - With 4 or more broadcast orbits the receiver works out where YOU are: the log shows
-    "GNSS FIX lat, lon, height (N satellites)". It should land near the location you set
-    (within a kilometre or so) - a good check of the whole chain.
+    "FIX  pocket_trk: N satellites" (and "FIX  own solver: ..." once our own solver has settled;
+    see WAAS-CORRECTED POSITION), then only changes - "FIX LOST ... 4 GPS tracked, HDOP 6.6 > 6",
+    "LOST  GPS G24 after 25 min". It should land near the location you set (within a kilometre
+    or so) - a good check of the whole chain. The position panel's second line says what the
+    solver is doing right now ("Own solver: no fix - 3 GPS (needs 4): G10 G23 G32; pocket_trk
+    fixing with 4 GPS + 1 Galileo"), so an outage explains itself.
+  - A satellite counts as tracked after 5 seconds at 25 dB-Hz or more (or as soon as its orbit
+    arrives); one-second false locks no longer make rows, events or the new-satellite sound.
+  - Sample-stream gaps: the SDR's USB link loses 100-140 ms of samples a few times a day. The
+    receiver fills them with zeros so the satellites stay locked and writes "STREAM GAP 110 ms of
+    samples lost (USB) - filled" in the log; if a gap still gets past it (pocket_trk then rejects
+    every range as out of range and would never fix again) pocket_trk is restarted within half a
+    minute ("RESTART pocket_trk lost its clock after a gap"). Before this, one such gap ended
+    the positioning for the rest of a run while the satellites still looked locked. The gaps are
+    counted in the capture's .log; if you see many, try another USB port (a USB 2.0 port on
+    another root hub), unplug other USB storage (a Garmin in drive mode), or turn off USB
+    selective suspend in the Windows power plan.
+  - pocket_trk's own log and RTCM output of each run are kept beside the capture
+    (<capture>.trk1.log / .trk1.rtcm: the raw ranges, carrier phases, navigation bits and events)
+    and trimmed with the capture under the storage limits - the complete record of a session for
+    later analysis.
 A broadcast orbit is accurate to a few metres for about 4 hours and slowly gets less certain
 after that; the next run refreshes it (each satellite sends a fresh one every couple of hours).
 BeiDou is not received (PocketSDR decodes no BeiDou orbit at this frequency, and searching its
@@ -461,6 +480,12 @@ pocket_trk's raw measurements, in two steps pocket_trk doesn't take:
 WAAS doesn't give a position by itself; it corrects the GPS satellites. Its fixes (GSPP lines,
 kept in the catalog) are used by the 'Your position' line and 'Use GPS-tracked position' when
 there are enough; the line then says 'WAAS-corrected' and shows pocket_trk's own figure next to it.
+When the own solver has had no fix for a minute the headline goes grey and says why ("No fix for
+17 min - 3 GPS (needs 4): G10 G23 G32"); pocket_trk's figures are then labelled as its own, not
+as "Your position". 'Use GPS-tracked position' takes only settled WAAS-corrected fixes with 4 or
+more satellites from the last 10 minutes (at least 30 of them; pocket_trk's fixes with 5 or more
+satellites only when there are none) and its tooltip says how good that average is - the first
+quick fixes can be 10-30 m off and are no longer averaged in.
 Measured on 8 recorded sessions here: 95 % within 3-10 m (pocket_trk 11-30 m), half within
 1-4 m (pocket_trk 4-9 m), and the sessions' middle positions agree with each other to 1.4 m rms
 horizontally and 5 m in height (pocket_trk 2.4 m and 8.5 m). Each satellite is left to settle
@@ -484,9 +509,14 @@ position between uses; its data is many small standard files):
   - Start-up history: the tooltip shows this session's first fixes and the median of the last ten.
   - Searching only for the satellites that are up (gnss_rx.py --narrow-search) is there but off:
     on a recording it locked fewer satellites, as pocket_trk already searches all in parallel.
-  - pocket_trk's own settings: a data\pocket_trk.opt file (lines like 'thres_cn0_l = 33') is
-    passed to it. Tested on a recording: lowering its lock thresholds finds weak satellites but
-    can't hold them, so the defaults stay; a better view of the sky added them for real.
+  - pocket_trk's own settings: data\pocket_trk.opt (lines like 'lost_th = 10', '#' for comments)
+    is passed to it, and the command and settings used are written into the capture's .log. The
+    file ships with two values measured on recordings: 'lost_th = 10' - by default pocket_trk
+    dropped half of the satellites it found at 34-36 dB-Hz after exactly 2 seconds, because its
+    phase loop got one second to lock after the frequency pull-in; and 'b_dll = 0.5' - its
+    default code-loop bandwidth lost every Galileo E1B satellite after about 10 seconds, which is
+    why Galileo orbits rarely decoded. Lowering the acquisition threshold ('thres_cn0_l') alone
+    finds weak satellites but locks noise below 33, so it stays at 34.
   - Catalog: one file per capture in data\catalog (plus index.json) instead of one big file - a
     bad write costs at most one capture, and a save rewrites only what changed. The old
     catalog-data.json is read once and left in place. Each GNSS capture also keeps its session
@@ -526,7 +556,14 @@ Jamming checks:
     baseline): a carrier or swept jammer. Watch 5 dB, alert 12 dB.
   - Overload (samples clipped), signal strength (every satellite's C/N0 falling together) and
     satellites lost at once. A C/N0 drop without more noise is reported as a watch: something
-    blocking the antenna.
+    blocking the antenna - unless it is a stream gap: when the SDR's USB link lost samples
+    (the receiver reports it, or every satellite dropped out together and came back at its old
+    strength within seconds) the event is marked 'stream gap (SDR/USB) - not RF', the summary
+    says so, and the raw samples are kept for the first gap of a session only. The jamming
+    card counts the session's gaps ("3 stream gaps this session, last 110 ms at 12:20").
+  - A check's level is held once raised until its value has dropped a little below the line
+    (1 dB, or 20 %) for the clearing time, so a signal sitting on a threshold no longer flips
+    between watch and alert every minute.
 Spoofing checks:
   - Position vs home and position drift: the receiver's own fix against Settings > location, and
     how far it moved during the session (measured here: within ~15-25 m normally).
@@ -542,11 +579,13 @@ Event snapshots: whenever a check rises to watch or alert, everything around it 
 own folder, data\integrity\<date-time>-<check>\ (the 'Snapshots' button opens it; double-click
 the 'Snapshot saved' line in the event list to view one):
   - event.json: when (local time, weekday), the band and the receiver's settings, the checks and
-    satellites at the start and end, which checks rose and how far, and a summary - how long it
-    lasted, how the noise rose and fell (a gradual rise and fall is like a jammer in a passing
-    vehicle; an abrupt start, something switched on nearby), what kind of signal (narrowband,
-    swept, broadband) and which part of the band, each satellite's C/N0 before and at its
-    lowest and who was lost, the position and GPS time during it.
+    satellites at the start and end, which checks rose and how far, and a summary - when it
+    really began (worked out from the data, not the check's hold-off), its kind (stream gap,
+    interference, signal drop), how long it lasted, how the noise rose and fell (a gradual rise
+    and fall is like a jammer in a passing vehicle; an abrupt start, something switched on
+    nearby), what kind of signal (narrowband, swept, broadband) and which part of the band, each
+    satellite's C/N0 before and at its lowest, who was lost and how soon it came back, the
+    position and GPS time during it.
   - lines.txt: every line the receiver sent from 2 minutes before until 90 s after the last
     check cleared (up to 15 minutes): satellites, fixes, noise, the band's spectrum each second.
   - waterfall.png: the band over the event.

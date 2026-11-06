@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import time
+import traceback
 
 import numpy as np
 
@@ -54,6 +55,12 @@ LEGACY = os.path.join(paths.DATA, 'catalog-data.json')                # the old 
 PREVIOUS = os.path.join(paths.DATA, 'catalog-data.previous.json')     # ...and its last good copy
 REPORT = os.path.join(paths.DATA, 'catalog.txt')
 SETTINGS = os.path.join(paths.DATA, 'settings.json')
+# one catalog run at a time: the tracker's Stop, the console's Stop and a --redo by hand can all start one, and two
+# runs saving at once used to delete each other's new entries. The lock holds the PID of the run that owns it.
+LOCK = os.path.join(CAT_DIR, '.lock')
+LOCK_WAIT_S = 60
+# the capture names the index listed when this process loaded the catalog - the only files save_data may delete
+_LOADED = set()
 
 
 def load_home():
@@ -453,11 +460,13 @@ def gnss_catalog_names():
 def read_gnss(lines):
     """GNSS receiver lines -> [(kind, unix t, fields)]
        GCH: t sat sig cn0 doppler_hz lock_s    GEPH: t sat <$EPH fields>    GPOS: t lat lon height nsat
-       GSPP: t lat lon height nsat hdop ...    (our own WAAS-corrected, carrier-smoothed fix: spp.py)"""
+       GSPP: t lat lon height nsat hdop ...    (our own WAAS-corrected, carrier-smoothed fix: spp.py)
+       GGAP: t gap_ms source                   (a hole in the sample stream the receiver zero-filled: usb, queue)
+       GLOG: t EVENT [sat] [values...]         (receiver events: FOUND LOST FALSELOCK EPOCH RESTART START)"""
     out = []
     for line in lines:
         f = line.split(None, 3)
-        if len(f) < 3 or f[0] not in ('GCH:', 'GEPH:', 'GPOS:', 'GSPP:'):
+        if len(f) < 3 or f[0] not in ('GCH:', 'GEPH:', 'GPOS:', 'GSPP:', 'GGAP:', 'GLOG:'):
             continue
         try:
             out.append((f[0][:-1], float(f[1]), line.split()[2:]))
@@ -484,20 +493,35 @@ def analyze_gnss(stem):
            'counts': meta.get('counts', dict(collections.Counter(k for k, _, _ in rows))),
            'slots': [], 'positions': [], 'passes': [], 'ephemerides': {}, 'gnss_fixes': []}
     by_sat = collections.defaultdict(list)
+    bad = restarts = 0
+    gaps = []
     for kind, t, f in rows:
-        if kind == 'GCH' and len(f) >= 4:
-            by_sat[f[0]].append((t, GNSS_L1 + float(f[3]), float(f[2])))
-        elif kind == 'GEPH' and len(f) >= 2:
-            cap['ephemerides'][f[0]] = [round(t, 3), ' '.join(f[1:])]
-        elif kind == 'GPOS' and len(f) >= 4:
-            cap['gnss_fixes'].append({'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
-                                      'nsat': int(f[3])})
-        elif kind == 'GSPP' and len(f) >= 5:
-            fx = {'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
-                  'nsat': int(f[3]), 'hdop': float(f[4])}
-            if len(f) >= 9 and int(f[8]) < 4:
-                fx['quick'] = True      # (a quick fix before carrier smoothing settled)
-            cap.setdefault('gnss_spp', []).append(fx)
+        try:        # one line cut short by a crash (a field missing or half written) must not lose the capture
+            if kind == 'GCH' and len(f) >= 4:
+                by_sat[f[0]].append((t, GNSS_L1 + float(f[3]), float(f[2])))
+            elif kind == 'GEPH' and len(f) >= 2:
+                cap['ephemerides'][f[0]] = [round(t, 3), ' '.join(f[1:])]
+            elif kind == 'GPOS' and len(f) >= 4:
+                cap['gnss_fixes'].append({'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]),
+                                          'height_m': float(f[2]), 'nsat': int(f[3])})
+            elif kind == 'GSPP' and len(f) >= 5:
+                fx = {'t': round(t, 3), 'lat': float(f[0]), 'lon': float(f[1]), 'height_m': float(f[2]),
+                      'nsat': int(f[3]), 'hdop': float(f[4])}
+                if len(f) >= 9 and int(f[8]) < 4:
+                    fx['quick'] = True      # (a quick fix before carrier smoothing settled)
+                cap.setdefault('gnss_spp', []).append(fx)
+            elif kind == 'GGAP' and len(f) >= 1:
+                gaps.append([round(t, 3), float(f[0])])
+            elif kind == 'GLOG' and len(f) >= 1 and f[0] == 'RESTART':
+                restarts += 1
+        except (ValueError, IndexError):
+            bad += 1
+    if bad:
+        cap['counts']['bad'] = bad
+    if gaps:
+        cap['gaps'] = gaps
+    if restarts:
+        cap['restarts'] = restarts
     cap['_cn0'] = [h[2] for v in by_sat.values() for h in v]
     for sat, hits in sorted(by_sat.items()):
         hits.sort()
@@ -512,7 +536,12 @@ def analyze_gnss(stem):
             cap['passes'].append({'name': gnss_name(sat), 'sat': sat, 'first': iso(g[0][0]), 'last': iso(g[-1][0]),
                                   'frames': len(g), 'best_snr': max(h[2] for h in g),
                                   'doppler': [[round(h[0], 3), round(h[1], 1)] for h in g]})
-    cap['session'] = session_stats(cap, cap.pop('_cn0'))
+    cn0 = cap.pop('_cn0')
+    try:
+        cap['session'] = session_stats(cap, cn0)
+    except Exception as e:      # the statistics are a summary; losing them must not lose the capture
+        cap['session'], cap['session_error'] = None, str(e)
+        print('%s: session statistics failed (%s)' % (cap['capture'], e))
     return cap
 
 
@@ -531,6 +560,10 @@ def session_stats(cap, cn0=None):
          'satellites': len({p['sat'] for p in cap.get('passes', [])})}
     if cn0:
         s['cn0_median'] = round(float(np.median(cn0)), 1)
+    if cap.get('gaps'):             # holes in the sample stream (dropped USB buffers) and receiver restarts
+        s['gaps'] = len(cap['gaps'])
+    if cap.get('restarts'):
+        s['restarts'] = cap['restarts']
     for key, pts in (('pocket', fx), ('waas', good)):
         q = posquality.quality(pts, home=HOME) if pts else None
         if q and q.get('enough'):
@@ -731,18 +764,83 @@ def _cap_file(name):
     return os.path.join(CAT_DIR, name + '.json')
 
 
+def _alive(pid):
+    """is a process with this ID still running? (the same check receiver.py makes on a capture's .running marker)"""
+    if os.name != 'nt':
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+    h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        return bool(ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
+    finally:
+        ctypes.windll.kernel32.CloseHandle(h)
+
+
+def _lock_owner():
+    """PID written in the lock file, or 0 if it can't be read"""
+    try:
+        return int(open(LOCK).read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def acquire_lock(wait_s=LOCK_WAIT_S):
+    """take the run lock: True when this process owns it. Another live run keeps us waiting (polling every 2 s, up
+    to wait_s); a lock left by a run that died (its PID is gone) is removed. Creating the file with O_EXCL is what
+    makes the hand-over safe: of two runs trying at the same moment only one succeeds"""
+    os.makedirs(CAT_DIR, exist_ok=True)
+    deadline = time.time() + wait_s
+    told = False
+    while True:
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            pid = _lock_owner()
+            if pid and _alive(pid) and pid != os.getpid():
+                if time.time() >= deadline:
+                    return False
+                if not told:
+                    print('another catalog run (PID %d) is busy - waiting for it' % pid)
+                    told = True
+                time.sleep(2)
+                continue
+            try:                # stale (its run is gone, or the file is unreadable): clear it and try again
+                if _lock_owner() == pid:        # (unless a fresh run took it in the meantime)
+                    os.remove(LOCK)
+            except OSError:
+                pass
+            time.sleep(0.1)
+            continue
+        with os.fdopen(fd, 'w') as f:
+            f.write('%d %s\n' % (os.getpid(), time.strftime('%Y-%m-%d %H:%M:%S')))
+        return True
+
+
+def release_lock():
+    if _lock_owner() == os.getpid():
+        try:
+            os.remove(LOCK)
+        except OSError:
+            pass
+
+
 def load_data():
     """every capture's results: one file each in data\\catalog (the index lists them). Before the first save in this
     layout, the old single catalog-data.json. A capture file that can't be read is left out (with a message) - the
     rest load; it is analysed again from its capture files at the next catalog run if they are still there."""
     if not os.path.exists(DATA):
-        return _load_legacy()
-    try:
-        with open(DATA) as f:
-            names = json.load(f)['captures']
-    except (OSError, ValueError, KeyError):
-        names = [os.path.basename(p)[:-5] for p in glob.glob(os.path.join(CAT_DIR, '*.json'))
-                 if os.path.basename(p) != 'index.json']
+        data = _load_legacy()
+        _LOADED.clear()
+        _LOADED.update(data)
+        return data
+    names = _index_names()
     data = {}
     for name in names:
         try:
@@ -750,7 +848,19 @@ def load_data():
                 data[name] = json.load(f)
         except (OSError, ValueError) as e:
             print('catalog: %s could not be read (%s)' % (name, e))
+    _LOADED.clear()
+    _LOADED.update(data)
     return data
+
+
+def _index_names():
+    """the capture names index.json lists now (the folder's files if the index can't be read)"""
+    try:
+        with open(DATA) as f:
+            return list(json.load(f)['captures'])
+    except (OSError, ValueError, KeyError, TypeError):
+        return [os.path.basename(p)[:-5] for p in glob.glob(os.path.join(CAT_DIR, '*.json'))
+                if os.path.basename(p) != 'index.json']
 
 
 def _write_atomic(path, obj):
@@ -765,7 +875,9 @@ def _write_atomic(path, obj):
 def save_data(data):
     """one small file per capture, each written to a temporary file and swapped in, only when it changed; then the
     index. An interrupted save can at most leave one capture's previous version (never a cut-off catalog), and a
-    save rewrites only what is new instead of the whole history"""
+    save rewrites only what is new instead of the whole history.
+    Only captures this process loaded and then dropped are deleted - never "every file not in the dict": a second
+    run that finished in between may have written entries we never saw, and the index written here keeps them"""
     os.makedirs(CAT_DIR, exist_ok=True)
     for name, cap in data.items():
         text = json.dumps(cap, separators=(',', ':'))
@@ -777,16 +889,54 @@ def save_data(data):
         except OSError:
             pass
         _write_atomic(path, cap)
-    for p in glob.glob(os.path.join(CAT_DIR, '*.json')):     # captures no longer in the catalog
-        name = os.path.basename(p)[:-5]
-        if name != 'index' and name not in data:
-            os.remove(p)
-    _write_atomic(DATA, {'captures': sorted(data), 'saved': time.time()})
+    dropped = _LOADED - set(data)           # captures the caller removed from the catalog
+    for name in dropped:
+        try:
+            os.remove(_cap_file(name))
+        except OSError:
+            pass
+    others = {n for n in _index_names() if n not in dropped and os.path.exists(_cap_file(n))} if os.path.exists(DATA) else set()
+    _write_atomic(DATA, {'captures': sorted(set(data) | others), 'saved': time.time()})
+    _LOADED.clear()
+    _LOADED.update(data)
+
+
+def log_error(what, exc):
+    """a traceback into the tracker's error log (this program's own stderr is thrown away when the tracker runs it)"""
+    text = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    try:
+        with open(paths.ERROR_LOG, 'a') as f:
+            f.write('%s  catalog: %s\n%s\n' % (time.ctime(), what, text))
+    except OSError:
+        pass
+
+
+def error_stub(name, stem, exc):
+    """what the catalog keeps for a capture whose analysis failed: every key the tracker reads, no frames (so it
+    is skipped like an empty run), and the error. --redo analyses it again; its raw files are kept meanwhile"""
+    try:
+        start, how = capture_start(stem)
+        start_utc = start.isoformat(timespec='seconds')
+    except Exception:
+        start_utc, how = None, None
+    return {'capture': name, 'system': systems.of_capture(name)['key'], 'start_utc': start_utc, 'clock': how,
+            'hours': 0, 'counts': {}, 'slots': [], 'positions': [], 'passes': [], 'ephemerides': {}, 'gnss_fixes': [],
+            'error': str(exc) or type(exc).__name__}
 
 
 def main():
     if HOME is None:
         sys.exit('No antenna location yet - start the tracker once and enter it (it is saved in settings.json).')
+    if not acquire_lock():
+        sys.exit('another catalog run (PID %d) has been busy for over %d s - giving up; the next run catches up'
+                 % (_lock_owner(), LOCK_WAIT_S))
+    try:
+        _main()
+    finally:
+        release_lock()
+
+
+def _main():
     redo = '--redo' in sys.argv
     ready = {a[8:] for a in sys.argv if a.startswith('--ready=')}   # captures known to be finished
     data = load_data()      # (with --redo, captures whose files are gone keep their old results)
@@ -814,31 +964,37 @@ def main():
             continue
         print('analyzing %s ...' % name)
         key = systems.of_capture(name)['key']
-        if systems.get(key).get('system') == 'ham':
-            load_tles(key)                  # refresh the name list
-            cap = analyze_ham(stem, norad_names())
-        elif systems.get(key).get('system') == 'gnss':
-            load_tles(key)
-            cap = analyze_gnss(stem)
-        else:
-            if sats[key] is None:
-                sats[key] = load_tles(key)
-            cap = analyze_orbcomm(stem, sats[key]) if key == 'orbcomm' else analyze(stem, sats[key])
-        if not src.endswith(storage.REDUCED):
-            storage.write_reduced(stem, src, cap['counts'], cap['hours'])
+        try:        # one capture that can't be analysed must not stop the rest (or the save) - it used to
+            if systems.get(key).get('system') == 'ham':
+                load_tles(key)                  # refresh the name list
+                cap = analyze_ham(stem, norad_names())
+            elif systems.get(key).get('system') == 'gnss':
+                cap = analyze_gnss(stem)        # (named from the satellite codes: no name list needed)
+            else:
+                if sats[key] is None:
+                    sats[key] = load_tles(key)
+                cap = analyze_orbcomm(stem, sats[key]) if key == 'orbcomm' else analyze(stem, sats[key])
+            if not src.endswith(storage.REDUCED):
+                storage.write_reduced(stem, src, cap['counts'], cap['hours'])
+        except Exception as e:
+            log_error('analysing %s' % name, e)
+            print('%s could not be analysed (%s: %s) - kept for a later --redo; details in %s'
+                  % (name, type(e).__name__, e, os.path.basename(paths.ERROR_LOG)))
+            cap = error_stub(name, stem, e)
         data[name] = cap
     # session statistics for GNSS captures analysed before they existed (from what the catalog holds)
     for name, cap in data.items():
-        if cap.get('system') == 'gnss1' and 'session' not in cap and cap.get('start_utc'):
+        if cap.get('system') == 'gnss1' and 'session' not in cap and cap.get('start_utc') and not cap.get('error'):
             try:
                 cap['session'] = session_stats(cap)
-            except (ValueError, KeyError, TypeError):
-                pass
+            except Exception as e:
+                log_error('session statistics of %s' % name, e)
     save_data(data)
     caps = [c for _, c in sorted(data.items()) if sum(c['counts'].values()) and c.get('system', 'iridium') == 'iridium']
     open(REPORT, 'w').write(build_report(caps))     # the text report covers Iridium
     print('catalog written to %s' % REPORT)
-    n, freed = storage.enforce(set(data), protect=recording)
+    # (a capture whose analysis failed keeps its raw files: they are all it has until a --redo succeeds)
+    n, freed = storage.enforce({n for n, c in data.items() if not c.get('error')}, protect=recording)
     if n:
         print('deleted %d raw capture files (%s) - see storage settings' % (n, storage.fmt_bytes(freed)))
 
