@@ -37,6 +37,8 @@ DEFAULTS = {
     'gnss1_auto_gain': False,
     'glo1_gain': 40.0,
     'glo1_auto_gain': False,
+    'bds1_gain': 40.0,
+    'bds1_auto_gain': False,
     'meteor_gain': 40.0,        # Meteor-M pictures (a whip: its signal is weak, low in the noise)
     'meteor_auto_gain': False,
     'radio_gain': 30.0,         # Radio (any frequency): strong broadcast stations overload higher gains
@@ -50,6 +52,7 @@ DEFAULTS = {
     'ham70_if_gain': 60.0,
     'gnss1_if_gain': 60.0,
     'glo1_if_gain': 60.0,
+    'bds1_if_gain': 60.0,
     'meteor_if_gain': 50.0,     # (at 137 MHz with gain 40, IF 60 gave a lower level than 50)
     'radio_if_gain': 60.0,
 }

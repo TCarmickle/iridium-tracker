@@ -213,6 +213,7 @@ class Receiver(QtCore.QObject):
         g, auto = sdr_settings.gain(s)
         prog = ([ORBCOMM_RX] if self.system is systems.ORBCOMM else [GNSS_RX] if self.system is systems.GNSS_BAND
                 else [GNSS_RX, '--constellation', 'glonass'] if self.system is systems.GLONASS_BAND
+                else [GNSS_RX, '--constellation', 'beidou'] if self.system is systems.BEIDOU_BAND
                 else [METEOR_RX, '--baseband', self.bits_path[:-5] + '.s16'] if self.system is systems.METEOR
                 else [RADIO_RX] if self.system is systems.RADIO
                 else [HAM_RX, '--band', self.system['key']])

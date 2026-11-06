@@ -300,7 +300,8 @@ class SourceDialog(QtWidgets.QDialog):
                     'ham2m': 'the 2 m satellite subband (145.8 - 146.0 MHz), with the ISS',
                     'ham70': 'most of the 70 cm satellite subband (435 - 438 MHz)',
                     'gnss1': 'GPS L1, Galileo E1 and WAAS (1575.42 MHz)',
-                    'glo1': 'GLONASS L1, frequency channels -2..+2'}.get(v['system'], '')
+                    'glo1': 'GLONASS L1, frequency channels -2..+2',
+                    'bds1': 'BeiDou B1I (1561.098 MHz): every BeiDou satellite'}.get(v['system'], '')
             self.coverage.setText('Receives %.3f - %.3f MHz at %.4f MS/s: %s'
                                   % (c - half, c + half, sdr.sample_rate(v) / 1e6, what))
             return

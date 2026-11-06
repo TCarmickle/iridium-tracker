@@ -208,6 +208,13 @@ receivers do; it agrees with the public catalog to tens of km over hours. Your a
 cover 1602 MHz - most GPS pucks do. GLONASS can't be received at the same time as GPS: one SDR
 hears one band at a time.
 
+BeiDou (its own band - "GNSS B1I (BeiDou)"): China's navigation satellites on 1561.098 MHz, the
+same GPS antenna. Every BeiDou satellite sends B1I with its broadcast orbit, so they get orbits
+like GPS (checked: within ~20 km of the public catalog). The decoder's channel number is not
+always the satellite's real number, so each one is named by where its own decoded orbit puts it
+(the nearest satellite in the public list, names only); its tracking appears once its orbit has
+been decoded, usually within a minute or two.
+
 Offset tuning (Source, on by default for the E4000 tuner) keeps the SDR's own spike at the
 centre frequency off the signal. If nothing is tracked after 10 minutes: check the antenna has
 sky, Bias-T is on, and try a higher gain in Source.

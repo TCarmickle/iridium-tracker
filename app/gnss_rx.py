@@ -84,11 +84,13 @@ ap.add_argument('--parent-pid', type=int, default=0)   # stop when the tracker t
 ap.add_argument('--chunk-s', type=float, default=CHUNK_S)
 ap.add_argument('--keep-chunks', default='')    # for tests: keep the recorded chunks in this folder
 ap.add_argument('--mode', choices=('live', 'chunks'), default='live')
-ap.add_argument('--constellation', choices=('gps', 'glonass'), default='gps')   # gps = GPS + Galileo + WAAS
+ap.add_argument('--constellation', choices=('gps', 'glonass', 'beidou'), default='gps')   # gps = GPS + Galileo + WAAS
 opts = ap.parse_args()
 if opts.constellation == 'glonass':     # every frequency channel (the SDR's slice holds the middle ones);
     # pocket_trk needs the tuning (-fo) to place each channel
     SIGNALS = ['-sig', 'G1CA', '-prn', ','.join(str(k) for k in range(-7, 7)), '-fo', '%.6f' % (opts.center / 1e6)]
+elif opts.constellation == 'beidou':    # B1I at 1561.098 MHz: every BeiDou satellite (PRN 1-63)
+    SIGNALS = ['-sig', 'B1I', '-prn', '1-63', '-fo', '%.6f' % (opts.center / 1e6)]
 
 
 def log(text):
@@ -212,6 +214,65 @@ def track(path, t0, rate):
     return lines, ephs
 
 
+class BeidouNames:
+    """pocket_trk's B1I channel number is not always the satellite's PRN: on live data its 'C38' carried an orbit
+    that was the satellite the public catalog lists as C43 (to 11 km; the real C38 was below the horizon), and its
+    'C13' had C49's Doppler. So each BeiDou satellite is named by its own decoded orbit: the public catalog
+    satellite (names only) within 300 km of where its ephemeris puts it. Its tracking lines wait for that (up to
+    WAIT_S; without an orbit by then they go out under the channel's number)."""
+    WAIT_S = 300.0
+
+    def __init__(self):
+        self.alias = {}             # channel 'C38' -> the satellite 'C43'
+        self.waiting = {}           # channel -> [first seen, [lines held back]]
+        self.sats = []
+        try:
+            import catalog
+            lines = open(catalog.tle_file('gnss')).read().splitlines()
+            self.sats = [catalog.Sat(lines[i].strip(), lines[i + 1], lines[i + 2]) for i in range(len(lines) - 2)
+                         if lines[i].startswith('BEIDOU') and lines[i + 1].startswith('1 ') and '(C' in lines[i]]
+            self.match = catalog.match_ecef
+        except Exception as e:
+            log('BeiDou: no name list (%s) - satellites go by their channel numbers' % e)
+
+    def identify(self, chan, fields, t):
+        """a channel's decoded ephemeris: which satellite it is"""
+        if chan in self.alias or not self.sats:
+            return self.alias.get(chan, chan)
+        try:
+            eph = gnss.finish_eph(dict(fields), 'C', int(chan[1:]), 'B1I')
+            pos = gnss.sat_ecef(eph, t)[0]
+            name, km = self.match(self.sats, datetime.datetime.fromtimestamp(t, datetime.timezone.utc), pos)
+        except Exception as e:
+            log('BeiDou: could not check %s (%s)' % (chan, e))
+            name, km = None, None
+        sat = 'C%02d' % int(name[name.rindex('(C') + 2:].rstrip(')').strip()) if name else chan
+        self.alias[chan] = sat
+        if sat != chan:
+            log('BeiDou: channel %s is satellite %s (%s, its orbit %.0f km from the catalog\'s)' % (chan, sat, name, km))
+        elif name is None:
+            log('BeiDou: %s - no catalog satellite near its orbit (%s km); keeping its channel number'
+                % (chan, '%.0f' % km if km is not None else '?'))
+        return sat
+
+    def hold(self, chan, line):
+        """True if this channel's line must wait for its identity (kept to send later)"""
+        if chan in self.alias or not self.sats:
+            return False
+        w = self.waiting.setdefault(chan, [time.time(), []])
+        if time.time() - w[0] > self.WAIT_S:
+            self.alias[chan] = chan
+            self.release(chan)
+            return False
+        w[1].append(line)
+        return True
+
+    def release(self, chan):
+        sat = self.alias.get(chan, chan)
+        for line in self.waiting.pop(chan, [None, []])[1]:
+            emit(line.replace(' %s ' % chan, ' %s ' % sat, 1))
+
+
 class Lines:
     """pocket_trk's log lines and decoded orbits -> this receiver's GCH / GEPH / GPOS lines"""
 
@@ -223,11 +284,16 @@ class Lines:
         self.sbas_types = {}    # WAAS message type -> how many decoded (for the status line)
         self.glo_slot = {}      # GLONASS frequency channel -> the satellite's slot ('R16')
         self.clock = False      # live mode: when() is the PC time a sample was taken, so fixes time the PC clock
+        self.bds = BeidouNames() if opts.constellation == 'beidou' else None
         self.offsets = collections.deque(maxlen=10)
         self.last_gtime = 0.0
 
     def orbits(self, ephs, t):
         for sat, sig, fields in ephs:      # in the field order of a $EPH line, so gnss.parse_eph reads it
+            if self.bds and sat.startswith('C'):
+                chan = sat
+                sat = self.bds.identify(chan, fields, t)
+                self.bds.release(chan)
             if fields.get('glo'):           # GLONASS: 'GLO,' + its position / velocity / acceleration at tb
                 text = same = 'GLO,' + ','.join(repr(float(fields[k])) for k in gnss.GLO_FIELDS)
             else:
@@ -252,6 +318,9 @@ class Lines:
                         sat = self.glo_slot[f[6]]
                     else:
                         return
+                chan = sat
+                if self.bds and sat.startswith('C'):    # BeiDou: by the satellite its orbit says it is
+                    sat = self.bds.alias.get(chan, chan)
                 if lock < 1.0 or rt - self.last_ch.get(sat, -9) < 1.0:
                     return
                 self.last_ch[sat] = rt
@@ -260,7 +329,9 @@ class Lines:
                 if len(f) > 25:     # sync flags and counters ($CH fields 12-15 and 23-25)
                     sync = ''.join(c if f[12 + k].strip() not in ('', '0') else '-' for k, c in enumerate('SBFR'))
                     extra = ' %s %d %d %d' % (sync, int(f[23]), int(f[24]), int(f[25]))
-                emit('GCH: %.3f %s %s %.1f %.1f %.1f%s' % (when(rt), sat, sig, cn0, fd, lock, extra))
+                text = 'GCH: %.3f %s %s %.1f %.1f %.1f%s' % (when(rt), sat, sig, cn0, fd, lock, extra)
+                if not (self.bds and chan.startswith('C') and self.bds.hold(chan, text)):
+                    emit(text)
             elif f[0] == '$NAV' and len(f) > 7 and f[2].startswith('S'):
                 self.sbas(f, when)
             elif f[0] == '$EPH' and len(f) > 4:

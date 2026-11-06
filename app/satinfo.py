@@ -105,6 +105,14 @@ GPS_BLOCKS = {
     'BIIF': 'Block IIF (launched 2010-2016, built by Boeing) - added the L5 signal',
     'BIII': 'GPS III (launched from 2018, built by Lockheed Martin) - adds the L1C signal shared with Galileo',
 }
+BEIDOU_FACTS = [
+    ('What it does', 'China\'s navigation system (BDS): like GPS it broadcasts its own time and orbit'),
+    ('Signal you receive', 'B1I at 1561.098 MHz, under the noise like GPS - found by correlating with this satellite\'s '
+                           'own code. Its broadcast orbit comes every 30 s (MEO / IGSO) or 6 s (GEO)'),
+    ('Constellation', 'BDS-3: 24 satellites in 3 planes at 21,500 km (55 degrees), plus 3 geostationary and 3 inclined '
+                      'geosynchronous (IGSO) satellites over Asia; some BDS-2 satellites still work'),
+    ('Operator', 'China Satellite Navigation Office'),
+]
 GLONASS_FACTS = [
     ('What it does', 'Russia\'s navigation system: like GPS it broadcasts its own time and orbit, and receivers use '
                      'both together'),
@@ -472,6 +480,8 @@ class SatInfoDialog(QtWidgets.QDialog):
                 return 'WAAS (SBAS), geostationary'
             if self.name.startswith('GLONASS'):
                 return 'GLONASS'
+            if self.name.startswith('BeiDou'):
+                return 'BeiDou'
             if self.name.startswith('Galileo'):
                 return 'Galileo'
             return 'GPS ' + GPS_BLOCKS.get(self._gps_block(), 'satellite').split(' (')[0]
@@ -517,6 +527,8 @@ class SatInfoDialog(QtWidgets.QDialog):
                 rows += WAAS_FACTS
             elif self.name.startswith('GLONASS'):
                 rows += GLONASS_FACTS
+            elif self.name.startswith('BeiDou'):
+                rows += BEIDOU_FACTS
             elif self.name.startswith('Galileo'):
                 rows += GALILEO_FACTS
             else:

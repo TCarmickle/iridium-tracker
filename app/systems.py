@@ -95,7 +95,7 @@ HAM70 = dict(_HAM_BAND, **{
 # noise; PocketSDR tracks them and decodes each satellite's own broadcast orbit (ephemeris)
 GNSS = {
     'key': 'gnss',
-    'label': 'GNSS (GPS / Galileo / GLONASS)',
+    'label': 'GNSS (GPS / Galileo / GLONASS / BeiDou)',
     'prefix': None,
     'short': '',
     'colour': (190, 130, 255),
@@ -138,6 +138,20 @@ GLONASS_BAND = dict(GNSS_BAND, **{
                'with open sky: outdoors or in a window',
     'listen_hz': 1602.0e6,
     'bands': [(1600.8, 1603.2, 'GLONASS L1 channels -2..+2 - under the noise', (190, 130, 255, 30))],
+})
+# BeiDou (China): B1I at 1561.098 MHz, 14 MHz below GPS, so its own band. Every BeiDou satellite (BDS-2 and BDS-3)
+# sends B1I, with its broadcast orbit; pocket_trk decodes both. (BDS-3's newer B1C shares GPS's 1575.42 MHz,
+# but pocket_trk decodes no orbit from it - tried first.)
+BEIDOU_BAND = dict(GNSS_BAND, **{
+    'key': 'bds1',
+    'label': 'GNSS B1I (BeiDou)',
+    'band_hz': (1560.07e6, 1562.12e6),
+    'rate': 2048000, 'center_hz': 1561098000,
+    'capture_prefix': 'bds-',
+    'antenna': 'the active GPS antenna (most cover 1559-1610 MHz, BeiDou B1I included), plugged straight into the '
+               'SDR, with open sky: outdoors or in a window',
+    'listen_hz': 1561.098e6,
+    'bands': [(1560.07, 1562.12, 'BeiDou B1I - under the noise', (190, 130, 255, 30))],
 })
 # Meteor-M (Russia's weather satellites): pictures of the Earth (LRPT, 137.9 MHz, backup 137.1 MHz).
 # The receiver records the pass (meteor_rx.py) and SatDump turns it into pictures afterwards (images.py);
@@ -222,7 +236,7 @@ RADIO_PLAN = [  # (lo, hi, name, row)
     (1670.0, 1710.0, 'weather satellites (HRPT, GOES)', 1), (1850.0, 1990.0, 'cell phones (PCS)', 1),
     (2400.0, 2483.5, 'Wi-Fi / Bluetooth', 1),
 ]
-ORDER = [IRIDIUM, ORBCOMM, HAM2M, HAM70, GNSS_BAND, GLONASS_BAND, METEOR, RADIO]   # what the receiver can listen to (one at a time)
+ORDER = [IRIDIUM, ORBCOMM, HAM2M, HAM70, GNSS_BAND, GLONASS_BAND, BEIDOU_BAND, METEOR, RADIO]   # what the receiver can listen to (one at a time)
 DISPLAY = [IRIDIUM, ORBCOMM, HAM, GNSS]               # what the map, list and Systems filter group satellites by
 SYSTEMS = {s['key']: s for s in ORDER + DISPLAY}
 DEFAULT = 'iridium'

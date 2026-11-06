@@ -223,12 +223,12 @@ def fmt_sigma(km):
 NO_SYSTEM = 'none'      # the Systems filter's "None": no satellites shown (where the app starts)
 # the Systems filter: categories, and the systems you can turn on and off under each
 CATEGORIES = [('comms', 'Communications', 'Comms', ('iridium', 'orbcomm')),
-              ('gnss', 'Navigation (GNSS)', 'Navigation', ('gps', 'galileo', 'glonass', 'waas')),
+              ('gnss', 'Navigation (GNSS)', 'Navigation', ('gps', 'galileo', 'glonass', 'beidou', 'waas')),
               ('ham', 'ISS and ham satellites', 'ISS / ham', ('ham',))]
 SUB_LABELS = {'iridium': 'Iridium', 'orbcomm': 'Orbcomm', 'gps': 'GPS', 'galileo': 'Galileo', 'glonass': 'GLONASS',
-              'waas': 'WAAS', 'ham': 'ISS & ham'}
+              'beidou': 'BeiDou', 'waas': 'WAAS', 'ham': 'ISS & ham'}
 SUB_CATEGORY = {sub: key for key, _, _, subs in CATEGORIES for sub in subs}
-GNSS_SUBS = {'GPS': 'gps', 'Galileo': 'galileo', 'GLONASS': 'glonass', 'WAAS': 'waas'}
+GNSS_SUBS = {'GPS': 'gps', 'Galileo': 'galileo', 'GLONASS': 'glonass', 'BeiDou': 'beidou', 'WAAS': 'waas'}
 
 
 def sub_of(name):
@@ -2804,7 +2804,9 @@ class Tracker(QtWidgets.QMainWindow):
                     'Galileo': (sum(1 for n in heard if n.startswith('Galileo')),
                                 sum(1 for x in tl if x.name.startswith('GSAT'))),
                     'GLONASS': (sum(1 for n in heard if n.startswith('GLONASS')),
-                                sum(1 for x in tl if x.name.startswith('COSMOS')))}
+                                sum(1 for x in tl if x.name.startswith('COSMOS'))),
+                    'BeiDou': (sum(1 for n in heard if n.startswith('BeiDou')),
+                               sum(1 for x in tl if x.name.startswith('BEIDOU')))}
         if key == 'ham':
             if self._ham_known is None:
                 import satellites
@@ -2834,12 +2836,12 @@ class Tracker(QtWidgets.QMainWindow):
             c = self._constellation('gnss')
             boxes = [(orbit, 'with broadcast orbit', 'their own orbit (ephemeris) decoded: on the map\n(%d GNSS '
                                                      'position fixes of your own so far)' % len(d.gnss_fixes)),
-                     ('%d/%d' % c['GPS'], 'GPS heard', 'GPS satellites tracked, of the %d in the public '
-                                                       'operational list' % c['GPS'][1]),
-                     ('%d/%d' % c['Galileo'], 'Galileo heard', 'Galileo satellites tracked, of the %d in the public '
-                                                               'list (a few of them are not in service)' % c['Galileo'][1]),
-                     ('%d/%d' % c['GLONASS'], 'GLONASS heard', 'GLONASS satellites tracked, of the %d in the public '
-                                                               'operational list' % c['GLONASS'][1])]
+                     ]
+            notes = {'Galileo': 'list (a few of them are not in service)'}
+            # three boxes for the constellations: the ones you have heard most (GPS, Galileo, GLONASS first on a tie)
+            for k in sorted(c, key=lambda k: -c[k][0])[:3]:
+                boxes.append(('%d/%d' % c[k], '%s heard' % k, '%s satellites tracked, of the %d in the public %s'
+                              % (k, c[k][1], notes.get(k, 'operational list'))))
         elif want == 'orbcomm':
             c = self._constellation('orbcomm')['Orbcomm']
             boxes = [('%d/%d' % c, 'satellites heard', 'Orbcomm satellites heard, of the %d in the public list '
@@ -2877,7 +2879,8 @@ class Tracker(QtWidgets.QMainWindow):
             return False
         if cap is not None and not name_or_system:
             band = systems.of_capture(cap)
-            subs = (('glonass',) if band['key'] == 'glo1' else ('gps', 'galileo', 'waas')) \
+            subs = (('glonass',) if band['key'] == 'glo1' else ('beidou',) if band['key'] == 'bds1'
+                    else ('gps', 'galileo', 'waas')) \
                 if band['system'] == 'gnss' else (band['system'],)
         elif name_or_system in systems.SYSTEMS:
             key = systems.SYSTEMS[name_or_system].get('system', name_or_system)

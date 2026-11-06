@@ -1,7 +1,8 @@
 """Reads the broadcast orbits (ephemerides) out of an RTCM 3 stream - what pocket_trk writes with -rtcm.
 
 pocket_trk keeps its ephemeris log lines ($EPH) switched off and has no option to switch them on, but it sends
-every ephemeris it decodes as RTCM 3 messages: 1019 (GPS) and 1045 / 1046 (Galileo F/NAV, I/NAV). This turns
+every ephemeris it decodes as RTCM 3 messages: 1019 (GPS), 1045 / 1046 (Galileo F/NAV, I/NAV), 1042 (BeiDou)
+and 1020 (GLONASS). This turns
 them back into the fields of a $EPH line (gnss.FIELDS), so gnss.py reads them the same way.
 Field layout: RTCM 10403.3, as written by RTKLIB's rtcm3e.c (which PocketSDR uses).
 """
@@ -108,6 +109,29 @@ def decode(payload, now=None):
         else:
             svh = (b.u(2) << 4) | (b.u(1) << 3)       # E5a health / validity
         sat, sig, week = 'E%02d' % prn, 'E1B' if msg == 1046 else 'E5A', week + 1024     # GST week -> GPS week
+    elif msg == 1042:                                # BeiDou (RTKLIB decode_type1042)
+        prn, week, sva = b.u(6), b.u(13), b.u(4)
+        idot = b.s(14) * 2 ** -43 * SC2RAD
+        iode, toc = b.u(5), b.u(17) * 8.0
+        af2, af1, af0 = b.s(11) * 2 ** -66, b.s(22) * 2 ** -50, b.s(24) * 2 ** -33
+        iodc = b.u(5)
+        crs, deln = b.s(18) * 2 ** -6, b.s(16) * 2 ** -43 * SC2RAD
+        M0 = b.s(32) * 2 ** -31 * SC2RAD
+        cuc, e, cus = b.s(18) * 2 ** -31, b.u(32) * 2 ** -33, b.s(18) * 2 ** -31
+        sqrtA, toes = b.u(32) * 2 ** -19, b.u(17) * 8.0
+        cic, OMG0 = b.s(18) * 2 ** -31, b.s(32) * 2 ** -31 * SC2RAD
+        cis, i0 = b.s(18) * 2 ** -31, b.s(32) * 2 ** -31 * SC2RAD
+        crc, omg = b.s(18) * 2 ** -6, b.s(32) * 2 ** -31 * SC2RAD
+        OMGd = b.s(24) * 2 ** -43 * SC2RAD
+        tgd = b.s(10) * 1e-10
+        b.s(10)                                      # second group delay
+        svh, flag, fit, code = b.u(1), 0, 0.0, 0
+        # BDT week (13 bits) -> GPS week; BeiDou time runs 14 s behind GPST
+        cur_bdt = int((now - GPS_EPOCH) // 604800) - 1356
+        week = cur_bdt - ((cur_bdt - week) % 8192) + 1356
+        sat, sig = 'C%02d' % prn, 'B1I'
+        toe_gpst, toc_gpst = _gpst(week, toes) + 14, _gpst(week, toc) + 14
+        return sat, sig, _fields(locals())
     elif msg == 1020:
         return decode_glonass(payload, now)
     else:
@@ -118,12 +142,17 @@ def decode(payload, now=None):
         toc_gpst -= 604800
     elif toe_gpst - toc_gpst > 302400:
         toc_gpst += 604800
-    fields = {'iode': iode, 'iodc': iodc, 'sva': sva, 'svh': svh, 'toe_gpst': int(toe_gpst), 'toc_gpst': int(toc_gpst),
-              'ttr_gpst': int(now + 18), 'A': sqrtA ** 2, 'e': e, 'i0': i0, 'OMG0': OMG0, 'omg': omg, 'M0': M0,
-              'deln': deln, 'OMGd': OMGd, 'idot': idot, 'crc': crc, 'crs': crs, 'cuc': cuc, 'cus': cus, 'cic': cic,
-              'cis': cis, 'toes': toes, 'fit': fit, 'af0': af0, 'af1': af1, 'af2': af2, 'tgd': tgd, 'code': code,
-              'flag': flag}
-    return sat, sig, fields
+    return sat, sig, _fields(locals())
+
+
+def _fields(v):
+    """the decoded values -> {gnss.FIELDS: value}"""
+    return {'iode': v['iode'], 'iodc': v['iodc'], 'sva': v['sva'], 'svh': v['svh'], 'toe_gpst': int(v['toe_gpst']),
+            'toc_gpst': int(v['toc_gpst']), 'ttr_gpst': int(v['now'] + 18), 'A': v['sqrtA'] ** 2, 'e': v['e'],
+            'i0': v['i0'], 'OMG0': v['OMG0'], 'omg': v['omg'], 'M0': v['M0'], 'deln': v['deln'], 'OMGd': v['OMGd'],
+            'idot': v['idot'], 'crc': v['crc'], 'crs': v['crs'], 'cuc': v['cuc'], 'cus': v['cus'], 'cic': v['cic'],
+            'cis': v['cis'], 'toes': v['toes'], 'fit': v['fit'], 'af0': v['af0'], 'af1': v['af1'], 'af2': v['af2'],
+            'tgd': v['tgd'], 'code': v['code'], 'flag': v['flag']}
 
 
 def ephemerides(buf, now=None):
