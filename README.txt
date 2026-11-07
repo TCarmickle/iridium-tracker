@@ -119,7 +119,9 @@ overhead, the edge is the horizon, north is up and east is right. Big dots are p
 (coloured by signal strength), small dots are other frames from identified satellites. Empty
 areas are directions or heights your antenna can't hear - a house or roof in the way, or the
 antenna's blind spot (a vertical whip hears little straight up). Move the antenna and watch the
-empty areas fill in; "Show" picks this run, the last hour, the last day or everything.
+empty areas fill in; "Heard in" picks this run (the default), the last hour, the last day or
+everything. Long GNSS sessions leave a dot a second per satellite, so at most 200 dots of each
+pass are drawn, and the plot only refreshes while it is on screen.
 
 
 SYSTEMS: IRIDIUM, ORBCOMM, ISS AND HAM SATELLITES

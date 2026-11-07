@@ -19,6 +19,7 @@ from PyQt5.QtCore import QPointF, Qt
 TEXT, MUTED, GRID = '#e6e9ef', '#8b93a1', '#2f3541'
 SNR_LO, SNR_HI = 12.0, 30.0
 SECTORS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+FRAME_CAP = 200         # at most this many 'heard' dots per pass (see sky_points)
 
 
 def snr_colour(snr):
@@ -47,7 +48,14 @@ def sky_points(data, from_home, since=0.0, shows=None):
         orbit = data.orbits.get(name)
         if orbit is None or not shows(name):
             continue
-        ts = np.array([t for g in groups for t, _ in g if t >= since], float)
+        # one dot every few seconds is all the picture needs: a GNSS pass has a point per second for hours (760 000
+        # points in the catalog after a few days), and propagating and painting every one froze the window for
+        # seconds at each refresh
+        ts = []
+        for g in groups:
+            step = max(1, len(g) // FRAME_CAP)
+            ts += [t for t, _ in g[::step] if t >= since]
+        ts = np.array(ts, float)
         if not len(ts):
             continue
         ok = orbit.sigma_km(ts) < 300           # only where our orbit for it is good
@@ -210,7 +218,7 @@ class SkyDialog(QtWidgets.QDialog):
         self.period = QtWidgets.QComboBox()
         for label, _ in self.PERIODS:
             self.period.addItem(label)
-        self.period.setCurrentIndex(3)
+        self.period.setCurrentIndex(0)          # this run: 'Everything' is a choice, not the default it was (slow)
         self.period.currentIndexChanged.connect(self.refresh)
         self.text = QtWidgets.QLabel()
         self.text.setWordWrap(True)
@@ -262,8 +270,18 @@ class SkyDialog(QtWidgets.QDialog):
         lay.addWidget(note)
         self.resize(900, 760)
         self.timer = QtCore.QTimer(self)
-        self.timer.timeout.connect(self.refresh)
+        self.timer.timeout.connect(self._tick)
         self.timer.start(5000)
+        self.refresh()
+
+    def _tick(self):
+        """the 5 s refresh - only while the sky is actually on screen (as a view or its own window): once opened,
+        it used to keep recomputing every 5 s behind the map, freezing the whole tracker each time"""
+        if self.isVisible():
+            self.refresh()
+
+    def showEvent(self, event):
+        super().showEvent(event)
         self.refresh()
 
     def refresh(self):
