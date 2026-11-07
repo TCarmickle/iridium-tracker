@@ -243,7 +243,8 @@ class Receiver(QtCore.QObject):
             opt = os.path.join(paths.DATA, 'pocket_trk.opt')
             if os.path.exists(opt):         # pocket_trk's own settings, if tuned (see README)
                 args += ['--pocket-opts', opt]
-            args += ['--work-stem', stem]   # pocket_trk's log and RTCM beside the capture (<name>.trk1.log / .rtcm)
+            # pocket_trk's log and RTCM beside the capture (<name>.trk1.log / .rtcm)
+            args += ['--work-stem', self.live_path[:-len('.live')]]
             import integrity
             if self.system['key'] in integrity.WATCH_BANDS:     # (it keeps 20 s of samples in memory: ~80 MB)
                 args += ['--snap-trigger', snap_trigger()]
