@@ -438,7 +438,9 @@ class Solver:
                 if fc is not None:
                     P = P + fc
                     corr.append('fast')
-            tgd = e.get('tgd', 0.0) if o['sat'][0] == 'G' else e.get('tgd', 0.0)
+            # the group delay the broadcast clock needs on this signal: GPS TGD (L1 C/A); Galileo E1B BGD(E1,E5b)
+            # (rtcm3 stores that one for I/NAV ephemerides)
+            tgd = e.get('tgd', 0.0)
             meas.append({'sat': o['sat'], 'P': P, 'pos': pos, 'dts': dts - tgd, 'cn0': o['cn0'], 'nsm': nsm,
                          'corr': corr})
         return self._lsq(t, meas, sb)

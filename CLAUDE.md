@@ -435,16 +435,29 @@ fresh install has none - consider having gnss_rx write the two measured defaults
 **Small things noticed in week 1:** with the tracked gate (5 s at 25 dB-Hz) weak Galileo still churns TRACKING/LOST
 events every 10-30 s (raise the bar for E to 30 dB-Hz or 10 s if noisy; `GNSS_TRACK_*` in iridium_tracker.py); the
 GCH dedup still leaves ~7 two-second holes in 3 h (pocket_trk itself); Integrity's cn0 raise text says "blocked?"
-for 3-8 s when only the satellite fingerprint (no GGAP) identifies a gap; on the first new-code run Integrity raised
-a 'lock' WATCH at 20:48 (snapshot 20261106-204804-lock, 160 MB) when one satellite of 12 (G25) dropped - the at-once
-reacquired/lost fingerprint fires too easily, check `_reset_burst` / `_lost_burst` thresholds in integrity.py;
-`catalog.py --redo` is needed after any catalog format change; the stale-text list under "Known issues" still stands.
+for 3-8 s when only the satellite fingerprint (no GGAP) identifies a gap; `catalog.py --redo` is needed after any
+catalog format change; the stale-text list under "Known issues" still stands.
 First comparison new vs old code (same 14-minute windows, `build\_tmp\week1\compare_runs.py`): GPS acquisitions
 lost within 2.5 s 38-62 % -> 0 %; GPS lock-length median 2-61 s -> 129-777 s; Galileo lock median 10 s -> 710 s
-with all four Galileo satellites held and 2600+ Galileo ranges per 14 min (0-770 before); no gaps yet. Own-solver
-R95 6-7 m with the session middle 2-3 m from home (old sessions 2-7 m and 0.5-1.6 m) - watch this: with Galileo
-orbits now decoding, Galileo enters the own solver's two-clock solution for the first time (BGD E5a/E5b item 6 and
-Galileo weighting matter now); judge after an hour-long session.
+with all four Galileo satellites held and 2600+ Galileo ranges per 14 min (0-770 before); no gaps yet.
+
+**Done after week 1 (2026-11-06 late, before week 2):**
+- Galileo E1B now uses BGD(E1,E5b) (rtcm3.py 1046; spp.py's no-op branch removed) - correct per the ICD, but the
+  measured effect is under 1 m (within run-to-run noise): it was never the cause of the wider fixes.
+- The own solver's wider R95 on the new-code sessions is the sky, not week 1: replaying them GPS-only gives the same
+  R95 6.6 m. Adding Galileo (now possible because its orbits decode) gives 19-100 % more fixes and CEP50 2.7 ->
+  1.6 m but widens the worst 5 % (R95 6.6 -> 8.3-9.1 m on the 36-min 20:54 session): Galileo weighting / the lone-
+  Galileo work in week 2 item 1 is where that tail gets fixed (`build\_tmp\week1b\galileo_effect.py` replays any
+  session three ways).
+- The 20:48 Integrity 'Satellites lost, 0 locked (was 12)' was a GUI stall (the sky-view freeze), not the gap
+  fingerprint: the receiver logged all 12 every second. Integrity now judges 'locked' against the newest receiver
+  line's time (`Monitor.newest_t`), not the tick's wall clock (`build\_tmp\week1b\stall_test.py` reproduces the old
+  false alarm and shows it gone).
+- Status bar: the position is its own label (`fix_label`, `fix_badge()` / `fix_cadence()` in iridium_tracker.py):
+  green with the live fix, its satellite count, source (own solver / pocket_trk) and 'a fix every second' when a new
+  fix arrives every second; amber when fixes come slower; plain home setting after 30 s without one
+  (`build\_tmp\week1b\badge_test.py` replays a session through it).
+- The PC clock had drifted to 2.46 s behind GPS by 20:48 (GTIME; 1.33 s at 03:56): Settings > PC clock.
 
 ## Ideas the owner wants to come back to
 GNSS reflectometry snow depth (favourite); auto PPM from the GPS Doppler offset (~+0.42 ppm); precise antenna

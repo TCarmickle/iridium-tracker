@@ -180,6 +180,10 @@ Pick "GNSS L1 (GPS)" next to Start receiver and press Start. The receiver stream
 straight into PocketSDR, which tracks the satellites live: they show up as they lock on (usually
 within a minute or two) and stay locked, and their updates arrive every second or two. Leave it
 running at least 10-15 minutes.
+  - The status bar at the bottom right shows your position from the receiver, how many
+    satellites it came from, and whether it is the own solver's (WAAS-corrected) or pocket_trk's:
+    green while a new position arrives every second, amber when they come slower (too few
+    satellites, or poor geometry at times), and the plain home setting after 30 s without one.
   - Satellites it tracks appear in the list ("GPS G06", "Galileo E18") with their Doppler
     curves, as "Doppler only, no orbit" at first.
   - Once a satellite has been tracked long enough (about 30 seconds of strong, unbroken signal)

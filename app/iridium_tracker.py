@@ -353,6 +353,59 @@ def fix_reason(tracked, ages, now, hdop, n_orbit=None, restart_t=None, who='own'
     return '%d GPS tracked (%s), HDOP %.1f - the solver has no solution yet' % (len(gps), names, hdop)
 
 
+FIX_FRESH_S = 5.0       # status bar: a new fix read this recently = receiving (the live file is read every 2 s)
+FIX_STALE_S = 30.0      # ...older than this: no position (the home setting is shown again)
+FIX_CADENCE_S = 10.0    # the fix rate is counted over this much of the fixes' own time
+
+
+def fix_cadence(fixes):
+    """fixes per second over the last FIX_CADENCE_S of the fixes' own timestamps (the receiver sends one a second
+    when it has a solution every epoch), from the newest end of a time-ordered list"""
+    if not fixes:
+        return 0.0
+    newest = fixes[-1]['t']
+    n = 0
+    for f in reversed(fixes):
+        if f['t'] < newest - FIX_CADENCE_S + 0.5:
+            break
+        n += 1
+    return n / FIX_CADENCE_S
+
+
+def fix_badge(own, pocket, now, home=None):
+    """the status bar's position: (state, text, tooltip). state 'live' (a fix every second: green), 'slow' (fixes,
+    but not every second: amber) or 'none' (no fix in FIX_STALE_S: the home setting, plain).
+    own / pocket: {'fix': newest fix dict, 'seen': wall time a new one was last read, 'rate': fixes per second} or
+    None - the own solver (WAAS-corrected) is shown whenever it is fixing, pocket_trk's otherwise"""
+    def age(s):
+        return now - s['seen'] if s and s.get('fix') else 1e9
+    # a fresh fix first, then one not yet stale; the own solver's when both are equally fresh
+    src, s = min((('own', own), ('pocket', pocket)),
+                 key=lambda x: (age(x[1]) > FIX_FRESH_S, age(x[1]) > FIX_STALE_S, x[0] != 'own', age(x[1])))
+    if age(s) > FIX_STALE_S:
+        if home:
+            return ('none', 'You (home setting): %.4f, %.4f  -  no position fix' % home,
+                    'No GNSS position fix in the last %d s. Receive GNSS L1 (GPS) with the GPS antenna to get one; '
+                    'this turns green when a new position arrives every second.' % FIX_STALE_S)
+        return 'none', 'Location not set', 'No home location yet and no GNSS position fix.'
+    f = s['fix']
+    who = ('own solver, WAAS-corrected' + (' (still settling)' if f.get('quick') else '')) if src == 'own' \
+        else "pocket_trk's fix"
+    every = (1.0 / s['rate']) if s['rate'] > 0 else None
+    live = age(s) <= FIX_FRESH_S and s['rate'] >= 0.8
+    cadence = 'a fix every second' if live else ('a fix every %.0f s' % every if every and every < 60
+                                                  else 'last fix %s ago' % fmt_age(age(s)))
+    text = 'You: %.5f, %.5f  ·  %d satellites  ·  %s  ·  %s' % (
+        f['lat'], f['lon'], f.get('nsat', 0), who, cadence)
+    tip = ('Your position from the GNSS receiver right now: %s, from %d satellites, %s.\n'
+           'Green: a new position every second. Amber: positions, but not every second (too few satellites or poor '
+           'geometry at times). Plain: no position for %d s - the home setting is shown.'
+           % (who, f.get('nsat', 0), cadence, FIX_STALE_S))
+    if src == 'own' and pocket and pocket.get('fix') and age(pocket) <= FIX_FRESH_S:
+        tip += "\npocket_trk is fixing too, with %d satellites." % pocket['fix'].get('nsat', 0)
+    return ('live' if live else 'slow'), text, tip
+
+
 def fix_status(tracked, ages, last_gpos_t, last_gspp_t, now, hdop, n_orbit=None, restart_t=None, own=None):
     """one line on the position fix right now, for the panel and its tooltip (pure: give it the facts).
     tracked / ages / hdop / n_orbit / restart_t as in fix_reason(); last_gpos_t and last_gspp_t: pocket_trk's and
@@ -2381,6 +2434,11 @@ class Tracker(QtWidgets.QMainWindow):
         self.status = QtWidgets.QLabel()
         self.status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Preferred)   # (long text)
         self.statusBar().addWidget(self.status, 1)
+        # your position: green while a new GNSS fix arrives every second, with how many satellites it came from
+        self.fix_label = QtWidgets.QLabel()
+        self.statusBar().addPermanentWidget(self.fix_label)
+        self._fix_state = None
+        self._fix_seen = {'own': [0, 0.0], 'pocket': [0, 0.0]}    # list length, wall time it last grew
 
         self.reload_lists()
         self.go_live()
@@ -3693,8 +3751,35 @@ class Tracker(QtWidgets.QMainWindow):
                                        'tracker window) before starting the receiver here' % other[0])
             elif not self.receiver.stamp or self.rx_status.text().startswith('Another receiver'):
                 self.rx_status.setText(self._source_text())     # (after a run here, its result message stays up)
-        self.status.setText('%s    |    %s    |    %s' % (live, self.tle_note, 'You: %.4f, %.4f' % (HOME_LAT, HOME_LON) if catalog.HOME else 'Location not set'))
+        self.status.setText('%s    |    %s' % (live, self.tle_note))
+        self._update_fix_label(now)
         self.refresh()
+
+    def _update_fix_label(self, now):
+        """the status bar's position (see fix_badge): which fixes are arriving, how often, from how many satellites"""
+        try:
+            srcs = {}
+            for key, fixes in (('own', self.data.gnss_spp), ('pocket', self.data.gnss_fixes)):
+                seen = self._fix_seen[key]
+                if len(fixes) != seen[0]:       # new fixes read (or the list was rebuilt after a catalog reload)
+                    if len(fixes) > seen[0]:
+                        seen[1] = now
+                    seen[0] = len(fixes)
+                srcs[key] = {'fix': fixes[-1], 'seen': seen[1], 'rate': fix_cadence(fixes)} if fixes and seen[1] else None
+            state, text, tip = fix_badge(srcs['own'], srcs['pocket'], now,
+                                         (HOME_LAT, HOME_LON) if catalog.HOME else None)
+        except Exception as e:          # (the status bar must never take the window down)
+            state, text, tip = 'none', 'You: -', 'position display: %r' % e
+        self.fix_label.setText(text)
+        self.fix_label.setToolTip(tip)
+        if state != self._fix_state:
+            self._fix_state = state
+            theme.style(self.fix_label, {
+                'live': 'QLabel { background: %(GOOD)s; color: #0b0f14; font-weight: 600; padding: 1px 8px; '
+                        'border-radius: 3px; }',
+                'slow': 'QLabel { background: %(WARN)s; color: #0b0f14; font-weight: 600; padding: 1px 8px; '
+                        'border-radius: 3px; }',
+                'none': 'QLabel { color: %(MUTED)s; padding: 1px 8px; }'}[state])
 
     # ---- scene
     def refresh(self, *_):

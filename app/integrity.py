@@ -236,6 +236,7 @@ class Monitor:
         self.t_start = time.time()
         # stream gaps (see the module notes): what gnss_rx and pocket_trk reported, and the fingerprint's inputs
         self.lock_s = {}                            # sat -> (t, lock seconds) from its last GCH line
+        self.newest_t = None                        # time of the newest receiver line (its clock, for the checks)
         self.gaps = collections.deque(maxlen=500)   # (t, ms, source) GGAP lines this session
         self.log = collections.deque(maxlen=2000)   # (t, event, sat, values) GLOG lines
         self.restarts = []                          # GLOG RESTART times
@@ -277,6 +278,8 @@ class Monitor:
                 self.ring.popleft()
             if self.snap:
                 self.snap['lines'].append(rec)
+            if kind in ('GCH', 'GNOISE', 'GPOS', 'GSPP', 'GTIME'):      # (the receiver's clock: see evaluate)
+                self.newest_t = t if self.newest_t is None else max(self.newest_t, t)
             if kind == 'GCH' and len(f) >= 6:
                 sat, cn0, dop = f[2], float(f[4]), float(f[5])
                 self.last[sat] = (t, cn0, dop)
@@ -449,15 +452,21 @@ class Monitor:
         noisy = bool(n and not n['learning'] and (n['rise'] >= 2.0 and not self.auto_gain or n['peak'] >= PEAK_DB[0]))
 
         # -- signals: C/N0 drop and lock loss
-        locked = {s: v for s, v in self.last.items() if now - v[0] < 5}
-        self.counts.append((now, len(locked)))
-        while self.counts and self.counts[0][0] < now - 120:
+        # Judged on the receiver's own clock - the time of the newest line it sent - not on this tick's wall clock:
+        # when the window stalls (a slow redraw) or lines arrive in a batch, the satellites' last lines look
+        # seconds old at the tick and every satellite seemed lost (seen 2026-11-06 20:48: 'Satellites lost, 0
+        # locked (was 12)' while all 12 were reported every second). A receiver that stops sending altogether is
+        # 'receiver stopped', not satellites lost.
+        ts = min(now, self.newest_t + 1.0) if self.newest_t is not None else now
+        locked = {s: v for s, v in self.last.items() if ts - v[0] < 5}
+        self.counts.append((ts, len(locked)))
+        while self.counts and self.counts[0][0] < ts - 120:
             self.counts.popleft()
         drops = []
         for s in locked:
             q = self.cn0.get(s, ())
-            old = [c for t, c in q if now - 70 <= t < now - 15]
-            new = [c for t, c in q if t >= now - 5]
+            old = [c for t, c in q if ts - 70 <= t < ts - 15]
+            new = [c for t, c in q if t >= ts - 5]
             if len(old) >= 20 and new:
                 drops.append(float(np.median(old)) - float(np.median(new)))
         # a stream gap (SDR/USB) drops every satellite too - but it is the receiver, not radio: at most a watch,
@@ -480,7 +489,7 @@ class Monitor:
                                                                      else ' (noise normal: blocked?)'))
         else:
             raw['cn0'] = (NA, 'needs 3 satellites tracked for a minute')
-        before = [c for t, c in self.counts if now - 70 <= t < now - 15]
+        before = [c for t, c in self.counts if ts - 70 <= t < ts - 15]
         if before and max(before) >= 4:
             was = float(np.median(before))
             lost = len(locked) <= was / 3

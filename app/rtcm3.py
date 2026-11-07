@@ -100,10 +100,13 @@ def decode(payload, now=None):
         cis, i0 = b.s(16) * 2 ** -29, b.s(32) * 2 ** -31 * SC2RAD
         crc, omg = b.s(16) * 2 ** -5, b.s(32) * 2 ** -31 * SC2RAD
         OMGd = b.s(24) * 2 ** -43 * SC2RAD
-        tgd = b.s(10) * 2 ** -32
+        tgd = b.s(10) * 2 ** -32                     # BGD(E1,E5a) - the F/NAV (1045) clock's group delay
         svh, flag, fit, iodc, code = 0, 0, 0.0, iode, 0
         if msg == 1046:
-            b.s(10)                                  # second group delay
+            # I/NAV (E1B) clocks are for the E1/E5b pair: a single-frequency E1 user corrects with BGD(E1,E5b), the
+            # second field (Galileo OS SIS ICD 5.1.5; RTKLIB uses tgd[1] for E1). Measured on our own receptions:
+            # the two differ by 0.07-0.28 m of range (E18 -3.03 vs -3.96 ns, E28 0.00 vs 0.70 ns)
+            tgd = b.s(10) * 2 ** -32
             svh = (b.u(2) << 4) | (b.u(1) << 3)       # E5b health / validity
             svh |= (b.u(2) << 1) | b.u(1)             # E1-B health / validity
         else:
