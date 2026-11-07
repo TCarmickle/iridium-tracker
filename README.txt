@@ -116,12 +116,13 @@ SKY PLOT (Sky button)
 ---------------------
 Where in your sky the satellites were when your antenna heard them: the centre is straight
 overhead, the edge is the horizon, north is up and east is right. Big dots are position fixes
-(coloured by signal strength), small dots are other frames from identified satellites. Empty
+(coloured by signal strength); the shading is everything else heard from identified satellites,
+counted in 3-degree patches of sky (brighter = more heard). Empty
 areas are directions or heights your antenna can't hear - a house or roof in the way, or the
 antenna's blind spot (a vertical whip hears little straight up). Move the antenna and watch the
 empty areas fill in; "Heard in" picks this run (the default), the last hour, the last day or
-everything. Long GNSS sessions leave a dot a second per satellite, so at most 200 dots of each
-pass are drawn, and the plot only refreshes while it is on screen.
+everything. Every reception counts (a GNSS session adds one a second per satellite), and the
+plot only refreshes while it is on screen.
 
 
 SYSTEMS: IRIDIUM, ORBCOMM, ISS AND HAM SATELLITES
@@ -269,6 +270,8 @@ and messaging channels are shaded green, the phone channels blue.
 - Sound (in the spectrum toolbar): hear the radio like SDR++ - static, with a click or "zzt"
   for each burst. "Whole band" plays every burst the receiver hears; "Tuned" plays one channel -
   click the spectrum to choose it (the yellow marker). Nothing is decoded into speech.
+  The GNSS bands have no sound (navigation signals lie under the noise - there is nothing to
+  hear), so the sound controls are greyed out while one is received.
   "Audio" next to the volume: an optional low-pass (softer, less hiss) and high-pass (less
   rumble) filter, and a squelch that mutes the static and opens only for bursts louder than the
   noise by the amount you set. Your choices are remembered.
@@ -500,6 +503,15 @@ still pulling in, and that start would stay in the average - seen against a Garm
 beside the antenna); fixes then start once 4 satellites have been smoothed for 30 s (about two
 minutes after starting the receiver), and only with good geometry (HDOP 6 or better). GPS's own ionosphere model is kept in data\gnss-solver.json
 between sessions. Galileo joins when 2 or more Galileo satellites have decoded orbits.
+Static antenna: the antenna never moves, so the solver also uses its height - learned from its
+own earlier fixes (first from the catalog's sessions, then kept up to date in gnss-solver.json;
+never from the home setting, whose height comes from an internet terrain map). With it, 4
+satellites in a poor line-up or a single Galileo satellite still give a position, and 3 give a
+quick one. On recorded sessions this filled every gap the geometry rule used to leave (5920 good
+fixes where there were 2914 in the same 100 minutes) and tightened the 95 % figure (5.5 -> 4.8 m,
+6.4 -> 3.5 m with Galileo). The height is checked all the time against fixes that don't need it:
+if they disagree (the antenna was moved up or down) it is dropped and learned again over 15
+minutes. Heights of fixes the height held are not used in the height figures.
 WARM START, SATELLITES NOT HEARD, REFERENCE POINTS, GPX
 -------------------------------------------------------
 Ideas taken from how a Garmin GPSMAP 64st works (its chip keeps orbit predictions and its last
@@ -531,7 +543,14 @@ position between uses; its data is many small standard files):
     GPX file - waypoints near home and stretches where a track sat still 3+ minutes become points.
     A Garmin plugged in as a drive is imported by itself (its GPX files are copied to
     data\garmin). Star the one beside the antenna (or name one 'antenna'): the panel then measures
-    against it instead of the home location.
+    against it instead of the home location. A track stretch only becomes a point when it is
+    dense (60+ points, one every 2 s or better - set the Garmin's track log to 1 s) and steady (95 %
+    within 10 m); if nothing is starred, the tightest such stretch within 25 m of home is starred for
+    you, and the panel says "from home (no reference starred)" while there is none. A Garmin's
+    heights are its barometer, which drifts tens of metres in hours: they are shown as such and
+    never used as a height reference. The 10-minute average's "+-" figure is now set per source (our
+    solver's errors last minutes, pocket_trk's seconds) and the "all N sessions" figure appears from
+    4 sessions on, widened for how few there are.
   - GPX export (right-click): every session's fixes, pocket_trk's and the WAAS-corrected, as
     tracks, and the reference points as waypoints - for BaseCamp, Google Earth or QGIS.
   - Sea-level heights: a Garmin on the live USB link reports the local gap between GPS's ellipsoid

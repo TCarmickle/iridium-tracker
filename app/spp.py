@@ -42,6 +42,42 @@ IONO_H = 350000.0
 HDOP_MAX = 6.0                  # worse geometry than this: no fix (satellites nearly in a line or a plane)
 READY_SMOOTH = 30               # seconds of smoothing before a satellite counts as settled
 SETTLE_S = 30                   # seconds after a satellite locks before its smoothing starts (code loop settling)
+# The antenna never moves, so its height is known from this solver's own earlier fixes: a height row in the solution
+# (a 'prior', with this uncertainty) keeps it solving when only 4 satellites with poor geometry, or 3, are left.
+# Replays of 2026-11-06's logs: good fixes 1723 -> 3987 of 4043 epochs at the same 1.5-2.5 m (the HDOP gate alone
+# threw away 23 % of the seconds with 4 settled GPS satellites, in 7-17 min stretches). Never from the home setting
+# (a map-picked home carries a terrain height from the internet, ~20 m off the GPS ellipsoid here).
+PRIOR_SIGMA_M = 3.0
+PRIOR_RADIUS_M = 1000.0         # the prior only applies while the solution stays this close to where it was learned
+LONE_GAL_VAR = 1.0 ** 2         # a lone Galileo satellite rides on the GPS clock: GPS-Galileo bias measured within 1 m
+# Error budgets (DO-229 / ICD numbers), in m^2, for Solver(weights='budget'): a WAAS-corrected GPS range weighted by
+# its UDRE, others by the broadcast URA / SISA, plus the ionosphere's GIVE and the troposphere. Measured on
+# 2026-11-06's sessions with the height prior it was WORSE than the simple weighting (R95 4.8 / 3.6 / 4.9 m against
+# 4.7 / 3.4 / 3.5 m): the SISA of 3 m down-weights Galileo ranges that are in fact good - so 'simple' is the default
+# and this stays only for experiments (build\_tmp\week2\replay_static.py, VARIANTS=prior,priorS)
+UDRE_VAR = [0.0520, 0.0924, 0.1444, 0.2830, 0.4678, 0.8315, 1.2992, 1.8709, 2.5465, 3.3260, 5.1968, 20.7870,
+            230.9661, 2078.695]
+GIVE_VAR = [0.0084, 0.0333, 0.0749, 0.1331, 0.2079, 0.2994, 0.4075, 0.5322, 0.6735, 0.8315, 1.1974, 1.8709,
+            3.3260, 20.787, 187.0826]
+URA_M = [2.4, 3.4, 4.85, 6.85, 9.65, 13.65, 24.0, 48.0, 96.0, 192.0, 384.0, 768.0, 1536.0, 3072.0, 6144.0]
+
+
+def broadcast_var(e):
+    """variance (m^2) of a range corrected by the broadcast orbit and clock alone: GPS URA, Galileo SISA"""
+    n = int(e.get('sva', 0))
+    if e.get('sys') == 'E':
+        if n <= 49:
+            s = n * 0.01
+        elif n <= 74:
+            s = 0.5 + (n - 50) * 0.02
+        elif n <= 99:
+            s = 1.0 + (n - 75) * 0.04
+        elif n <= 125:
+            s = 2.0 + (n - 100) * 0.16
+        else:
+            s = 6.0             # (255: no accuracy prediction available)
+        return max(s, 0.5) ** 2
+    return URA_M[min(max(n, 0), len(URA_M) - 1)] ** 2
 
 
 # ---------------------------------------------------------------- geometry
@@ -256,6 +292,11 @@ class Sbas:
         f = self.fast.get(prn)
         return f[0] if f and t - f[2] <= FAST_TIMEOUT_S else None
 
+    def fast_var(self, prn, t):
+        """the variance (m^2) WAAS gives for a satellite's corrected range (its UDREI), or None"""
+        f = self.fast.get(prn)
+        return UDRE_VAR[f[1]] if f and t - f[2] <= FAST_TIMEOUT_S and f[1] < len(UDRE_VAR) else None
+
     def longterm(self, prn, iode, t_gpst):
         """(dpos m (3,), dclock s) for a GPS satellite whose ephemeris has this IODE, or None"""
         h = self.lt.get(prn)
@@ -268,43 +309,77 @@ class Sbas:
                 h['daf0'] + h['daf1'] * dt)
 
     def iono_delay(self, lla, az, el, t):
-        """slant L1 ionosphere delay (m) from the grid, or None if the pierce point's 4 grid corners aren't known"""
+        """slant L1 ionosphere delay (m) from the grid, or None if the pierce point can't be interpolated"""
+        got = self.iono_delay_var(lla, az, el, t)
+        return got[0] if got else None
+
+    def iono_delay_var(self, lla, az, el, t):
+        """(slant L1 delay m, its variance m^2 from the grid's GIVEI) at the pierce point, or None.
+        All 4 corners of the 5-degree cell: bilinear. One corner missing: the triangle of the other 3, if the pierce
+        point lies in it (DO-229 A.4.4.10.3) - before, one missing corner sent 1.9 % of the ranges to the much
+        rougher broadcast (Klobuchar) model"""
         re = 6378136.3
-        psi = math.pi / 2 - el - math.asin(re / (re + IONO_H) * math.cos(el))
-        lat = math.asin(math.sin(lla[0]) * math.cos(psi) + math.cos(lla[0]) * math.sin(psi) * math.cos(az))
-        lon = lla[1] + math.asin(math.sin(psi) * math.sin(az) / math.cos(lat))
+        psi = math.pi / 2 - el - math.asin(min(1.0, re / (re + IONO_H) * math.cos(el)))
+        lat = math.asin(max(-1.0, min(1.0, math.sin(lla[0]) * math.cos(psi)
+                                      + math.cos(lla[0]) * math.sin(psi) * math.cos(az))))
+        lon = lla[1] + math.asin(max(-1.0, min(1.0, math.sin(psi) * math.sin(az) / math.cos(lat))))
         la, lo = math.degrees(lat), (math.degrees(lon) + 180) % 360 - 180
         if abs(la) > 55:
             return None
         la1, lo1 = math.floor(la / 5) * 5, math.floor(lo / 5) * 5
-        corners = []
-        for dla, dlo in ((0, 0), (0, 5), (5, 0), (5, 5)):
-            p = (la1 + dla, (lo1 + dlo + 180) % 360 - 180)
-            v = self.iono.get(p)
-            if not v or t - v[2] > IONO_TIMEOUT_S:
-                return None
-            corners.append(v[0])
         x, y = (lo - lo1) / 5.0, (la - la1) / 5.0
-        vert = (corners[0] * (1 - x) * (1 - y) + corners[1] * x * (1 - y) + corners[2] * (1 - x) * y
-                + corners[3] * x * y)
+        pts = []                                # (x, y, delay, GIVE variance) of the corners we have
+        for cx, cy in ((0, 0), (1, 0), (0, 1), (1, 1)):
+            p = (la1 + 5 * cy, (lo1 + 5 * cx + 180) % 360 - 180)
+            v = self.iono.get(p)
+            if v and t - v[2] <= IONO_TIMEOUT_S:
+                pts.append((cx, cy, v[0], GIVE_VAR[v[1]] if v[1] < len(GIVE_VAR) else GIVE_VAR[-1]))
+        if len(pts) == 4:
+            wts = [(1 - x) * (1 - y), x * (1 - y), (1 - x) * y, x * y]
+        elif len(pts) == 3:
+            (x1, y1), (x2, y2), (x3, y3) = [(p[0], p[1]) for p in pts]
+            d = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3)
+            w1 = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / d
+            w2 = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / d
+            wts = [w1, w2, 1.0 - w1 - w2]
+            if min(wts) < -1e-9:                # outside the triangle: no interpolation
+                return None
+        else:
+            return None
+        vert = sum(w * p[2] for w, p in zip(wts, pts))
+        var = sum(w * p[3] for w, p in zip(wts, pts))
         fpp = 1.0 / math.sqrt(1.0 - (re * math.cos(el) / (re + IONO_H)) ** 2)
-        return fpp * vert
+        return fpp * vert, fpp * fpp * var
 
 
 # ---------------------------------------------------------------- the solver
 class Solver:
     """modes: iono 'klobuchar' | 'sbas' | 'none'; sbas_orbit (fast + long-term corrections); smooth (carrier)"""
 
-    def __init__(self, iono='sbas', sbas_orbit=True, smooth=True, systems='GE', settle=None):
+    def __init__(self, iono='sbas', sbas_orbit=True, smooth=True, systems='GE', settle=None, weights='simple'):
         self.iono_mode, self.sbas_orbit, self.smooth, self.systems = iono, sbas_orbit, smooth, systems
         self.settle = SETTLE_S if settle is None else settle
+        self.weights = weights          # 'simple' (noise by smoothing and elevation) or 'budget' (see the constants)
         self.ephs = {}                  # sat -> {iode: eph} (WAAS long-term corrections name the IODE they fix)
         self.ion = None                 # Klobuchar numbers
         self.sbas = {}                  # WAAS PRN -> Sbas (each GEO's own corrections; the freshest is used)
         self.pending, self.t_epoch = [], None
         self.hatch = {}                 # sat -> [smoothed P, last P, last L, n]
         self.x = np.array([-1.3e6, -4.9e6, 4.0e6])     # (a start in North America; it converges from anywhere)
-        self.dtr = {}
+        self.prior = None               # (ellipsoid height m, sigma m, ECEF of where it was learned) - set_prior()
+
+    def set_prior(self, h, lat_deg, lon_deg, sigma=PRIOR_SIGMA_M):
+        """the static antenna's ellipsoid height, from this solver's own earlier fixes (None: no prior)"""
+        if h is None:
+            self.prior = None
+            return
+        ref = lla_to_ecef(math.radians(lat_deg), math.radians(lon_deg), h)
+        self.prior = (float(h), float(sigma), ref)
+        if np.linalg.norm(self.x - ref) > 1e5:      # start the solution there (it converges from anywhere anyway)
+            self.x = ref.copy()
+
+    def _prior_on(self):
+        return self.prior is not None and np.linalg.norm(self.x - self.prior[2]) < PRIOR_RADIUS_M
 
     # -- inputs
     def eph(self, e):
@@ -428,6 +503,7 @@ class Solver:
             pos = gnss._kepler(e, np.atleast_1d(float(gnss.gpst_to_unix(tx))))[0][0].astype(float)
             dts = float(np.atleast_1d(gnss.sat_clock(e, gnss.gpst_to_unix(tx)))[0])
             corr = []
+            svar = broadcast_var(e)         # how well the broadcast orbit and clock alone know this range
             if o['sat'][0] == 'G' and sb is not None and self.sbas_orbit:
                 lt = sb.longterm(int(o['sat'][1:]), e['iode'], t)
                 fc = sb.fast_corr(int(o['sat'][1:]), t)
@@ -438,29 +514,66 @@ class Solver:
                 if fc is not None:
                     P = P + fc
                     corr.append('fast')
+                    fv = sb.fast_var(int(o['sat'][1:]), t)
+                    if fv is not None and lt is not None:
+                        svar = fv           # corrected by WAAS: its own (much smaller) figure
             # the group delay the broadcast clock needs on this signal: GPS TGD (L1 C/A); Galileo E1B BGD(E1,E5b)
             # (rtcm3 stores that one for I/NAV ephemerides)
             tgd = e.get('tgd', 0.0)
-            meas.append({'sat': o['sat'], 'P': P, 'pos': pos, 'dts': dts - tgd, 'cn0': o['cn0'], 'nsm': nsm,
-                         'corr': corr})
-        return self._lsq(t, meas, sb)
+            meas.append({'sat': o['sat'], 'sys': o['sat'][0], 'P': P, 'pos': pos, 'dts': dts - tgd,
+                         'cn0': o['cn0'], 'nsm': nsm, 'corr': corr, 'svar': svar})
+        prior = self._prior_on()
+        out = self._lsq(t, meas, sb, prior)
+        if out is not None and prior and out['nsat'] >= 5:
+            # the same epoch without the height row: what the height prior is checked and learned against
+            free = self._lsq(t, meas, sb, False, probe=True)
+            if free is not None:
+                out['h_free'], out['vdop_free'], out['ok_free'] = free['h'], free['vdop'], free['ok']
+        return out
 
-    def _lsq(self, t, meas, sb):
-        if len(meas) < 4:
+    def _var(self, m, el, ion_src, ion, ion_var):
+        """a range's variance (m^2): receiver noise (smaller once carrier-smoothed, larger low down) and, with the
+        error budget, what the orbit/clock (WAAS UDRE, else GPS URA / Galileo SISA), ionosphere and troposphere
+        leave over"""
+        se = max(math.sin(el), 0.1)
+        noise = (0.3 + 3.0 / math.sqrt(max(m['nsm'], 1))) * (1 + 1 / se)
+        if self.weights != 'budget':
+            return noise ** 2
+        var = noise ** 2 + m['svar']
+        if ion_src == 'sbas':
+            var += ion_var
+        elif ion_src == 'klob':
+            var += (0.5 * ion) ** 2         # (the broadcast model takes out about half of the delay)
+        else:
+            var += 25.0
+        mt = 1.001 / math.sqrt(0.002001 + se * se)      # troposphere: 0.12 m at the zenith (DO-229 J.2.4)
+        return var + (0.12 * mt) ** 2
+
+    def _lsq(self, t, meas, sb, use_prior=False, probe=False):
+        """one epoch's least squares. use_prior: the static antenna's height row (PRIOR_SIGMA_M) - then 3 satellites
+        give a (quick) fix and a lone Galileo satellite rides on the GPS clock; probe: a side solution (the
+        prior-free check), which leaves the solver's state alone"""
+        min_sats = 3 if use_prior else 4
+        if len(meas) < min_sats:
             return None
         x = self.x.copy()
-        sysl = sorted({m['sat'][0] for m in meas})
-        # a second system costs one more unknown (its own clock): only with 2+ of its satellites
-        sysl = [s for s in sysl if s == 'G' or sum(1 for m in meas if m['sat'][0] == s) >= 2]
+        counts = collections.Counter(m['sys'] for m in meas)
+        # a second system costs one more unknown (its own clock): only with 2+ of its satellites - or, with the
+        # height prior, one Galileo satellite on the GPS clock (their offset measured within 1 m: a bigger sigma)
+        sysl = ['G'] + [s for s in sorted(counts) if s != 'G' and counts[s] >= 2]
+        lone = {s for s in counts if s == 'E' and counts[s] == 1 and use_prior}
         nclk = len(sysl)
         clk = np.zeros(nclk)
         drop = set()
         res = None
+        H = v = w = used = None
+        nsat_rows = 0
         for it in range(12):
             lla = ecef_to_lla(x)
             H, v, w, used = [], [], [], []
             for m in meas:
-                if m['sat'] in drop or m['sat'][0] not in sysl:
+                s = m['sys']
+                if m['sat'] in drop or (s not in sysl and s not in lone):
                     continue
                 tau = np.linalg.norm(m['pos'] - x) / C
                 a = OMGE * tau          # the Earth turned while the signal travelled
@@ -470,24 +583,29 @@ class Solver:
                 az, el = azel(x, ps, lla) if it > 0 or np.linalg.norm(x) > 6e6 else (0.0, math.pi / 2)
                 if it > 1 and math.degrees(el) < EL_MASK:
                     continue
-                ion, ion_src = 0.0, '-'
+                ion, ion_src, ion_var = 0.0, '-', 0.0
                 if self.iono_mode == 'sbas' and sb is not None:
-                    d = sb.iono_delay(lla, az, el, t)
+                    d = sb.iono_delay_var(lla, az, el, t)
                     if d is not None:
-                        ion, ion_src = d, 'sbas'
+                        ion, ion_var, ion_src = d[0], d[1], 'sbas'
                 if ion_src == '-' and self.iono_mode in ('sbas', 'klobuchar') and self.ion:
                     ion, ion_src = klobuchar(t, lla, az, el, self.ion), 'klob'
                 trp = tropo(lla, el) if it > 0 else 0.0
-                k = sysl.index(m['sat'][0])
+                k = sysl.index(s) if s in sysl else 0
                 model = r + clk[k] - C * m['dts'] + ion + trp
                 row = list(-(ps - x) / r) + [1.0 if j == k else 0.0 for j in range(nclk)]
                 H.append(row)
                 v.append(m['P'] - model)
-                se = max(math.sin(el), 0.1)
-                sig = (0.3 + 3.0 / math.sqrt(max(m['nsm'], 1))) * (1 + 1 / se)
-                w.append(1 / sig ** 2)
+                var = self._var(m, el, ion_src, ion, ion_var) + (LONE_GAL_VAR if s in lone else 0.0)
+                w.append(1 / var)
                 used.append((m, az, el, ion_src, ion, trp))
-            if len(H) < 3 + nclk:
+            nsat_rows = len(H)
+            if use_prior and nsat_rows >= 2:        # the height: one more 'measurement' of the up direction
+                lat, lon = lla[0], lla[1]
+                H.append([math.cos(lat) * math.cos(lon), math.cos(lat) * math.sin(lon), math.sin(lat)] + [0.0] * nclk)
+                v.append(self.prior[0] - lla[2])
+                w.append(1 / self.prior[1] ** 2)
+            if len(H) < 3 + nclk or nsat_rows < min_sats:
                 return None
             H, v, W = np.array(H), np.array(v), np.diag(w)
             try:
@@ -496,36 +614,40 @@ class Solver:
                 return None
             dx = N @ H.T @ W @ v
             if not np.all(np.isfinite(dx)) or np.linalg.norm(dx[:3]) > 1e7:
-                self.x = np.array([-1.3e6, -4.9e6, 4.0e6])     # diverged: start the next epoch from scratch
+                if not probe:
+                    self.x = np.array([-1.3e6, -4.9e6, 4.0e6])     # diverged: start the next epoch from scratch
                 return None
             x = x + dx[:3]
             clk = clk + dx[3:]
             if np.linalg.norm(dx[:3]) < 1e-3 and it > 2:
                 res = v - H @ dx
-                # one bad satellite (multipath, wrong correction): drop the worst if it stands out and one is spare
-                k = int(np.argmax(np.abs(res) * np.sqrt(w)))
+                # one bad satellite (multipath, wrong correction): drop the worst if it stands out and there is
+                # redundancy to tell which one it is (the height row counts; it is never dropped itself)
+                k = int(np.argmax(np.abs(res[:nsat_rows]) * np.sqrt(w[:nsat_rows])))
                 if len(H) > 4 + nclk and abs(res[k]) * math.sqrt(w[k]) > 4.0 and len(drop) < 2:
                     drop.add(used[k][0]['sat'])
                     continue
                 break
-        self.x = x
+        if not probe:
+            self.x = x
         lat, lon, h = ecef_to_lla(x)
-        # geometry (DOP) in east-north-up
+        # geometry (DOP) in east-north-up, the height row included: it is what holds a 4-satellite fix together
         R = np.array([[-math.sin(lon), math.cos(lon), 0],
                       [-math.sin(lat) * math.cos(lon), -math.sin(lat) * math.sin(lon), math.cos(lat)],
                       [math.cos(lat) * math.cos(lon), math.cos(lat) * math.sin(lon), math.sin(lat)]])
         G = np.array([list(R @ np.array(row[:3])) + list(row[3:]) for row in H])
         try:
             Q = np.linalg.inv(G.T @ G)
-            hdop = math.sqrt(Q[0, 0] + Q[1, 1])
-        except np.linalg.LinAlgError:
-            hdop = float('nan')
+            hdop, vdop = math.sqrt(Q[0, 0] + Q[1, 1]), math.sqrt(Q[2, 2])
+        except (np.linalg.LinAlgError, ValueError):
+            hdop = vdop = float('nan')
         corrs = collections.Counter(c for u in used for c in u[0]['corr'])
         smoothed = sum(1 for u in used if u[0]['nsm'] >= READY_SMOOTH)
-        # a fix to show: good geometry, and (smoothing on) 4+ satellites smoothed long enough to have settled
-        ok = hdop <= HDOP_MAX and (not self.smooth or smoothed >= 4)
-        return {'ok': ok,'t': t, 'lat': math.degrees(lat), 'lon': math.degrees(lon), 'h': h, 'nsat': len(used), 'hdop': hdop,
-                'sats': [u[0]['sat'] for u in used], 'dropped': sorted(drop),
+        # a fix to show: good geometry, 4+ satellites, and (smoothing on) 4+ of them smoothed long enough to have
+        # settled; 3 satellites with the height prior are only ever a quick fix (about twice as wide)
+        ok = hdop <= HDOP_MAX and len(used) >= 4 and (not self.smooth or smoothed >= 4)
+        return {'ok': ok, 't': t, 'lat': math.degrees(lat), 'lon': math.degrees(lon), 'h': h, 'nsat': len(used),
+                'hdop': hdop, 'vdop': vdop, 'sats': [u[0]['sat'] for u in used], 'dropped': sorted(drop),
                 'iono': collections.Counter(u[3] for u in used), 'fast': corrs.get('fast', 0), 'lt': corrs.get('lt', 0),
-                'smoothed': smoothed,
-                'res_rms': float(np.sqrt(np.mean(res ** 2))) if res is not None else None}
+                'smoothed': smoothed, 'prior': bool(use_prior and nsat_rows >= 2),
+                'res_rms': float(np.sqrt(np.mean(res[:nsat_rows] ** 2))) if res is not None else None}

@@ -207,7 +207,11 @@ class EphemerisOrbit:
                      'health': eph['health'], 'geo': eph['geo']}
 
     def ecef(self, t):
-        return sat_ecef(self.eph, np.atleast_1d(np.asarray(t, float)))[0]
+        # position only (km): every caller (map, globe, sky view, Integrity's Doppler check by differencing two
+        # positions) throws the velocity away, and sat_ecef's velocity costs two more Kepler solves - measured
+        # 255 us per scalar call vs 89 us without it (measure_c.py), 57 GNSS orbits on every scene rebuild.
+        # sat_ecef keeps the velocity for whoever needs it.
+        return _kepler(self.eph, np.atleast_1d(np.asarray(t, float)))[0] / 1000.0
 
     def sigma_km(self, t):
         """1-sigma position uncertainty (km) at time(s) t. Model: SIG_FIT_KM within SIG_HOURS of Toe

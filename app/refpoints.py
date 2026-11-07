@@ -23,6 +23,19 @@ NEAR_M = 500.0
 STILL_M = 30.0          # a Garmin track counts as sitting still while within this of its stretch's middle (indoors
 #                         its fixes wander ~20 m; someone walking leaves 30 m in ~20 s)...
 STILL_MIN_S = 180.0     # ...for at least this long
+# A stretch is good enough to measure against only with dense points or a tight scatter: of 39 stretches imported by
+# 2026-11-06, 35 were indoors, one point per ~40 s (the Garmin's 'Auto' record mode), 10-19 m from home - the one
+# outdoor stretch (640 points at 1 s, scatter 2.6 m) was the only truth among them
+GOOD_N, GOOD_RATE, GOOD_SCATTER_M = 60, 0.5, 10.0
+STAR_N, STAR_NEAR_M = 300, 25.0     # auto-star: the tightest stretch with this many points this close to home
+
+
+def good_stretch(n, span_s, scatter95_m):
+    """dense (60+ points at one every 2 s or better) and not wandering (95 % within 10 m): a handful of points can
+    look tight by luck (5-11-point indoor stretches did), and an hour indoors drifts 14-19 m"""
+    if not (n and span_s and scatter95_m is not None):
+        return False
+    return n >= GOOD_N and n / span_s >= GOOD_RATE and scatter95_m <= GOOD_SCATTER_M
 
 
 def _dist(lat1, lon1, lat2, lon2):
@@ -47,17 +60,50 @@ def save(refs):
 
 
 def add(ref):
-    """ref: {'name','lat','lon', 'height_msl'?, 'height_ell'?, 'source', 'n'?, 'span_s'?, 'avg95_m'?, 't'?};
-    a reference of the same name and source is replaced - keeping its star (the Garmin's points are imported again
-    every time it is plugged in, and that must not lose which one was chosen)"""
-    old = [r for r in load() if r['name'] == ref['name'] and r.get('source') == ref.get('source')]
-    refs = [r for r in load() if not (r['name'] == ref['name'] and r.get('source') == ref.get('source'))]
-    if any(r.get('primary') for r in old) and 'primary' not in ref:
-        ref['primary'] = True
-    ref.setdefault('t', time.time())
-    refs.append(ref)
+    """ref: {'name','lat','lon', 'height_msl'?, 'height_ell'?, 'height_source'?, 'source', 'n'?, 'span_s'?,
+    'avg95_m'?, 't'?}; a reference of the same name and source is replaced - keeping its star (the Garmin's points are
+    imported again every time it is plugged in, and that must not lose which one was chosen)"""
+    return add_many([ref])[0]
+
+
+def add_many(new):
+    """add() for a whole import at once: one read and one write (an import used to rewrite the file per point)"""
+    refs = load()
+    for ref in new:
+        key = (ref['name'], ref.get('source'))
+        old = [r for r in refs if (r['name'], r.get('source')) == key]
+        refs = [r for r in refs if (r['name'], r.get('source')) != key]
+        for k in ('primary', 'auto_star'):
+            if any(r.get(k) for r in old) and k not in ref:
+                ref[k] = True
+        ref.setdefault('t', time.time())
+        refs.append(ref)
     save(refs)
-    return ref
+    return new
+
+
+def starred(refs=None):
+    """the reference the position panel measures against: the starred one, else one named 'antenna', else None"""
+    refs = refs if refs is not None else load()
+    return (next((r for r in refs if r.get('primary')), None) or
+            next((r for r in refs if r['name'].lower() == 'antenna'), None))
+
+
+def auto_star(home):
+    """nothing starred and nothing named 'antenna': star the tightest Garmin stretch beside home (STAR_N+ points within
+    STAR_NEAR_M) - the panel otherwise measures against the home setting, the thing it should be checking. Returns
+    the reference starred, or None"""
+    refs = load()
+    if starred(refs) or not home:
+        return None
+    cand = [r for r in refs if r.get('scatter95_m') is not None and (r.get('n') or 0) >= STAR_N
+            and _dist(home[0], home[1], r['lat'], r['lon']) <= STAR_NEAR_M]
+    if not cand:
+        return None
+    best = min(cand, key=lambda r: r['scatter95_m'])
+    best['primary'] = best['auto_star'] = True
+    save(refs)
+    return best
 
 
 def remove(name):
@@ -74,26 +120,31 @@ def nearest(lat, lon, refs=None):
     return best
 
 
-def still_stretches(points, near=None):
+def still_stretches(points, near=None, good_only=False):
     """[(t0, t1, lat, lon, ele, n, scatter95_m)] of the stretches where a track sat still for STILL_MIN_S+ (points
-    (t, lat, lon, ele)); near=(lat, lon): only those within NEAR_M of it"""
+    (t, lat, lon, ele)); near=(lat, lon): only those within NEAR_M of it; good_only: only good_stretch() ones.
+    The stretch's centre while it grows is a running mean (the median of the whole growing stretch, recomputed at
+    every point, made this quadratic: 1.3 s on the GUI thread for one day's track, minutes for a day of 1 s logging);
+    the median is taken once the stretch is complete"""
     out, i = [], 0
     pts = sorted(points)
     while i < len(pts):
         j = i
-        la, lo = pts[i][1], pts[i][2]
+        sla, slo, k = pts[i][1], pts[i][2], 1
+        la, lo = sla, slo
         while j + 1 < len(pts) and pts[j + 1][0] - pts[j][0] < 60 and _dist(la, lo, pts[j + 1][1], pts[j + 1][2]) < STILL_M:
             j += 1
-            seg = pts[i:j + 1]
-            la, lo = float(np.median([p[1] for p in seg])), float(np.median([p[2] for p in seg]))
+            sla, slo, k = sla + pts[j][1], slo + pts[j][2], k + 1
+            la, lo = sla / k, slo / k
         if pts[j][0] - pts[i][0] >= STILL_MIN_S:
             seg = pts[i:j + 1]
             la, lo = float(np.median([p[1] for p in seg])), float(np.median([p[2] for p in seg]))
             eles = [p[3] for p in seg if p[3] is not None]
             r = sorted(_dist(la, lo, p[1], p[2]) for p in seg)
-            if near is None or _dist(la, lo, near[0], near[1]) <= NEAR_M:
-                out.append((seg[0][0], seg[-1][0], la, lo, float(np.median(eles)) if eles else None, len(seg),
-                            r[int(0.95 * (len(r) - 1))]))
+            sc = r[int(0.95 * (len(r) - 1))]
+            if (near is None or _dist(la, lo, near[0], near[1]) <= NEAR_M) and \
+                    (not good_only or good_stretch(len(seg), seg[-1][0] - seg[0][0], sc)):
+                out.append((seg[0][0], seg[-1][0], la, lo, float(np.median(eles)) if eles else None, len(seg), sc))
         i = j + 1
     return out
 

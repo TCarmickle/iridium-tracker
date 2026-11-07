@@ -509,6 +509,8 @@ def analyze_gnss(stem):
                       'nsat': int(f[3]), 'hdop': float(f[4])}
                 if len(f) >= 9 and int(f[8]) < 4:
                     fx['quick'] = True      # (a quick fix before carrier smoothing settled)
+                if len(f) >= 10 and f[9] == '1':
+                    fx['prior'] = True      # (the height row held it: its height is the antenna's, not a measurement)
                 cap.setdefault('gnss_spp', []).append(fx)
             elif kind == 'GGAP' and len(f) >= 1:
                 gaps.append([round(t, 3), float(f[0])])

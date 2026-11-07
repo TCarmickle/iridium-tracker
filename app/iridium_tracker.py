@@ -389,7 +389,9 @@ def fix_badge(own, pocket, now, home=None):
                     'this turns green when a new position arrives every second.' % FIX_STALE_S)
         return 'none', 'Location not set', 'No home location yet and no GNSS position fix.'
     f = s['fix']
-    who = ('own solver, WAAS-corrected' + (' (still settling)' if f.get('quick') else '')) if src == 'own' \
+    rough = f.get('quick') and f.get('nsat', 4) < 4     # 3 satellites + the antenna's known height: ~20 m (95 %)
+    who = ('own solver, WAAS-corrected' + (' (rough: 3 satellites + known height)' if rough else
+                                           ' (still settling)' if f.get('quick') else '')) if src == 'own' \
         else "pocket_trk's fix"
     every = (1.0 / s['rate']) if s['rate'] > 0 else None
     live = age(s) <= FIX_FRESH_S and s['rate'] >= 0.8
@@ -437,6 +439,7 @@ class Data:
 
     def __init__(self):
         self.cat_mtime = None
+        self._cap_files = None  # capture -> ((file time, size), its catalog entry) as last read (see _load_captures)
         self._tles = {}         # system -> public catalog satellites (names only)
         self._gnss_cat = {}     # GNSS satellite -> its public catalog name (info window only)
         self.oc_ids = {}        # Orbcomm satellite ID -> name
@@ -675,6 +678,52 @@ class Data:
         self._ham_fits[n] = (key, time.time())
         return orbit, why
 
+    @staticmethod
+    def _cap_names(c):
+        """the satellites a capture's catalog entry has data for (whose orbits change when it does)"""
+        out = {p['name'] for p in c.get('positions', []) if p.get('name')}
+        out |= {ps['name'] for ps in c.get('passes', []) if ps.get('name')}
+        out |= {s['name'] for s in c.get('slots', []) if s.get('name')}
+        out |= {catalog.gnss_name(sat) for sat in c.get('ephemerides', {})}
+        return out
+
+    def _load_captures(self):
+        """the catalog's captures -> (caps, satellites to refit or None for all). After a Stop only one capture is
+        new, so only the per-capture files that are new or changed since the last load (by file time and size) are
+        read again - the rest come from what this window read before. A full read + every orbit refitted took
+        2.2-2.6 s on the main thread after every Stop (week-2 reload_test.py), although a GNSS Stop changes no
+        Iridium orbit. The legacy single-file catalog (no index.json) is always read whole."""
+        old = self._cap_files
+        if not os.path.exists(catalog.DATA):
+            self._cap_files = None
+            return catalog.load_data(), None        # (the previous good copy if the file was cut off)
+        files = {}
+        changed = set()
+        for name in catalog._index_names():
+            path = catalog._cap_file(name)
+            try:
+                st = os.stat(path)
+                key = (st.st_mtime_ns, st.st_size)
+                if old and name in old and old[name][0] == key:
+                    files[name] = old[name]
+                    continue
+                with open(path) as f:
+                    files[name] = (key, json.load(f))
+                changed.add(name)
+            except (OSError, ValueError) as e:
+                print('catalog: %s could not be read (%s)' % (name, e))
+        self._cap_files = files
+        caps = {n: c for n, (_, c) in files.items()}
+        if old is None:
+            return caps, None                       # (the first load: every orbit is fitted)
+        changed |= set(old) - set(files)            # captures removed from the catalog
+        names = set()
+        for n in changed:                           # what they held before and what they hold now
+            for got in (old.get(n), files.get(n)):
+                if got:
+                    names |= self._cap_names(got[1])
+        return caps, names
+
     def load_catalog(self):
         path = catalog.DATA
         try:
@@ -682,10 +731,13 @@ class Data:
         except OSError:
             pass
         try:
-            caps = catalog.load_data()      # (the previous good copy if the file was cut off)
+            caps, refit = self._load_captures()
         except (OSError, ValueError, SystemExit) as e:
             print('catalog: %s' % e)
-            caps = {}
+            caps, refit = {}, None
+            self._cap_files = None
+        live_before = ({f['name'] for f in self.live_fixes} | {n for _, n in self.live_doppler} |
+                       set(self.live_links.values()))
         self.captures, self.fixes = [], []
         self.gnss_eph, self.gnss_fixes, self.gnss_spp, self.gnss_sessions = {}, [], [], []
         self.doppler = {}       # name -> list of Doppler curves [(t, Hz), ...]
@@ -767,7 +819,21 @@ class Data:
             if ps not in self.slot_name:
                 self.slot_name[ps] = n
                 self._info(n)['slots'].add(ps)
-        self.fit_orbits()
+        if refit is None or not hasattr(self, 'orbits'):
+            self.fit_orbits()
+            return
+        # only the satellites whose data changed: those of the new / changed / removed captures, those whose live
+        # data has just been replaced by the catalog's, and those still waiting for a plane to settle their
+        # direction (which may have come with another satellite's new orbit); a satellite gone altogether loses
+        # its orbit. (Checked against a full reload in build\_tmp\week2\gui\reload_test.py.)
+        live_after = ({f['name'] for f in self.live_fixes} | {n for _, n in self.live_doppler} |
+                      set(self.live_links.values()))
+        refit |= live_before - live_after
+        refit |= {n for n, why in self.no_orbit.items() if 'direction' in why}
+        for n in [n for n in set(self.orbits) | set(self.no_orbit) if n not in self.info]:
+            self.orbits.pop(n, None)
+            self.no_orbit.pop(n, None)
+        self.fit_orbits({n for n in refit if n in self.info})
 
     def _info(self, name):
         if name not in self.info:
@@ -1108,6 +1174,8 @@ class Data:
                           'nsat': int(f[3]), 'hdop': float(f[4])}
                     if len(f) >= 9 and int(f[8]) < 4:
                         fx['quick'] = True      # before smoothing settled: shown as the first fix, not in the accuracy
+                    if len(f) >= 10 and f[9] == '1':
+                        fx['prior'] = True      # the static antenna's height held it (its height is not measured)
                     self.gnss_spp.append(fx)
                     if newest:
                         waas = len(f) >= 7 and (int(f[5]) > 0 or int(f[6]) > 0)
@@ -2032,6 +2100,7 @@ class Tracker(QtWidgets.QMainWindow):
         self.speed = 1
         self.selected = None
         self.last_tick = time.time()
+        self._scene_second = None   # while following live: the whole second the scene was last built for
         self.pass_cache = (None, 0, None)
         self._ham_known = None      # how many satellites gr-satellites can decode (counted once)
 
@@ -2866,25 +2935,36 @@ class Tracker(QtWidgets.QMainWindow):
         src = source or os.path.basename(path)
         sep = refpoints.geoid_sep()
         home = (HOME_LAT, HOME_LON) if catalog.HOME else None
-        n = 0
+        # a handheld's track and waypoint heights are its barometer (the GPX and its live GPS height agreed to 0.4 m:
+        # one smoothed source; they drifted 12-50 m within hours as the altimeter calibrated itself): kept, labelled,
+        # never used as a height reference
+        hsrc = 'barometer' if 'garmin' in src.lower() or 'gpsmap' in src.lower() else 'unknown'
+        new = []
         for w in wpts:
             if home and refpoints._dist(home[0], home[1], w['lat'], w['lon']) > refpoints.NEAR_M:
                 continue
-            refpoints.add({'name': w['name'] or 'waypoint', 'lat': w['lat'], 'lon': w['lon'],
-                           'height_msl': w['ele'], 'height_ell': w['ele'] + sep if w['ele'] is not None and sep is not None
-                           else None, 'source': '%s waypoint' % src, 't': w['t']})
-            n += 1
+            new.append({'name': w['name'] or 'waypoint', 'lat': w['lat'], 'lon': w['lon'],
+                        'height_msl': w['ele'], 'height_ell': w['ele'] + sep if w['ele'] is not None and sep is not None
+                        else None, 'height_source': hsrc, 'source': '%s waypoint' % src, 't': w['t']})
         for name, pts in tracks:
-            for t0, t1, la, lo, ele, k, sc in refpoints.still_stretches(pts, home):
-                refpoints.add({'name': 'still from %s' % time.strftime('%Y-%m-%d %H:%M', time.localtime(t0)),
-                               'lat': la, 'lon': lo, 'height_msl': ele,
-                               'height_ell': ele + sep if ele is not None and sep is not None else None,
-                               'source': '%s track' % src, 'n': k, 'span_s': t1 - t0, 'scatter95_m': sc, 't': t0})
-                n += 1
+            for t0, t1, la, lo, ele, k, sc in refpoints.still_stretches(pts, home, good_only=True):
+                new.append({'name': 'still from %s' % time.strftime('%Y-%m-%d %H:%M', time.localtime(t0)),
+                            'lat': la, 'lon': lo, 'height_msl': ele,
+                            'height_ell': ele + sep if ele is not None and sep is not None else None,
+                            'height_source': hsrc, 'source': '%s track' % src, 'n': k, 'span_s': t1 - t0,
+                            'scatter95_m': sc, 't': t0})
+        if new:
+            refpoints.add_many(new)
+        star = refpoints.auto_star(home)
+        if star:
+            self.events.insertItem(0, '%s  Reference point starred: %s (%d points, 95 %% within %.1f m) - the '
+                                      'position panel now measures against it' % (
+                                          fmt_clock(time.time()), star['name'], star.get('n', 0), star['scatter95_m']))
         if not quiet:
-            self.events.insertItem(0, '%s  Imported %d reference points from %s' % (fmt_clock(time.time()), n, path))
+            self.events.insertItem(0, '%s  Imported %d reference points from %s' % (fmt_clock(time.time()), len(new),
+                                                                                  path))
         self._long_key = None
-        return n
+        return len(new)
 
     def _garmin_import(self):
         """every 30 s: a Garmin handheld connected as a drive? Copy its GPX files (data\\garmin\\<unit>) when they
@@ -2899,10 +2979,12 @@ class Tracker(QtWidgets.QMainWindow):
                 gpx = glob.glob('%s:\\Garmin\\GPX\\**\\*.gpx' % letter, recursive=True)
             except OSError:
                 continue
-            sig = tuple(sorted((p, os.path.getmtime(p)) for p in gpx))
+            try:
+                sig = tuple(sorted((p, os.path.getmtime(p), os.path.getsize(p)) for p in gpx))
+            except OSError:         # (the drive went away while looking)
+                continue
             if self.garmin_seen.get(letter) == sig:
                 continue
-            self.garmin_seen[letter] = sig
             try:
                 txt = open(dev, errors='replace').read()
             except OSError:
@@ -2911,19 +2993,26 @@ class Tracker(QtWidgets.QMainWindow):
             m2 = re.search(r'<Id>(\d+)</Id>', txt)
             unit, uid = (m1.group(1) if m1 else 'Garmin'), (m2.group(1) if m2 else letter)
             dest = os.path.join(paths.DATA, 'garmin', str(uid))
-            n = 0
+            n, failed = 0, []
             for p in gpx:
                 rel = os.path.relpath(p, '%s:\\Garmin\\GPX' % letter)
                 out = os.path.join(dest, rel)
-                os.makedirs(os.path.dirname(out), exist_ok=True)
                 try:
-                    if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(p):
-                        shutil.copy2(p, out)
+                    os.makedirs(os.path.dirname(out), exist_ok=True)
+                    # copied whole or not at all: a copy cut short by the drive going away (the unit re-connects
+                    # when its mode changes) used to stay, newer than the source, and was never imported again
+                    if not os.path.exists(out) or os.path.getmtime(out) < os.path.getmtime(p) \
+                            or os.path.getsize(out) != os.path.getsize(p):
+                        shutil.copy2(p, out + '.tmp')
+                        os.replace(out + '.tmp', out)
                     n += self._import_gpx(out, unit, quiet=True)
-                except OSError:
-                    pass
-            self.events.insertItem(0, '%s  %s connected: %d GPX files copied to %s, %d reference points' % (
-                fmt_clock(time.time()), unit, len(gpx), dest, n))
+                except OSError as e:
+                    failed.append('%s (%s)' % (rel, e.strerror or e))
+            if not failed:
+                self.garmin_seen[letter] = sig      # (only a complete pass counts: a failed one is tried again)
+            self.events.insertItem(0, '%s  %s connected: %d GPX files copied to %s, %d reference points%s' % (
+                fmt_clock(time.time()), unit, len(gpx) - len(failed), dest, n,
+                ' - could not read %s; trying again' % ', '.join(failed[:3]) if failed else ''))
 
     def _save_reference(self):
         import refpoints
@@ -2950,22 +3039,40 @@ class Tracker(QtWidgets.QMainWindow):
                                      '\u2605, else one named "antenna" (else your home location). A Garmin\'s "still '
                                      'from ..." points are where it sat 3+ minutes - star the one beside the antenna.'))
         tree = QtWidgets.QTreeWidget()
-        tree.setHeaderLabels(['', 'Name', 'From the recent middle', 'Height (sea level)', 'Source'])
+        cols = ['', 'Name', 'From the recent middle', 'From home', '95 % within', 'Points', 'Span',
+                'Height (sea level)', 'Source']
+        tree.setHeaderLabels(cols)
         tree.setRootIsDecorated(False)
         v.addWidget(tree, 1)
         mid = getattr(self, '_long', None)
+        home = (HOME_LAT, HOME_LON) if catalog.HOME else None
 
         def fill():
             tree.clear()
-            for r in refpoints.load():
+            # the tightest first: a stretch is only as good as its scatter (indoor, sparse ones are greyed)
+            refs = sorted(refpoints.load(), key=lambda r: (not r.get('primary'), r.get('scatter95_m') is None,
+                                                          r.get('scatter95_m') or 0))
+            for r in refs:
                 dist = refpoints._dist(mid['lat'], mid['lon'], r['lat'], r['lon']) if mid else None
-                it = QtWidgets.QTreeWidgetItem(['\u2605' if r.get('primary') else '', r['name'],
-                                                '%.1f m' % dist if dist is not None else '-',
-                                                '%.0f m' % r['height_msl'] if r.get('height_msl') is not None else '-',
-                                                r.get('source', '')])
+                dh = refpoints._dist(home[0], home[1], r['lat'], r['lon']) if home else None
+                sc, n, span = r.get('scatter95_m'), r.get('n'), r.get('span_s')
+                baro = r.get('height_source') == 'barometer' or 'track' in r.get('source', '') \
+                    or 'waypoint' in r.get('source', '')
+                it = QtWidgets.QTreeWidgetItem([
+                    '\u2605' + (' (auto)' if r.get('auto_star') else '') if r.get('primary') else '', r['name'],
+                    '%.1f m' % dist if dist is not None else '-', '%.1f m' % dh if dh is not None else '-',
+                    '%.1f m' % sc if sc is not None else '-', '%d' % n if n else '-',
+                    '%.0f min' % (span / 60) if span else '-',
+                    ('%.0f m%s' % (r['height_msl'], ' (barometer)' if baro else ''))
+                    if r.get('height_msl') is not None else '-', r.get('source', '')])
                 it.setData(1, Qt.UserRole, r['name'])
+                if sc is not None and not refpoints.good_stretch(n, span, sc):
+                    for c in range(len(cols)):
+                        it.setForeground(c, QtGui.QColor(MUTED))
+                    it.setToolTip(1, 'Sparse or wide (fewer than %d points at one every 2 s, and 95 %% not within %.0f m) '
+                                     '- not a good reference' % (refpoints.GOOD_N, refpoints.GOOD_SCATTER_M))
                 tree.addTopLevelItem(it)
-            for c in range(5):
+            for c in range(len(cols)):
                 tree.resizeColumnToContents(c)
 
         def primary():
@@ -3174,6 +3281,22 @@ class Tracker(QtWidgets.QMainWindow):
         self.rx_dot.setText('<span style="color:%s; font-size:16px">●</span>' % (ALERT if on else IDLE))
         self.rx_btn.setEnabled(True)
         self.rx_system.setEnabled(not on)        # switch systems while stopped
+        self._sound_for_band(on)
+
+    def _sound_for_band(self, on):
+        """GNSS bands send no sound (their signals lie under the noise, there is nothing to hear - gnss_rx no longer
+        builds the sound tree for them): while one is received the sound controls are greyed out and say why"""
+        sp = getattr(self, 'spectrum', None)
+        if sp is None:
+            return
+        if not hasattr(self, '_sound_tip'):
+            self._sound_tip = sp.sound.toolTip()
+        system = getattr(self.receiver, 'system', None) or {}
+        silent = bool(on and system.get('system') == 'gnss')
+        for wdg in (sp.sound, sp.volume, sp.audio_btn):
+            wdg.setEnabled(not silent)
+        sp.sound.setToolTip('No sound on %s: satellite navigation signals lie under the noise, so there is nothing '
+                            'to hear' % system.get('label', 'this band') if silent else self._sound_tip)
 
     def _receiver_status(self, text):
         self.rx_status.setText(text)
@@ -3705,6 +3828,12 @@ class Tracker(QtWidgets.QMainWindow):
         dt, self.last_tick = now - self.last_tick, now
         if self.following:
             self.t = now
+            # live, the scene is rebuilt once a second, not at every 100 ms tick: the clock shows whole seconds,
+            # the timeline moves ~20 s per pixel, and new data comes with poll() (which rebuilds it itself). A
+            # rebuild took 24-78 ms in the GNSS view (measure_b.py) - at 10 a second 43-97 % of the main thread.
+            # Playback and scrubbing still rebuild at every tick so they stay smooth.
+            if int(now) == self._scene_second:
+                return
         elif self.playing:
             self.t += dt * self.speed
         else:
@@ -3785,6 +3914,7 @@ class Tracker(QtWidgets.QMainWindow):
     def refresh(self, *_):
         t = self.t
         d = self.data
+        self._scene_second = int(t) if self.following else None     # (see tick)
         self.time_label.setText(fmt_time(t, True) + ('   LIVE' if self.following else ''))
         self.timeline.set_time(t, keep_visible=self.playing or self.following)
         sats = []

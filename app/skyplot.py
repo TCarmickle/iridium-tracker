@@ -4,8 +4,8 @@ Centre = straight overhead, edge = the horizon, north at the top, east to the ri
   satellites  the ones above your horizon now (from our own orbits), named; a green ring = heard in the last
               minute, blue brackets = the one selected, whose pass across your sky is drawn as a path
   big dots    positions the satellites reported (Iridium ring alerts, Orbcomm ephemeris), coloured by signal
-  small dots  everything else heard from identified satellites (frames, packets, GNSS tracking), placed with
-              our own orbit for that satellite
+  shading     everything else heard from identified satellites (frames, packets, GNSS tracking), placed with
+              our own orbit for that satellite and counted in 3-degree patches of sky (brighter = more heard)
 Empty parts of the circle are directions or heights your antenna isn't hearing - blocked, or in its
 pattern's blind spot (a vertical whip, for instance, hears little straight up).
 """
@@ -19,7 +19,11 @@ from PyQt5.QtCore import QPointF, Qt
 TEXT, MUTED, GRID = '#e6e9ef', '#8b93a1', '#2f3541'
 SNR_LO, SNR_HI = 12.0, 30.0
 SECTORS = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
-FRAME_CAP = 200         # at most this many 'heard' dots per pass (see sky_points)
+# 'heard' receptions are counted in cells of the sky this many degrees on a side (elevation and azimuth): a GNSS pass
+# has a point per second for hours (760 000 points in the catalog after a few days); drawing a dot for each froze the
+# window for seconds, and the cap of 200 dots per pass that replaced it (73fabfc) thinned long passes out
+CELL_DEG = 3
+N_EL, N_AZ = 90 // CELL_DEG, 360 // CELL_DEG
 
 
 def snr_colour(snr):
@@ -33,38 +37,89 @@ def snr_colour(snr):
     return QtGui.QColor(*stops[-1][1])
 
 
-def sky_points(data, from_home, since=0.0, shows=None):
-    """(fixes [(el, az, snr, t)], frames [(el, az, t)]) heard since `since` (unix time);
+def sky_fixes(data, from_home, since=0.0, shows=None):
+    """[(el, az, snr, t)]: the positions satellites reported (Iridium ring alerts, Orbcomm) since `since`;
     shows(name, capture) -> bool limits it to the systems being shown"""
     shows = shows or (lambda name, cap=None: True)
-    fixes = []
     fx = [f for f in data.all_fixes() if f.get('xyz_km') and f['t'] >= since and shows(f['name'], f['cap'])]
-    if fx:
-        X, Y, Z = np.array([f['xyz_km'] for f in fx], float).T
-        el, az, _ = from_home(X, Y, Z)
-        fixes = [(float(e), float(a), f['snr'], f['t']) for e, a, f in zip(el, az, fx) if e > -2]
-    frames = []
-    for name, groups in data.doppler.items():
-        orbit = data.orbits.get(name)
-        if orbit is None or not shows(name):
-            continue
-        # one dot every few seconds is all the picture needs: a GNSS pass has a point per second for hours (760 000
-        # points in the catalog after a few days), and propagating and painting every one froze the window for
-        # seconds at each refresh
-        ts = []
-        for g in groups:
-            step = max(1, len(g) // FRAME_CAP)
-            ts += [t for t, _ in g[::step] if t >= since]
-        ts = np.array(ts, float)
+    if not fx:
+        return []
+    X, Y, Z = np.array([f['xyz_km'] for f in fx], float).T
+    el, az, _ = from_home(X, Y, Z)
+    return [(float(e), float(a), f['snr'], f['t']) for e, a, f in zip(el, az, fx) if e > -2]
+
+
+class HeardCells:
+    """everything heard from identified satellites (frames, packets, GNSS tracking), each reception placed with our
+    own orbit for that satellite and counted in a CELL_DEG sky cell. Worked out incrementally: each Doppler curve's
+    receptions are placed once and kept (cell number + time); a curve still growing live only has its new points
+    placed; a satellite whose orbit was refitted is placed again; a moved home starts over.
+    Measured on the 11-06 catalog + an 11 h live session (week-2 sky_load.py): 'Everything' took 190 ms to gather
+    and 360 ms to paint every 5 s even with the 200-dot cap; now placing all 783 000 receptions takes 400 ms once
+    (when the sky is first shown), each 5 s refresh 5-9 ms and its paint 3 ms (25 ms when the cells changed)."""
+
+    def __init__(self):
+        self.curves = {}        # id(curve) -> [curve, orbit, points done, cells (int16), times, name, all-time counts]
+        self.home = None
+
+    def update(self, data, from_home, shows):
+        probe = tuple(float(np.asarray(v).reshape(-1)[0]) for v in from_home(np.array([7000.0]), np.array([0.0]),
+                                                                            np.array([0.0])))
+        if probe != self.home:          # (home moved: every place in the sky is different)
+            self.curves, self.home = {}, probe
+        seen = set()
+        for name, groups in data.doppler.items():
+            orbit = data.orbits.get(name)
+            if orbit is None:
+                continue
+            visible = shows(name)
+            for g in groups:
+                k = id(g)
+                e = self.curves.get(k)
+                if e is not None and e[0] is g and not visible:
+                    seen.add(k)             # (hidden for now: kept as it was, placed when shown)
+                    continue
+                if not visible:
+                    continue
+                if e is None or e[0] is not g or e[1] is not orbit or len(g) < e[2]:
+                    e = self.curves[k] = [g, orbit, 0, np.zeros(0, np.int16), np.zeros(0), name, None]
+                seen.add(k)
+                if len(g) > e[2]:
+                    self._place(e, g[e[2]:], from_home)
+        for k in [k for k in self.curves if k not in seen]:
+            del self.curves[k]
+
+    @staticmethod
+    def _place(e, new, from_home):
+        orbit = e[1]
+        e[2] += len(new)
+        ts = np.fromiter((t for t, _ in new), float, len(new))
+        ts = ts[orbit.sigma_km(ts) < 300]           # only where our orbit for it is good
         if not len(ts):
-            continue
-        ok = orbit.sigma_km(ts) < 300           # only where our orbit for it is good
-        if not ok.any():
-            continue
-        X, Y, Z = orbit.ecef(ts[ok]).T
+            return
+        X, Y, Z = orbit.ecef(ts).T
         el, az, _ = from_home(X, Y, Z)
-        frames += [(float(e), float(a), float(t)) for e, a, t in zip(el, az, ts[ok]) if e > -2]
-    return fixes, frames
+        keep = el > -2                              # (just below the horizon counts as on it)
+        el, az, ts = el[keep], az[keep], ts[keep]
+        cell = (np.clip(el, 0, 89.999) // CELL_DEG).astype(np.int16) * N_AZ +             ((az % 360) // CELL_DEG).astype(np.int16)
+        e[3] = np.concatenate([e[3], cell])
+        e[4] = np.concatenate([e[4], ts])
+        e[6] = None
+
+    def counts(self, since, shows):
+        """(N_EL, N_AZ) receptions per cell since `since`, of the satellites shown"""
+        acc = np.zeros(N_EL * N_AZ, np.int64)
+        for e in self.curves.values():
+            ts = e[4]
+            if not len(ts) or not shows(e[5]):
+                continue
+            if since <= ts.min():
+                if e[6] is None:
+                    e[6] = np.bincount(e[3], minlength=N_EL * N_AZ)
+                acc += e[6]
+            elif since <= ts.max():
+                acc += np.bincount(e[3][ts >= since], minlength=N_EL * N_AZ)
+        return acc.reshape(N_EL, N_AZ)
 
 
 class SkyPlot(QtWidgets.QWidget):
@@ -73,15 +128,25 @@ class SkyPlot(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setMinimumSize(300, 240)
-        self.fixes, self.frames = [], []
+        self.fixes = []
+        self.cells = np.zeros((N_EL, N_AZ), np.int64)       # receptions per sky cell (HeardCells.counts)
         self.now = []           # satellites up now: dicts with el, az, name, selected, live, el colour, system
         self.path = []          # the selected satellite's pass: [(el, az, t)]
         self.show_heard = self.show_now = self.show_path = True
         self.hits = []
+        # the grid and everything heard are drawn once into a picture and reused: the satellites up now change every
+        # second, what was heard only every 5 s (and often not at all) - so a second's repaint draws only the overlay
+        self._layer, self._layer_key, self._layer_version = None, None, 0
 
-    def set_points(self, fixes, frames):
-        self.fixes, self.frames = fixes, frames
-        self.update()
+    @property
+    def n_heard(self):
+        return int(self.cells.sum())
+
+    def set_points(self, fixes, cells):
+        if fixes != self.fixes or not np.array_equal(cells, self.cells):
+            self.fixes, self.cells = fixes, cells
+            self._layer_version += 1
+            self.update()
 
     def set_now(self, sats, path):
         self.now, self.path = sats, path
@@ -96,13 +161,29 @@ class SkyPlot(QtWidgets.QWidget):
         a = math.radians(az)
         return QPointF(cx + r * math.sin(a), cy - r * math.cos(a))
 
-    def paintEvent(self, _):
-        p = QtGui.QPainter(self)
-        p.setRenderHint(QtGui.QPainter.Antialiasing)
-        p.fillRect(self.rect(), QtGui.QColor('#14171c'))
+    def _geometry(self):
         w, h = self.width(), self.height()
-        R = min(w, h) / 2 - 34
-        cx, cy = w / 2, h / 2
+        return w, h, min(w, h) / 2 - 34, w / 2, h / 2
+
+    def _heard_layer(self):
+        """the background picture: grid, labels, heard cells, reported positions and their colour scale"""
+        dpr = self.devicePixelRatioF()
+        key = (self.width(), self.height(), dpr, self.show_heard, self._layer_version)
+        if self._layer is not None and self._layer_key == key:
+            return self._layer
+        pix = QtGui.QPixmap(max(1, int(self.width() * dpr)), max(1, int(self.height() * dpr)))
+        pix.setDevicePixelRatio(dpr)
+        p = QtGui.QPainter(pix)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        p.setFont(self.font())
+        self._paint_heard(p)
+        p.end()
+        self._layer, self._layer_key = pix, key
+        return pix
+
+    def _paint_heard(self, p):
+        w, h, R, cx, cy = self._geometry()
+        p.fillRect(QtCore.QRectF(0, 0, w, h), QtGui.QColor('#14171c'))
         font = p.font()
         font.setPointSize(8)
         p.setFont(font)
@@ -110,6 +191,15 @@ class SkyPlot(QtWidgets.QWidget):
         p.setBrush(QtGui.QColor('#1b1f26'))
         p.setPen(QtGui.QPen(QtGui.QColor(GRID), 1))
         p.drawEllipse(QPointF(cx, cy), R, R)
+        # what was heard, under the grid lines: one wedge per sky cell, brighter where more was heard
+        if self.show_heard and self.cells.any():
+            p.setPen(Qt.NoPen)
+            top = math.log1p(float(self.cells.max()))
+            for i, j in zip(*np.nonzero(self.cells)):
+                alpha = int(45 + 150 * math.log1p(float(self.cells[i, j])) / top)
+                p.setBrush(QtGui.QColor(150, 170, 200, alpha))
+                p.drawPath(self._cell_path(int(i), int(j), cx, cy, R))
+            p.setPen(QtGui.QPen(QtGui.QColor(GRID), 1))
         p.setBrush(Qt.NoBrush)
         for el in (30, 60):
             r = (90 - el) / 90 * R
@@ -119,8 +209,8 @@ class SkyPlot(QtWidgets.QWidget):
         p.setPen(QtGui.QColor(MUTED))
         for el in (0, 30, 60):
             r = (90 - el) / 90 * R
-            p.drawText(QPointF(cx + 4, cy - r + 12), '%d°' % el)
-        p.drawText(QPointF(cx + 4, cy + 12), '90° (overhead)')
+            p.drawText(QPointF(cx + 4, cy - r + 12), '%d\u00b0' % el)
+        p.drawText(QPointF(cx + 4, cy + 12), '90\u00b0 (overhead)')
         for name, az in (('N', 0), ('E', 90), ('S', 180), ('W', 270)):
             pt = self._xy(-8, az, cx, cy, R + 14)
             p.setPen(QtGui.QColor(TEXT))
@@ -129,16 +219,46 @@ class SkyPlot(QtWidgets.QWidget):
             p.setFont(f2)
             p.drawText(QtCore.QRectF(pt.x() - 10, pt.y() - 8, 20, 16), Qt.AlignCenter, name)
             p.setFont(font)
-        # frames from identified satellites, then the position fixes on top
-        if self.show_heard:
-            p.setPen(Qt.NoPen)
-            p.setBrush(QtGui.QColor(150, 170, 200, 70))
-            for el, az, _ in self.frames:
-                p.drawEllipse(self._xy(el, az, cx, cy, R), 1.8, 1.8)
-            for el, az, snr, _ in sorted(self.fixes, key=lambda f: f[2]):
-                p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 140), 1))
-                p.setBrush(snr_colour(snr))
-                p.drawEllipse(self._xy(el, az, cx, cy, R), 4.5, 4.5)
+        if not self.show_heard:
+            return
+        # the position fixes on top
+        for el, az, snr, _ in sorted(self.fixes, key=lambda f: f[2]):
+            p.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0, 140), 1))
+            p.setBrush(snr_colour(snr))
+            p.drawEllipse(self._xy(el, az, cx, cy, R), 4.5, 4.5)
+        # colour scale (for the reported positions, when there are any)
+        if self.fixes:
+            x0, y0 = 12, h - 22
+            for i in range(100):
+                p.fillRect(QtCore.QRectF(x0 + i, y0, 1.2, 8), snr_colour(SNR_LO + (SNR_HI - SNR_LO) * i / 99))
+            p.setPen(QtGui.QColor(MUTED))
+            p.drawText(QPointF(x0, y0 - 4), 'reported position signal  %.0f - %.0f dB' % (SNR_LO, SNR_HI))
+
+    @staticmethod
+    def _cell_path(i, j, cx, cy, R):
+        """the wedge of sky cell (elevation row i, azimuth column j)"""
+        r_out = (90 - i * CELL_DEG) / 90 * R
+        r_in = (90 - (i + 1) * CELL_DEG) / 90 * R
+        a0 = 90 - j * CELL_DEG          # (Qt's angles: anticlockwise from east; azimuth: clockwise from north)
+        outer = QtCore.QRectF(cx - r_out, cy - r_out, 2 * r_out, 2 * r_out)
+        path = QtGui.QPainterPath()
+        path.arcMoveTo(outer, a0)
+        path.arcTo(outer, a0, -CELL_DEG)
+        if r_in > 0.5:
+            path.arcTo(QtCore.QRectF(cx - r_in, cy - r_in, 2 * r_in, 2 * r_in), a0 - CELL_DEG, CELL_DEG)
+        else:
+            path.lineTo(cx, cy)
+        path.closeSubpath()
+        return path
+
+    def paintEvent(self, _):
+        p = QtGui.QPainter(self)
+        p.drawPixmap(0, 0, self._heard_layer())
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        w, h, R, cx, cy = self._geometry()
+        font = p.font()
+        font.setPointSize(8)
+        p.setFont(font)
         import iridium_tracker as it        # (the map's satellite drawing and colours)
         # the selected satellite's pass: rises, highest, sets
         if self.show_path and len(self.path) > 1:
@@ -168,34 +288,30 @@ class SkyPlot(QtWidgets.QWidget):
                 p.setPen(QtGui.QColor(TEXT))
                 p.drawText(QPointF(q.x() + 13, q.y() - 7), s['label'])
                 self.hits.append((q.x(), q.y(), s['name']))
-        # colour scale (for the reported positions, when there are any)
-        if self.show_heard and self.fixes:
-            x0, y0 = 12, h - 22
-            for i in range(100):
-                p.fillRect(QtCore.QRectF(x0 + i, y0, 1.2, 8), snr_colour(SNR_LO + (SNR_HI - SNR_LO) * i / 99))
-            p.setPen(QtGui.QColor(MUTED))
-            p.drawText(QPointF(x0, y0 - 4), 'reported position signal  %.0f - %.0f dB' % (SNR_LO, SNR_HI))
 
 
-def summary(fixes, frames):
-    """a few lines on what the plot shows"""
-    pts = [(f[0], f[1]) for f in fixes] + [(f[0], f[1]) for f in frames]
-    if not pts:
+def summary(fixes, cells):
+    """a few lines on what the plot shows (the receptions counted by sky cell, at each cell's middle)"""
+    el_c, az_c = np.meshgrid((np.arange(N_EL) + 0.5) * CELL_DEG, (np.arange(N_AZ) + 0.5) * CELL_DEG, indexing='ij')
+    els = np.concatenate([np.array([f[0] for f in fixes], float), el_c.ravel()])
+    azs = np.concatenate([np.array([f[1] for f in fixes], float), az_c.ravel()])
+    wts = np.concatenate([np.ones(len(fixes)), np.asarray(cells, float).ravel()])
+    total = wts.sum()
+    if not total:
         return 'Nothing heard in this period yet.'
-    els = np.array([e for e, _ in pts])
-    sector = [SECTORS[int(((a + 22.5) % 360) // 45)] for _, a in pts]
-    counts = {s: sector.count(s) for s in SECTORS}
-    total = len(pts)
+    sector = (((azs + 22.5) % 360) // 45).astype(int)
+    counts = {s: wts[sector == k].sum() for k, s in enumerate(SECTORS)}
     dead = [s for s in SECTORS if counts[s] < 0.02 * total]
-    bands = [('overhead (60-90°)', els >= 60), ('high (30-60°)', (els >= 30) & (els < 60)),
-             ('low (0-30°)', els < 30)]
+    bands = [('overhead (60-90\u00b0)', els >= 60), ('high (30-60\u00b0)', (els >= 30) & (els < 60)),
+             ('low (0-30\u00b0)', els < 30)]
+    share = {n: wts[m].sum() / total for n, m in bands}
     lines = ['<b>%d reported positions</b> and <b>%d other receptions</b> from identified satellites.'
-             % (len(fixes), len(frames)),
-             'By height: ' + ', '.join('%s %d%%' % (n, round(100 * m.mean())) for n, m in bands) + '.',
+             % (len(fixes), int(np.asarray(cells).sum())),
+             'By height: ' + ', '.join('%s %d%%' % (n, round(100 * share[n])) for n, _ in bands) + '.',
              'By direction: ' + ', '.join('%s %d%%' % (s, round(100 * counts[s] / total)) for s in SECTORS) + '.']
     if dead:
         lines.append('<span style="color:#ff6b6b">Little or nothing heard from: %s.</span>' % ', '.join(dead))
-    if (els >= 60).mean() < 0.05:
+    if share[bands[0][0]] < 0.05:
         lines.append('<span style="color:#ff6b6b">Almost nothing from overhead</span> - typical of a vertical whip '
                      '(blind straight up), or something above the antenna. An upward-facing patch antenna hears '
                      'overhead satellites best - and those are the closest and strongest.')
@@ -215,6 +331,7 @@ class SkyDialog(QtWidgets.QDialog):
         self.tracker = parent
         self.plot = SkyPlot()
         self.plot.satelliteClicked.connect(parent.select)
+        self.heard = HeardCells()
         self.period = QtWidgets.QComboBox()
         for label, _ in self.PERIODS:
             self.period.addItem(label)
@@ -245,7 +362,7 @@ class SkyDialog(QtWidgets.QDialog):
         note = QtWidgets.QLabel('<span style="color:%s">Centre = straight overhead, edge = horizon, north up, east right. '
                                 'Satellites: up now (click one to select it; ring = signal strength, red weak to '
                                 'green strong, fading as it goes quiet). '
-                                'Big dots: positions the satellites reported (colour = signal). Small dots: everything '
+                                'Big dots: positions the satellites reported (colour = signal). Shading: everything '
                                 'else heard from identified satellites. Move the antenna and watch the empty areas '
                                 'fill in.</span>' % MUTED)
         note.setWordWrap(True)
@@ -260,6 +377,7 @@ class SkyDialog(QtWidgets.QDialog):
         self.up.cellClicked.connect(lambda r, c: parent.select(self.up.item(r, 0).data(Qt.UserRole)))
         self.up.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)    # (the selected satellite is coloured)
         self.up.setFocusPolicy(Qt.NoFocus)
+        self._up_rows = None        # what the table shows now (update_now changes only what differs)
         mid = QtWidgets.QHBoxLayout()
         mid.addWidget(self.plot, 1)
         mid.addWidget(self.up)
@@ -290,9 +408,12 @@ class SkyDialog(QtWidgets.QDialog):
             since = self.run_start() or time.time()
         else:
             since = time.time() - span if span else 0.0
-        fixes, frames = sky_points(self.data, self.from_home, since, self.shows)
-        self.plot.set_points(fixes, frames)
-        self.text.setText(summary(fixes, frames))
+        shows = self.shows or (lambda name, cap=None: True)
+        fixes = sky_fixes(self.data, self.from_home, since, shows)
+        self.heard.update(self.data, self.from_home, shows)
+        cells = self.heard.counts(since, shows)
+        self.plot.set_points(fixes, cells)
+        self.text.setText(summary(fixes, cells))
         self.update_now()
 
     def update_now(self):
@@ -315,21 +436,42 @@ class SkyDialog(QtWidgets.QDialog):
             path = [(float(e), float(a), float(t)) for e, a, t in zip(el, az, ts) if e >= 0]
         self.plot.set_now(sats, path)
         sats.sort(key=lambda s: -s['el'])
-        self.up.setRowCount(len(sats))
-        for r, s in enumerate(sats):
+        rows = []
+        for s in sats:
             heard = 'now' if s['live'] else ''
             info = tr.data.info.get(s['name'], {}).get('now')
             if info and s['live'] and 'cn0' in info:
                 heard = '%.0f dB-Hz' % info['cn0']
-            for c, v in enumerate([s['label'], '%.0f\u00b0' % s['el'], '%s %.0f\u00b0' % (
-                    SECTORS[int(((s['az'] + 22.5) % 360) // 45)], s['az']), heard]):
-                item = QtWidgets.QTableWidgetItem(v)
-                if c == 0:
-                    item.setData(Qt.UserRole, s['name'])
-                f = item.font()
-                f.setBold(s['selected'])
-                item.setFont(f)
-                if s['selected']:           # the main list's selection colour
-                    item.setBackground(it.C_SELECTED_NAME)
-                    item.setForeground(QtGui.QColor('#ffffff'))
-                self.up.setItem(r, c, item)
+            rows.append((s['name'], s['selected'], [s['label'], '%.0f\u00b0' % s['el'], '%s %.0f\u00b0' % (
+                SECTORS[int(((s['az'] + 22.5) % 360) // 45)], s['az']), heard]))
+        if rows == self._up_rows:
+            return
+        # only the cells that changed are touched: rebuilding the table with new items took ~1 ms a cell (its
+        # columns are sized to their contents, measured again at every one) - 98 ms of each second's update
+        # with 25 satellites up (week-2 sky_load.py)
+        self._up_rows = rows
+        self.up.setUpdatesEnabled(False)
+        try:
+            self.up.setRowCount(len(rows))
+            for r, (name, selected, texts) in enumerate(rows):
+                for c, v in enumerate(texts):
+                    item = self.up.item(r, c)
+                    if item is None:
+                        item = QtWidgets.QTableWidgetItem(v)
+                        self.up.setItem(r, c, item)
+                    elif item.text() != v:
+                        item.setText(v)
+                    if c == 0 and item.data(Qt.UserRole) != name:
+                        item.setData(Qt.UserRole, name)
+                    if item.font().bold() != selected:
+                        f = item.font()
+                        f.setBold(selected)
+                        item.setFont(f)
+                    if selected:            # the main list's selection colour
+                        item.setBackground(it.C_SELECTED_NAME)
+                        item.setForeground(QtGui.QColor('#ffffff'))
+                    elif item.background().style() != Qt.NoBrush:
+                        item.setBackground(QtGui.QBrush())
+                        item.setForeground(QtGui.QBrush())
+        finally:
+            self.up.setUpdatesEnabled(True)

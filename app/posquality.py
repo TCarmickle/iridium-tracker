@@ -76,7 +76,27 @@ def _corr_time(t, x):
 
 
 SESSION_GAP_S = 600.0
-TAU_MIN_S = 120.0       # GNSS position errors are taken to change no faster than this (see quality)
+TAU_MIN_S = 120.0       # GNSS position errors are taken to change no faster than this (see quality)...
+# ...per source, calibrated 2026-11-06 against the Garmin's outdoor point beside the antenna (build\_tmp\
+# review-20261106\garmin-reference\calib.py): the own solver's errors are smoothed and slow (measured correlation
+# ~51 s, but a bias that lasts the whole window), so with 120 s its '10-min average' claim held only ~52-80 % of
+# the time - 240 s plus the window's own drift holds 92-97 %; pocket_trk's are nearly white (~9 s), so 120 s made
+# its claim ~5x too pessimistic - 30 s still holds 100 %
+TAU_FLOOR_S = {'own': 240.0, 'pocket': 30.0}
+LT_MIN_SESSIONS = 4     # 'all N sessions' is shown from this many on (with 2 the spread is a guess)
+_T975 = {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447, 7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+         12: 2.179, 15: 2.131, 20: 2.086, 30: 2.042}
+
+
+def t975(dof):
+    """Student's t (97.5 %) for this many degrees of freedom: a spread from few sessions is itself uncertain"""
+    if dof <= 0:
+        return float('inf')
+    keys = sorted(_T975)
+    for k in keys:
+        if dof <= k:
+            return _T975[k]
+    return 1.96
 AVG_MIN_S = 300.0       # a window's average figure needs at least this much of it
 
 
@@ -94,15 +114,21 @@ def long_term(fixes, home=None):
     if cur:
         sessions.append(cur)
     mids = []
+    floor = TAU_FLOOR_S['own' if fx and 'hdop' in fx[-1] else 'pocket']
     for s in sessions:
         if len(s) >= MIN_FIXES and s[-1]['t'] - s[0]['t'] >= 120:
+            hm = [f['height_m'] for f in s if not f.get('prior')]     # (measured heights only: see quality())
+            # a session's weight: how many independent fixes it holds (a 2-minute one counted like an hour before)
+            w = max(1.0, (s[-1]['t'] - s[0]['t']) / (2.0 * floor))
             mids.append((float(np.median([f['lat'] for f in s])), float(np.median([f['lon'] for f in s])),
-                         float(np.median([f['height_m'] for f in s])), s[0]['t'], len(s)))
+                         float(np.median(hm)) if len(hm) >= MIN_FIXES else None, s[0]['t'], len(s), w))
     if not mids:
         return None
-    lat = float(np.mean([m[0] for m in mids]))
-    lon = float(np.mean([m[1] for m in mids]))
-    h = float(np.mean([m[2] for m in mids]))
+    wts = np.array([m[5] for m in mids])
+    lat = float(np.average([m[0] for m in mids], weights=wts))
+    lon = float(np.average([m[1] for m in mids], weights=wts))
+    hs = [m[2] for m in mids if m[2] is not None]
+    h = float(np.mean(hs)) if hs else float('nan')
     e, n = _enu_m(lat, lon, [m[0] for m in mids], [m[1] for m in mids])
     N = len(mids)
     out = {'sessions': N, 'lat': lat, 'lon': lon, 'height_m': h, 'fixes': sum(m[4] for m in mids),
@@ -110,9 +136,12 @@ def long_term(fixes, home=None):
            'spread_m': float(np.sqrt(np.mean(e * e + n * n))),
            'days': len({time.localtime(m[3])[:3] for m in mids})}
     if N >= 2:
+        # the sessions' spread, widened by Student's t: from 2 sessions it is a guess (x6.5 at 95 %), from 10 fair
         sig = math.sqrt((np.var(e, ddof=1) + np.var(n, ddof=1)) / 2.0)
-        out['avg95_m'] = 2.45 * sig / math.sqrt(N)
-        out['v95_m'] = 1.96 * float(np.std([m[2] for m in mids], ddof=1)) / math.sqrt(N)
+        n_w = float(wts.sum() ** 2 / (wts ** 2).sum())      # (the weighted mean's effective number of sessions)
+        out['avg95_m'] = 2.45 * (t975(N - 1) / 1.96) * sig / math.sqrt(n_w)
+        out['v95_m'] = (t975(len(hs) - 1) * float(np.std(hs, ddof=1)) / math.sqrt(len(hs))) if len(hs) >= 2 \
+            else float('nan')
     if home:
         he, hn = _enu_m(lat, lon, home[0], home[1])
         out['from_home_m'] = float(math.hypot(he, hn))
@@ -127,10 +156,13 @@ def grade(r95):
     return 'bad'
 
 
-def quality(fixes, now=None, home=None, azel=None):
+def quality(fixes, now=None, home=None, azel=None, source=None):
     """fixes: [{'t','lat','lon','height_m','nsat'}]; now: the end of the window (default: the last fix);
-    home: (lat, lon, alt_km) or None; azel: the tracked satellites' (az, el) for the geometry.
+    home: (lat, lon, alt_km) or None; azel: the tracked satellites' (az, el) for the geometry; source: 'own' (our
+    solver's GSPP fixes) or 'pocket' (pocket_trk's GPOS) - by default told apart by the own fixes' 'hdop' key.
     Returns a dict (see the module notes), or None without enough fixes."""
+    if source is None:
+        source = 'own' if fixes and 'hdop' in fixes[-1] else 'pocket'
     fx = sorted((f for f in fixes if f.get('nsat', 0) >= 4 and not f.get('quick')), key=lambda f: f['t'])
     if not fx:
         return None
@@ -140,7 +172,10 @@ def quality(fixes, now=None, home=None, azel=None):
         return {'n': len(fx), 'enough': False, 't_last': fx[-1]['t'] if fx else None}
     lat = np.array([f['lat'] for f in fx])
     lon = np.array([f['lon'] for f in fx])
-    h = np.array([f['height_m'] for f in fx])
+    # heights: only from fixes that measured it - where the static antenna's height row (spp.py 'prior') held the
+    # solution, the height is the antenna's known one, and counting it would make the height look perfect
+    hm = [f for f in fx if not f.get('prior')]
+    h = np.array([f['height_m'] for f in (hm if len(hm) >= MIN_FIXES else fx)])
     t = np.array([f['t'] for f in fx])
     lat0, lon0, h0 = float(np.median(lat)), float(np.median(lon)), float(np.median(h))
     e, n = _enu_m(lat0, lon0, lat, lon)
@@ -156,10 +191,10 @@ def quality(fixes, now=None, home=None, azel=None):
     # (at least TAU_MIN_S: the atmosphere, reflections and the carrier smoothing make errors last minutes, which a
     # short window can't see - without the floor a 2-minute average claimed 0.6 m where the Garmin beside the antenna
     # showed 4 m, and separate sessions disagree by 1.4 m (WAAS-corrected) to 5 m (pocket_trk))
-    tau = max(_corr_time(t, e), _corr_time(t, n), TAU_MIN_S)
+    tau = max(_corr_time(t, e), _corr_time(t, n), TAU_FLOOR_S.get(source, TAU_MIN_S))
     n_eff = max(1.0, q['span_s'] / (2.0 * tau))
     sig = math.sqrt((_rstd(e) ** 2 + _rstd(n) ** 2) / 2.0)
-    q.update(tau_s=tau, n_eff=n_eff, avg95_m=2.45 * sig / math.sqrt(n_eff),
+    q.update(tau_s=tau, n_eff=n_eff, avg95_m=2.45 * sig / math.sqrt(n_eff), source_kind=source,
              avg_v95_m=1.96 * _rstd(h - h0) / math.sqrt(n_eff))
     # drift: the middle of the first two minutes against the last two
     a, b = t <= t[0] + 120, t >= t[-1] - 120
@@ -168,6 +203,9 @@ def quality(fixes, now=None, home=None, azel=None):
         eb, nb = float(np.median(e[b])), float(np.median(n[b]))
         q['drift_m'] = math.hypot(eb - ea, nb - na)
         q['drift_min'] = (np.median(t[b]) - np.median(t[a])) / 60.0
+        # a wander over the window is an error the scatter inside it cannot show: half of it goes into the
+        # average's uncertainty (measured: the own solver's drift medians 2-3.7 m exceeded its claimed 1.8-2.2 m)
+        q['avg95_m'] = math.hypot(q['avg95_m'], q['drift_m'] / 2.0)
     if home:
         he, hn = _enu_m(lat0, lon0, home[0], home[1])
         q['from_home_m'] = float(math.hypot(he, hn))
@@ -194,11 +232,11 @@ def headline(q):
     ref = q.get('ref')
     if ref:                         # measured against a reference point (independent of these fixes) when there is one
         avg += ', %.1f m from %s' % (q['ref_m'], ref['name'])
-    elif 'from_home_m' in q:
-        avg += ', %.1f m from home' % q['from_home_m']
+    elif 'from_home_m' in q:        # (the home setting is what this should be checking: say there is nothing better)
+        avg += ', %.1f m from home (no reference starred)' % q['from_home_m']
     parts.append(avg)
     lt = q.get('long')
-    if lt and lt['sessions'] >= 2:
+    if lt and lt['sessions'] >= LT_MIN_SESSIONS and 'avg95_m' in lt:
         far = (', %.1f m from %s' % (lt['ref_m'], ref['name']) if ref and 'ref_m' in lt else
                ', %.1f m from home' % lt['from_home_m'] if 'from_home_m' in lt else '')
         parts.append('all %d sessions ±%.1f m%s' % (lt['sessions'], lt['avg95_m'], far))

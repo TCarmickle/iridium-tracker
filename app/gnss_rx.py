@@ -188,12 +188,8 @@ class Quantizer:
         self.rms = None
 
     def __call__(self, x):
-        for watch in (NOISE, SNAP):
-            if watch:
-                try:
-                    watch(x)
-                except Exception as e:      # the watch must never stop the tracking
-                    log('GNSS watch: %r' % e)
+        if NOISE or SNAP:
+            watch_block(x)
         # 8 bits are plenty for signals under the noise: scale the noise to ~+-24 so it is neither clipped
         # nor coarse (the scale follows the noise level slowly)
         r = float(np.sqrt(np.mean(np.abs(x) ** 2) / 2)) + 1e-12
@@ -205,6 +201,72 @@ class Quantizer:
         # came out with the wrong sign (checked against the satellites' real geometry on live GPS data)
         iq[1::2] = np.clip(np.round(-x.imag * k), -127, 127)
         return iq.tobytes()
+
+
+# ---------------------------------------------------------------- the watches' own thread
+class Watcher(threading.Thread):
+    """runs the noise meter and the raw-sample recorder on their own thread, so the GNU Radio thread that feeds
+    pocket_trk only copies each block aside: the FFTs and file work used to run inside its work() call (0.25 ms a
+    block on average, up to 15 ms - offline rx_cpu.py), holding up the samples on their way to the pipe. Blocks
+    are handed over BATCH_S at a time (one hand-over per block, 470 a second, cost 0.14 core more than running
+    the watches in place). The queue holds about a second; if this thread ever falls that far behind, samples are
+    dropped (counted and logged) rather than the radio waiting - and the recorder gets zeros in their place, so
+    its 20 s before / 20 s after stay right in time."""
+    BATCH_S = 0.05
+    MAX_BATCHES = 20            # ~1 s
+
+    def __init__(self, rate):
+        super().__init__(daemon=True, name='gnss-watch')
+        self.q = queue.Queue(maxsize=self.MAX_BATCHES)
+        self.batch_n = int(rate * self.BATCH_S)
+        self.blocks, self.n = [], 0     # copied blocks not yet handed over
+        self.dropped = 0            # samples dropped in all
+        self.skipped = 0            # ...since the last batch that got through (it carries the count)
+        self.told = 0.0
+
+    def put(self, x, t):
+        """from the sample thread: never blocks"""
+        self.blocks.append(x.copy())        # (GNU Radio reuses the buffer after work())
+        self.n += len(x)
+        if self.n < self.batch_n:
+            return
+        try:
+            self.q.put_nowait((self.blocks, t, self.skipped))
+            self.skipped = 0
+        except queue.Full:
+            self.skipped += self.n
+            self.dropped += self.n
+        self.blocks, self.n = [], 0
+
+    def run(self):
+        while True:
+            blocks, t, skipped = self.q.get()
+            if skipped:
+                if SNAP:
+                    SNAP.skip(skipped)
+                if t - self.told > 60:
+                    self.told = t
+                    log('GNSS watch: the noise meter / raw recorder fell behind - %.1f s of samples skipped so far '
+                        '(the tracking itself is not affected)' % (self.dropped / opts.rate))
+            x = np.concatenate(blocks) if len(blocks) > 1 else blocks[0]
+            for watch in (NOISE, SNAP):
+                if watch:
+                    try:
+                        watch(x, t)         # (t: when the batch's last sample arrived)
+                    except Exception as e:      # the watch must never stop the tracking
+                        log('GNSS watch: %r' % e)
+
+
+WATCH = None
+
+
+def watch_block(x):
+    """a block of samples for the watches (from the GNU Radio thread; the time it arrived goes with it)"""
+    global WATCH
+    if WATCH is None:
+        WATCH = Watcher(opts.rate)
+        WATCH.start()
+    WATCH.put(x, time.time())
 
 
 # ---------------------------------------------------------------- the band's noise (jamming watch)
@@ -249,7 +311,8 @@ class NoiseMeter:
     def _reset(self):
         self.p_sum, self.p_n, self.clip, self.acc, self.nacc = 0.0, 0, 0, np.zeros(self.NFFT), 0
 
-    def __call__(self, x):
+    def __call__(self, x, now=None):
+        """a block of samples; now = when it arrived (the Watcher thread runs a little behind the radio)"""
         self.p_sum += float(np.sum(x.real * x.real + x.imag * x.imag))
         self.p_n += len(x)
         self.clip += int(np.count_nonzero((np.abs(x.real) > 0.99) | (np.abs(x.imag) > 0.99)))
@@ -261,7 +324,7 @@ class NoiseMeter:
             self.acc += np.abs(np.fft.fftshift(np.fft.fft(x[k:k + n] * self.win))) ** 2
             self.nacc += 1
             k += 4 * n + int(self.rand.integers(0, 8 * n))
-        now = time.time()
+        now = time.time() if now is None else now
         if now - self.t_last >= 1.0 and self.nacc:
             self._report(now)
 
@@ -341,16 +404,33 @@ class IQRecorder:
         except OSError:
             pass
 
-    def __call__(self, x):
+    def __call__(self, x, now=None):
+        """a block of samples; now = when it arrived (the Watcher thread runs a little behind the radio)"""
         b = np.empty(2 * len(x), np.int8)
         b[0::2] = np.clip(np.round(x.real * 128), -128, 127)
         b[1::2] = np.clip(np.round(x.imag * 128), -128, 127)
-        if self.rec:
+        self._store(b)
+        now = time.time() if now is None else now
+        if now - self.t_check >= 1.0:
+            self.t_check = now
+            self._poll(now)
+
+    def skip(self, n):
+        """n samples the Watcher had to drop: zeros in their place, so the saved stretch keeps its times right"""
+        if self.rec:            # (the recording's part of them)
+            self._store(np.zeros(2 * min(n, max(self.rec['left'], 0)), np.int8), ring=False)
+        self._store(np.zeros(2 * min(n, self.n), np.int8), record=False)   # (over a whole ring: it is all zeros)
+
+    def _store(self, b, ring=True, record=True):
+        """interleaved int8 I,Q into the recording (if one is running) and the ring of the last PRE_S seconds"""
+        if self.rec and record:
             self.rec['q'].put(b.tobytes())
-            self.rec['left'] -= len(x)
+            self.rec['left'] -= len(b) // 2
             if self.rec['left'] <= 0:
                 self.rec['q'].put(None)
                 self.rec = None
+        if not ring:
+            return
         k = len(b)
         if k >= len(self.ring):
             self.ring[:] = b[-len(self.ring):]
@@ -363,12 +443,8 @@ class IQRecorder:
                 cut = len(self.ring) - self.pos * 2
                 self.ring[self.pos * 2:] = b[:cut]
                 self.ring[:k - cut] = b[cut:]
-            self.pos = (self.pos + len(x)) % self.n
-            self.filled = min(self.n, self.filled + len(x))
-        now = time.time()
-        if now - self.t_check >= 1.0:
-            self.t_check = now
-            self._poll(now)
+            self.pos = (self.pos + k // 2) % self.n
+            self.filled = min(self.n, self.filled + k // 2)
 
     def _poll(self, now):
         if not os.path.exists(self.trigger):
@@ -648,6 +724,111 @@ class BeidouNames:
             emit(line.replace(' %s ' % chan, ' %s ' % sat, 1))
 
 
+class HeightPrior:
+    """the static antenna's ellipsoid height for the solver's height row (spp.Solver.set_prior), from this solver's
+    OWN fixes - never the home setting (a map-picked home carries an internet terrain height, ~20 m off the GPS
+    ellipsoid here). Learned from prior-free fixes that stand on their own (5+ satellites, VDOP 4 or better, settled),
+    kept in gnss-solver.json between sessions; the first time from the catalog's earlier sessions. Checked all the
+    time against those prior-free fixes: if they disagree by more than 3 sigma over 2 minutes (the antenna was moved
+    up or down) the prior is dropped and learned again."""
+    LEARN_N = 300           # prior-free fixes (5 min) before a session's own height counts, and the check's window
+    NEW_N = 900             # ...but 15 min of them before a brand-new prior (none kept, or one just dropped) is used
+    VDOP_MAX = 8.0          # (5-satellite solutions here have VDOP 5-6.5: a tighter limit never let one through)
+    MAX_N = 20000           # how many fixes the kept height may stand for (so it can still follow a slow change)
+
+    def __init__(self, solver):
+        self.solver = solver
+        self.free = collections.deque(maxlen=self.LEARN_N)
+        self.n_new = 0
+        st = STATE.get('height')
+        if not (isinstance(st, dict) and {'h', 'lat', 'lon'} <= set(st)):
+            st = self._from_catalog()
+            if st:
+                STATE['height'] = st
+                save_state(force=True)
+        if st:
+            solver.set_prior(st['h'], st['lat'], st['lon'])
+            log('GNSS position solver: height prior %.1f m (ellipsoid, from %d of its own fixes%s) - 3 satellites, or '
+                '4 with poor geometry, still give a position' % (st['h'], st.get('n', 0),
+                                                                ', earlier sessions' if st.get('src') else ''))
+        else:
+            log('GNSS position solver: no height prior yet - it is learned from this session\'s fixes (5 min of '
+                '5+ satellites)')
+
+    @staticmethod
+    def _from_catalog():
+        """the median of the earlier sessions' WAAS-corrected middles (each 5+ min of settled fixes), if 2+ agree"""
+        import catalog
+        mids = []
+        for cap in catalog.load_data().values():
+            w = (cap.get('session') or {}).get('waas') if cap.get('system') == 'gnss1' else None
+            if w and w.get('r95_m', 99) < 10 and w.get('span_s', 0) >= 300:
+                mids.append((w['height_m'], w['lat'], w['lon']))
+        if len(mids) < 2:
+            return None
+        h = float(np.median([m[0] for m in mids]))
+        near = [m for m in mids if abs(m[0] - h) < 3 * spp.PRIOR_SIGMA_M]
+        if len(near) < 2:
+            return None
+        return {'h': float(np.median([m[0] for m in near])), 'lat': float(np.median([m[1] for m in near])),
+                'lon': float(np.median([m[2] for m in near])), 'n': 300 * len(near), 't': time.time(),
+                'src': 'catalog %d sessions' % len(near)}
+
+    def _limit(self, vdop):
+        """how far a 5-minute median of prior-free heights may stray by chance: their errors last about a minute
+        (so 5 min hold ~3 independent ones) and a range error of ~1.5 m becomes VDOP x that in height - from this
+        site the 5-satellite solutions have VDOP 5-6.5 (measured 2026-11-06), so the line is ~20 m, not 9"""
+        return max(3 * spp.PRIOR_SIGMA_M, 2.5 * 1.5 * vdop)
+
+    def update(self, s):
+        """one solution: learn from it and check the prior against it"""
+        if s.get('prior'):
+            if not (s.get('ok_free') and s['nsat'] >= 5 and s.get('vdop_free', 99) <= self.VDOP_MAX):
+                return
+            h, vdop = s['h_free'], s['vdop_free']
+        else:
+            if not (s['ok'] and s['nsat'] >= 5 and s['vdop'] <= self.VDOP_MAX):
+                return
+            h, vdop = s['h'], s['vdop']
+        self.free.append((h, s['lat'], s['lon'], vdop))
+        self.n_new += 1
+        prior = self.solver.prior
+        if prior and len(self.free) >= self.LEARN_N and self.n_new % 30 == 0:
+            a = np.array(list(self.free))
+            med, vd = float(np.median(a[:, 0])), float(np.median(a[:, 3]))
+            if abs(med - prior[0]) > self._limit(vd):
+                log('GNSS position solver: the height prior (%.1f m) disagrees with this session\'s own fixes (%.1f m) '
+                    '- dropped; learning it again (was the antenna moved?)' % (prior[0], med))
+                self.solver.set_prior(None, 0, 0)
+                STATE.pop('height', None)
+                save_state(force=True)
+                self.free.clear()
+                self.n_new = 0
+                return
+        if len(self.free) >= self.LEARN_N and self.n_new % 60 == 0:
+            a = np.array(list(self.free))
+            sess = (float(np.median(a[:, 0])), float(np.median(a[:, 1])), float(np.median(a[:, 2])))
+            vd = float(np.median(a[:, 3]))
+            # each minute adds up to 60 fixes' weight - less with poor vertical geometry (VDOP 6: ~10)
+            add = 60.0 * min(1.0, (2.5 / vd) ** 2)
+            st = STATE.get('height')
+            if st and abs(sess[0] - st['h']) < self._limit(vd):
+                n0 = min(st.get('n', 0), self.MAX_N)
+                k = n0 / (n0 + add)
+                new = {'h': k * st['h'] + (1 - k) * sess[0], 'lat': k * st['lat'] + (1 - k) * sess[1],
+                       'lon': k * st['lon'] + (1 - k) * sess[2], 'n': int(n0 + add), 't': time.time()}
+            elif self.n_new >= self.NEW_N:
+                new = {'h': sess[0], 'lat': sess[1], 'lon': sess[2], 'n': int(add * self.NEW_N / 60), 't': time.time()}
+            else:       # a brand-new prior waits for more: 5 min of VDOP-6 heights came out 10 m off in a replay
+                return
+            STATE['height'] = new
+            save_state()
+            if prior is None or abs(prior[0] - new['h']) > 0.5:
+                if prior is None:
+                    log('GNSS position solver: height prior learned: %.1f m (ellipsoid)' % new['h'])
+                self.solver.set_prior(new['h'], new['lat'], new['lon'])
+
+
 class Lines:
     """pocket_trk's log lines and decoded orbits -> this receiver's GCH / GEPH / GPOS lines"""
 
@@ -683,6 +864,13 @@ class Lines:
                     n += 1
             log('GNSS position solver: warm start with %d saved orbits%s' % (
                 n, ' and the ionosphere model' if self.spp.ion else ''))
+            try:
+                self.height = HeightPrior(self.spp)
+            except Exception as e:      # (the prior is an improvement, never a reason not to solve)
+                log('GNSS position solver: no height prior (%r)' % e)
+                self.height = None
+        else:
+            self.height = None
 
     def reset_run(self):
         """a new pocket_trk run: its receiver time starts again, and so does the watchdog's memory of it"""
@@ -780,10 +968,16 @@ class Lines:
                 return
             if not s:
                 return
+            if self.height:
+                try:
+                    self.height.update(s)
+                except Exception as e:
+                    log('GNSS height prior: %r' % e)
             # good fixes; and before smoothing has settled, quick ones (good geometry, ranges that agree) so the
-            # first position comes as early as possible - n_smoothed says which is which
-            quick = (not s['ok'] and s['nsat'] >= 4 and s['hdop'] <= spp.HDOP_MAX and s['res_rms'] is not None
-                     and s['res_rms'] < QUICK_RES_M)
+            # first position comes as early as possible - n_smoothed says which is which (3 satellites with the
+            # height prior are only ever quick)
+            quick = (not s['ok'] and s['nsat'] >= (3 if s.get('prior') else 4) and s['hdop'] <= spp.HDOP_MAX
+                     and s['res_rms'] is not None and s['res_rms'] < QUICK_RES_M)
             if s['ok'] or quick:
                 self.spp_fixes += 1
                 t = float(gnss.gpst_to_unix(s['t']))
@@ -791,9 +985,11 @@ class Lines:
                     self.first_fix = t
                     log('GNSS position solver: first fix %.0f s after the start (%d satellites)' % (
                         t - (_started_at[0] or t), s['nsat']))
-                emit('GSPP: %.3f %.9f %.9f %.3f %d %.2f %d %d %d %d' % (
+                # (field order is a contract with catalog.analyze_gnss and the tracker: n_smoothed, then 'prior' -
+                # 1 when the static antenna's height row held the solution, so its height is not a measurement)
+                emit('GSPP: %.3f %.9f %.9f %.3f %d %.2f %d %d %d %d %d' % (
                     t, s['lat'], s['lon'], s['h'], s['nsat'], s['hdop'],
-                    s['iono'].get('sbas', 0), s['fast'], s['lt'], s['smoothed']))
+                    s['iono'].get('sbas', 0), s['fast'], s['lt'], s['smoothed'], 1 if s.get('prior') else 0))
 
     def line(self, line, when):
         """one log line; when(receiver time) -> unix time. Nothing a line can contain may stop the reader: a dead
@@ -1277,8 +1473,12 @@ class Receiver(gr.top_block):
         self.taps = []
         if opts.spectrum_port:      # (every 8th FFT frame: the signals are under the noise, and every frame cost 0.2 core)
             self.taps.append(sdr_taps.add_spectrum(self, src, opts.spectrum_port, center, rate, every=8))
+        # no sound: GNSS signals lie under the noise, so there is nothing to hear on these bands, and the sound tree
+        # (channel filter, demodulators, resampler) cost ~0.5-0.7 core for it (cpu_breakdown.out, rx_cpu.py).
+        # --audio-port is still accepted (receiver.py passes it to every band); with no hello from here the tracker's
+        # sound controls know there is no sound to play, and the tracker greys them out for GNSS bands.
         if opts.audio_port:
-            self.taps.append(sdr_taps.add_audio(self, src, opts.audio_port, rate, channel_hz=36e3, demod='am'))
+            log('Sound: none on GNSS bands (the signals are under the noise - nothing to hear)')
 
 
 def clean_temp():

@@ -202,11 +202,12 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
   when the log reader dies. pocket_trk's own events go out as `GLOG` (FOUND/LOST/FALSELOCK/EPOCH/SYNC/START/RESTART).
 - Lines emitted (exact formats in `Lines` / `NoiseMeter`):
   `GCH: t sat sig cn0 dop lock [sync nav err lol]`, `GEPH: t sat <fields|GLO,…|SBAS,…>`, `GPOS: t lat lon h nsat`,
-  `GSPP: t lat lon h nsat hdop n_waas_iono n_fast n_longterm n_smoothed`, `GTIME: t offset_s nsat spread`,
+  `GSPP: t lat lon h nsat hdop n_waas_iono n_fast n_longterm n_smoothed prior`, `GTIME: t offset_s nsat spread`,
   `GNOISE: t power rise clip peak peak_mhz floor learning rms_pct`, `GSPEC: t f_lo f_hi v1..v128`.
   **GSPP field order is a contract** with catalog.analyze_gnss and iridium_tracker._read_live_gnss, which both read
-  n_smoothed as f[8] (< 4 ⇒ `quick` fix, excluded from accuracy) - change together. `catalog.read_gnss` drops
-  kind + t (fields shift by 2); `integrity.Monitor.line` indexes the full split.
+  n_smoothed as f[8] (< 4 ⇒ `quick` fix, excluded from accuracy) and `prior` as f[9] (1 ⇒ the height row held it:
+  `fx['prior']`, its height left out of posquality's height figures; lines before 2026-11-07 have no f[9]) - change
+  together. `catalog.read_gnss` drops kind + t (fields shift by 2); `integrity.Monitor.line` indexes the full split.
 - Timing/clock: the stream's start time = sliding 10 s minimum of (arrival − samples so far/rate) − `usb_latency()`;
   each sample's PC time = that + its sample number/rate (re-anchored after dropped samples). `usb_latency` = two USB
   buffers + 5 ms for RTL-SDR (133 ms with default buffers; 0 for other devices). GTIME = GPS − PC, verified against
@@ -219,19 +220,33 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
   until then. A steady spur at ~1560.33 MHz sits near B1I.
 - Galileo: with pocket_trk's default DLL bandwidth 98 % of E1B locks died within 20 s (the orbit needs ~30 s of
   unbroken frames), so its orbits rarely decoded; `b_dll = 0.5` in `pocket_trk.opt` held them in replay (live
-  confirmation pending). A second system still needs ≥2 of its satellites with orbits in spp.py (own clock offset),
-  so fixes are GPS-only until the solver's static mode (week 2: height prior, lone Galileo on the GPS clock) lands.
-  GLONASS/BeiDou can't be received with GPS (the SDR sees ~2 MHz).
-- **Own solver `spp.py`** (GSPP lines, GPS band only): pocket_trk `$OBS` (P, L, D, C/N0) → broadcast orbit/clock, TGD,
-  Sagnac, Saastamoinen troposphere, ionosphere from the WAAS grid (MT18/26, pierce point 350 km, 5° grid, all 4
-  corners needed) else Klobuchar (decoded from GPS subframe 4 page 18) → weighted LSQ (one clock per system, elevation
-  mask 10°, drops up to 2 outliers). WAAS fast (PRC) + long-term corrections (IODE must match).
+  confirmation pending; live 11-06 evening: all four Galileo satellites held, 2600+ ranges per 14 min). Two Galileo
+  satellites with orbits get their own clock unknown in spp.py; a lone one rides on the GPS clock (+1 m sigma) while
+  the height prior is on. GLONASS/BeiDou can't be received with GPS (the SDR sees ~2 MHz).
+- **Own solver `spp.py`** (GSPP lines, GPS band only): pocket_trk `$OBS` (P, L, D, C/N0) → broadcast orbit/clock, TGD
+  (Galileo: BGD(E1,E5b)), Sagnac, Saastamoinen troposphere, ionosphere from the WAAS grid (MT18/26, pierce point
+  350 km, 5° grid; bilinear with 4 corners, DO-229 triangle with 3) else Klobuchar (decoded from GPS subframe 4
+  page 18) → weighted LSQ (one clock per system, elevation mask 10°, drops up to 2 outliers when redundancy allows).
+  WAAS fast (PRC) + long-term corrections (IODE must match). Weights: 'simple' (noise by smoothing count and
+  elevation) - an error-budget option (`weights='budget'`: UDRE / URA / SISA / GIVE / troposphere) measured worse
+  (it down-weights good Galileo ranges) and is kept only for experiments.
+  **Static mode (week 2, 2026-11-07):** `Solver.set_prior(h, lat, lon)` adds a height row (sigma 3 m) while the
+  solution stays within 1 km of where the height was learned; then 3 satellites give a quick fix, 4 give an 'ok' one
+  with HDOP computed from the augmented geometry (gate still 6), a lone Galileo joins. With 5+ satellites the epoch is
+  also solved without the row (`h_free`, `vdop_free`, `ok_free`) for checking and learning. `gnss_rx.HeightPrior`
+  owns the height: from `gnss-solver.json['height']` ({h, lat, lon, n, t}), the first time from the catalog's
+  WAAS session middles (2+ agreeing); learned from prior-free 5+-satellite fixes with VDOP ≤ 8 (5-satellite VDOP is
+  5-6.5 from this site), each minute weighted by geometry; a brand-new prior needs 15 min of them; dropped when a
+  5-minute median of them disagrees by more than max(9 m, 3.75 × VDOP). Replays (`build\_tmp\week2\
+  replay_static.py`; prior from OTHER sessions): 04:33 first 100 min good fixes 2914/5083 epochs → 5920/5979, R95
+  5.5 → 4.7 m; 03:29 R95 3.8 → 3.4 m; 20:54 (Galileo-heavy) 6.4 → 3.5 m. A deliberately 30 m wrong prior was
+  dropped after 6 min (`test_lines_prior.py`, PRIOR_TEST=wrong).
   **Carrier smoothing**: Hatch filter, 100 s; pocket_trk's code−carrier difference has a common per-epoch term
   (receiver clock steering, +16.7 m/s and 1 ms steps) removed with the median across satellites.
   **SETTLE_S = 30**: a satellite's smoothing starts 30 s after its first pseudorange (restarts after a cycle slip
   ≥8 m, a zero carrier phase or one missed epoch); the code loop is still pulling in - without it a side-by-side test
   against the Garmin showed 11 m and −31 m errors. Fix gate: HDOP ≤ 6 and ≥4 satellites smoothed ≥30 s; before that
-  "quick" fixes (residual rms < 15 m).
+  "quick" fixes (residual rms < 15 m; 3 satellites + the height prior are only ever quick).
   - Measured (8-9 recorded sessions): 95 % radius 3-16 m vs pocket_trk 11-32 m; half within 1-4 m vs 4-9 m; session
     middles agree to 1.4 m rms horizontally / 5.3 m height vs pocket_trk 2.4 / 8.5. With smoothing and WAAS off it
     reproduces pocket_trk (validates the maths). Live outdoor hour (2026-11-06): ±3 m per fix, 10-min average
@@ -242,10 +257,16 @@ Tracker window (iridium_tracker.py: Data, MapView, Timeline, Tracker; all on the
   start-up time is pocket_trk acquiring/syncing. `--narrow-search` (only satellites predicted up) exists but is
   **off**: on a recording it locked 4-5 satellites vs 6 with the full list (pocket_trk searches all in parallel).
 - `posquality.py` (the "Your position" panel, Navigation view): per-fix R95/CEP50 over 10 min; average uncertainty =
-  2.45·σ/√n_eff with n_eff = span/(2τ), **τ ≥ 120 s** (errors last minutes; without the floor a 2-min average claimed
-  0.6 m where the Garmin showed 4 m); needs ≥5 min; `long_term()` = every session's middle (split at 10-min gaps),
-  uncertainty from how much sessions disagree (uses own-solver fixes once 3+ sessions exist). Distances shown to a ★
-  reference point (or one named "antenna"), else home. Also "Up but not heard" (G/E satellites ≥15° up by their own
+  2.45·σ/√n_eff with n_eff = span/(2τ), τ floored per source (`TAU_FLOOR_S`: own solver 240 s, pocket_trk 30 s;
+  measured correlation ~51 s / ~9 s) and combined with half the window's drift (since 2026-11-07: against the Garmin
+  point the own solver's claim held 85 % of windows, was 66 %; pocket_trk's 5.8 m claim still 99 %, was a 10.3 m one).
+  Fixes flagged `prior` count horizontally but not in the height figures. Needs ≥5 min; `long_term()` = every
+  session's middle (split at 10-min gaps, weighted by effective length), uncertainty from how much sessions disagree
+  × Student t (`t975`), shown in the headline from `LT_MIN_SESSIONS` 4 on. Distances shown to a ★ reference point (or
+  one named "antenna"), else home ("from home (no reference starred)"). Reference points (refpoints.py): a Garmin
+  stretch is imported only when `good_stretch` (60+ points at ≥ 0.5/s and 95 % within 10 m: 2 of the 39 old ones
+  pass); `auto_star` stars the tightest one (300+ points within 25 m of home) when nothing is starred; Garmin heights
+  are tagged `height_source: barometer` and shown as such; `still_stretches` is linear now (1.2 s → 16 ms). Also "Up but not heard" (G/E satellites ≥15° up by their own
   orbit but not tracked - a long list means the sky view is blocked), start-up history, sea-level heights.
   `headline`/`details` read keys the caller sets (`source`, `ref`, `ref_m`, `long`, `pocket_r95_m`, `geoid_sep`).
 - Session stats (`catalog.session_stats`): kept for every GNSS capture, used (start-up history) and backfilled for
@@ -353,7 +374,15 @@ Integrity classifying a gap as "stream gap (SDR/USB) - not RF". The offline end-
 launched by the sandboxed assistant; the owner can run it. `data\pocket_trk.opt` lives in `data\` (not in git): a
 fresh install has none - consider having gnss_rx write the two measured defaults when the file is missing.
 
-**Week 2 - availability and accuracy**
+**Week 2 - availability and accuracy** (status 2026-11-07: item 1 DONE - static mode as described under "Own solver",
+with these changes from the plan: the error-budget weighting was built but measured worse, so 'simple' weights stay;
+the outlier rule was already at redundancy 2 and now benefits from the height row; the prior's VDOP limit is 8, not
+4 (5-satellite VDOP is 5-6.5 here). Item 3 DONE (posquality floors/drift/t-factor, good_stretch, auto_star, barometer
+tag, linear still_stretches, atomic GPX copy). Item 2 NOT DONE on purpose: with zero-fill and the watchdog the case
+it covers (pocket_trk's PVT dead for hours) should not recur - build it only if a live log shows 'RESTART
+clock-lost' happening and fixes still missing. Item 4 DONE (its own note below). Item 5 waits for an hour of live
+Galileo data. Live confirmation of item 1 pending: look for 'height prior' lines in the capture .log and the
+`prior` flag in GSPP lines.)
 1. **Static mode in spp.py** (the biggest gain: replays took good own-solver epochs from 1723 to 3987 of 4043 on
    the 11-06 live log at the same 1.5-2.5 m; prototype and replay harness in
    `build\_tmp\review-20261106\spp-solver\` - `sppx.py`, `replay.py`, `variants.py`, outputs `variants_live2.txt`,
@@ -381,14 +410,26 @@ fresh install has none - consider having gnss_rx write the two measured defaults
    show scatter/points/span columns, auto-star the best, say "from home (no reference starred)"; tag Garmin heights
    as barometric (they drift 12-50 m) and use them horizontally only; `refpoints.still_stretches` is O(n^2) on the
    GUI thread (1.3 s now, minutes after a day of 1 s logging) - running mean; GPX copy via .tmp + os.replace.
-4. **GUI load** (measured in `build\_tmp\review-20261106\tracker-gui\measure_*.py`): rebuild the live scene once a
-   second instead of at every 100 ms tick (24-78 ms per tick in the GNSS view = 43-97 % of the main thread;
-   iridium_tracker tick/refresh ~3360-3530); `EphemerisOrbit.ecef()` without the velocity (3 Kepler solves per
-   position, gnss.py ~209); reload only changed captures after a Stop (load_catalog ~540-633, 2-3 s today); sky
-   view binned into az/el cells (skyplot.py; the cap of 200 dots per pass from 73fabfc is the stop-gap); Integrity
-   strip charts binned to pixel columns (100-300 ms/s when visible); no audio tap for GNSS bands (gnss_rx builds the
-   whole sound tree, ~0.45 core, for a band with nothing to hear - check what the tracker's sound panel needs);
-   NoiseMeter/IQRecorder out of the GNU Radio work thread.
+4. **GUI load - DONE 2026-11-07** (scripts and before/after numbers in `build\_tmp\week2\gui\`):
+   - `Tracker.tick` rebuilds the live scene once per whole second (`_scene_second`); playback/scrubbing still every
+     tick. Main thread busy in the GNSS map view 51 → 10 %, sky view 81 → 9 %.
+   - `EphemerisOrbit.ecef()` is position-only (one Kepler solve); `sat_ecef` keeps the velocity for the solver and
+     Integrity's Doppler.
+   - `Data._load_captures()` re-reads only per-capture files whose (mtime, size) changed and refits only their
+     satellites (load_catalog after a Stop 2.2-2.6 s → 0.02-0.13 s; results equal a full load). It calls
+     catalog's private `_index_names` / `_cap_file`, and the cached capture dicts are shared between reloads - never
+     mutate a capture dict in place.
+   - Sky view: `HeardCells` places every heard point once into 3° az/el cells (incremental; re-placed when an
+     orbit object changes, all when home moves); the plot's heard layer is a cached QPixmap; the "Up now" table
+     updates only changed cells (its ResizeToContents header made each setItem ~1 ms). The 200-dots cap is gone.
+     Refresh 'Everything' 187-264 → 9-15 ms; first showing places all points once (~400 ms for 783k).
+   - Integrity `StripChart`: per-pixel-column min/max, one polygon per gap-free segment, two 1 px lines instead of a
+     1.5 px pen (Qt's stroker was the real cost); repaint only on new points or every 10 s (tick+paint 54 → 14 ms).
+   - gnss_rx: no sound tree for GNSS bands (the tracker greys the sound controls, `_sound_for_band`); NoiseMeter and
+     IQRecorder run in a `Watcher` thread fed 50 ms batches through a bounded (~1 s) queue that drops and counts,
+     never blocks work(); IQRecorder fills dropped stretches with zeros so its 20 s before / 20 s after stay timed.
+     gnss_rx 0.815 → 0.312 core; work() per block 0.53 → 0.17 ms. GNOISE times are batch arrival times (≤ 50 ms
+     later than before). Not yet run live end to end with pocket_trk.
 5. **Galileo feeding A/B** (after an hour of live data with `b_dll 0.5`): the GPS band at 2.4 MS/s (the tuner
    filters follow the rate and cut the E1B lobes at 2.048; `systems.GNSS_BAND['rate']`, +17 % pocket_trk CPU, the
    pipe and usb_latency follow `opts.rate`); `fast_acq = 1` with `el_mask = 5` (needs a fix first; re-acquisition is

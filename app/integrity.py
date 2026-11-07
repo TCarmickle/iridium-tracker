@@ -1050,10 +1050,50 @@ class StripChart(QtWidgets.QWidget):
         self.window, self.marker = window, marker       # a fixed (t0, t1) instead of the last 30 min; a time line
         self.series = {}
         self.setMinimumHeight(90)
+        self._seen = None           # what the series looked like at the last repaint (see set_series)
+        self._painted = 0.0
+
+    # a live chart is repainted when its series gained a point, or every REPAINT_S anyway so that it keeps sliding
+    # left while nothing arrives (the receiver stopped). set_series comes with every once-a-second tick.
+    REPAINT_S = 10.0
 
     def set_series(self, series):
-        self.series = series
+        seen = tuple((len(q), q[-1][0] if len(q) else None) for q in (series.get(k, ()) for k, _, _ in self.lines))
+        if series is self.series and seen == self._seen and time.time() - self._painted < self.REPAINT_S:
+            return
+        self.series, self._seen = series, seen
         self.update()
+
+    def _binned(self, key, t_a, now, pw):
+        """a series inside (t_a, now) cut down to the pixel columns it covers: per column its lowest and highest value
+        (in the order they came), so the line looks the same as one through every point but never has more than two
+        corners a pixel; split where the receiver stopped (more than 20 s without a point)"""
+        a = np.asarray(list(self.series.get(key, ())), float).reshape(-1, 2)
+        a = a[(a[:, 0] >= t_a) & (a[:, 0] <= now)]
+        if not len(a):
+            return []
+        a = a[np.argsort(a[:, 0], kind='stable')]
+        t, v = a[:, 0], a[:, 1]
+        col = np.clip(((t - t_a) * pw / (now - t_a)).astype(int), 0, pw)
+        out = []
+        cuts = np.flatnonzero(np.diff(t) > 20.0) + 1
+        for lo, hi in zip(np.r_[0, cuts], np.r_[cuts, len(t)]):
+            c, vv = col[lo:hi], v[lo:hi]
+            starts = np.r_[0, np.flatnonzero(np.diff(c)) + 1]
+            ends = np.r_[starts[1:], len(c)]
+            mn, mx = np.minimum.reduceat(vv, starts), np.maximum.reduceat(vv, starts)
+            # (lowest before highest or the other way round, as they came - so the line joins the columns right)
+            which = np.repeat(np.arange(len(starts)), ends - starts)
+            idx = np.arange(len(vv))
+            imn = np.minimum.reduceat(np.where(vv == mn[which], idx, len(vv)), starts)
+            imx = np.minimum.reduceat(np.where(vv == mx[which], idx, len(vv)), starts)
+            up = imn <= imx
+            mid1, mid2 = np.where(up, mn, mx), np.where(up, mx, mn)
+            ys = np.stack([mid1, mid2], 1).ravel()
+            xs = np.repeat(c[starts] + 0.5, 2)
+            keep = np.r_[True, (np.diff(ys) != 0) | (np.diff(xs) != 0)]
+            out.append((xs[keep], ys[keep]))
+        return out
 
     def paintEvent(self, e):
         p = QtGui.QPainter(self)
@@ -1064,7 +1104,10 @@ class StripChart(QtWidgets.QWidget):
         pw, ph = w - L - R, h - T - B
         t_a, now = self.window or (time.time() - HISTORY_S, time.time())
         span = max(now - t_a, 1.0)
-        vals = [v for key, _, _ in self.lines for t, v in self.series.get(key, ()) if t_a <= t <= now]
+        now = t_a + span
+        self._painted = time.time()
+        segs = {key: self._binned(key, t_a, now, max(pw, 1)) for key, _, _ in self.lines}
+        vals = [float(f(ys)) for parts in segs.values() for _, ys in parts for f in (np.min, np.max)]
         lims = list(self.limits or ())
         lo = min(vals + [0.0] + ([-lims[0]] if self.absval and lims else []))
         hi = max(vals + [self.floor_range] + lims[:1])
@@ -1104,17 +1147,17 @@ class StripChart(QtWidgets.QWidget):
                     p.drawLine(L, int(Y(s * v)), L + pw, int(Y(s * v)))
         x = L + pw - 4
         for key, col, name in self.lines:
-            pts = [(X(t), Y(v)) for t, v in self.series.get(key, ()) if t_a <= t <= now]
-            p.setPen(QtGui.QPen(QtGui.QColor(col), 1.5))
-            path = QtGui.QPainterPath()
-            for i, (px, py) in enumerate(pts):
-                if i and px - pts[i - 1][0] > pw * 20 / span:      # a gap (receiver stopped)
-                    path.moveTo(px, py)
-                elif i:
-                    path.lineTo(px, py)
-                else:
-                    path.moveTo(px, py)
-            p.drawPath(path)
+            # the 1.5 px line as two 1 px lines half a pixel apart: a pen wider than 1 px goes through Qt's stroker,
+            # which took 5 ms for a quiet 30-min series and 118 ms for a jumpy one; two thin lines take 0.5-2 ms
+            # (week-2 chart_variants.py). 30 min of points drawn that way took 100-300 ms a second with the
+            # Integrity section shown (tick_profile.py: 224 ms for the noise chart alone)
+            p.setPen(QtGui.QPen(QtGui.QColor(col), 1.0))
+            for xs, ys in segs[key]:                # (one line per stretch without a gap - the receiver stopped)
+                yy = T + ph * (1 - (ys - lo) / (hi - lo))
+                poly = QtGui.QPolygonF([QtCore.QPointF(x, y) for x, y in zip((L + xs).tolist(), yy.tolist())])
+                p.drawPolyline(poly)
+                poly.translate(0, 0.5)
+                p.drawPolyline(poly)
             fm = p.fontMetrics()
             x -= fm.horizontalAdvance(name)
             p.drawText(int(x), 2, fm.horizontalAdvance(name) + 2, 14, Qt.AlignLeft, name)
