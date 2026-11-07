@@ -435,8 +435,16 @@ fresh install has none - consider having gnss_rx write the two measured defaults
 **Small things noticed in week 1:** with the tracked gate (5 s at 25 dB-Hz) weak Galileo still churns TRACKING/LOST
 events every 10-30 s (raise the bar for E to 30 dB-Hz or 10 s if noisy; `GNSS_TRACK_*` in iridium_tracker.py); the
 GCH dedup still leaves ~7 two-second holes in 3 h (pocket_trk itself); Integrity's cn0 raise text says "blocked?"
-for 3-8 s when only the satellite fingerprint (no GGAP) identifies a gap; `catalog.py --redo` is needed after any
-catalog format change; the stale-text list under "Known issues" still stands.
+for 3-8 s when only the satellite fingerprint (no GGAP) identifies a gap; on the first new-code run Integrity raised
+a 'lock' WATCH at 20:48 (snapshot 20261106-204804-lock, 160 MB) when one satellite of 12 (G25) dropped - the at-once
+reacquired/lost fingerprint fires too easily, check `_reset_burst` / `_lost_burst` thresholds in integrity.py;
+`catalog.py --redo` is needed after any catalog format change; the stale-text list under "Known issues" still stands.
+First comparison new vs old code (same 14-minute windows, `build\_tmp\week1\compare_runs.py`): GPS acquisitions
+lost within 2.5 s 38-62 % -> 0 %; GPS lock-length median 2-61 s -> 129-777 s; Galileo lock median 10 s -> 710 s
+with all four Galileo satellites held and 2600+ Galileo ranges per 14 min (0-770 before); no gaps yet. Own-solver
+R95 6-7 m with the session middle 2-3 m from home (old sessions 2-7 m and 0.5-1.6 m) - watch this: with Galileo
+orbits now decoding, Galileo enters the own solver's two-clock solution for the first time (BGD E5a/E5b item 6 and
+Galileo weighting matter now); judge after an hour-long session.
 
 ## Ideas the owner wants to come back to
 GNSS reflectometry snow depth (favourite); auto PPM from the GPS Doppler offset (~+0.42 ppm); precise antenna
